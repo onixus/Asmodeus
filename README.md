@@ -77,4 +77,5 @@
 - [x] Control-plane: axum REST-сервер, каталог подписанных сценариев, движок прогона
 - [x] Runner: синтетический canary-инъектор (обратимый XOR, scope-guard, авто-очистка)
 - [x] Safety: circuit breaker + dead-man switch; Telemetry: MTTD/MTTR + экспортёр Prometheus
-- [ ] *Следующий этап*: gRPC/mTLS канал control-plane ↔ runner (tonic)
+- [x] gRPC/mTLS канал: proto-контракт (tonic), RunnerControl-сервер в раннере, mTLS-обвязка
+- [ ] *Следующий этап*: диспатч из control-plane в живой раннер (замена in-process симуляции) + CLI

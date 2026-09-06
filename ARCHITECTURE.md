@@ -172,18 +172,23 @@ Release-профиль (`Cargo.toml`) настроен на минимальны
 
 ```bash
 cargo build --workspace        # весь workspace
-cargo test  --workspace        # 24 теста (ядро, RBAC, крипта, DSL, REST)
+cargo test  --workspace        # 37 тестов (ядро, RBAC, крипта, DSL, REST, gRPC, canary)
 cargo run -p asmodeus-control-plane   # REST на 127.0.0.1:8842 (ASMODEUS_LISTEN)
-cargo run -p asmodeus-cli
+cargo run -p asmodeus-runner          # gRPC RunnerControl на 127.0.0.1:8850 (ASMODEUS_RUNNER_LISTEN)
+ASMODEUS_DRY_RUN=1 cargo run -p asmodeus-runner   # локальный синтетический прогон без control-plane
 ```
 
 Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `clippy`).
 
-### Реализовано (MVP-ядро + control-plane)
+### Реализовано
 
 - **Ядро** (`asmodeus-common`): RBAC-матрица `Role × Capability` (§3, инвариант CISO/SecOps/Auditor → read-only) и стейт-машина `RunState::on(RunEvent)` — тотальная функция без паник, инвариант «нет `Injecting` без `Armed`».
 - **Крипта** (`asmodeus-crypto`): реальная верификация Ed25519 на `ed25519-compact`.
 - **DSL-гейт** (`asmodeus-dsl`): `validate` отклоняет несинтетические (INV-0) и вне-scope манифесты.
-- **Control-plane** (`asmodeus-control-plane`): axum-сервер, каталог самоподписанных сценариев, движок прогона поверх стейт-машины. Эндпоинты: `POST /scenarios/:id/run`, `POST /scenarios/abort`, `GET /telemetry/mttd`, `GET /healthz`. RBAC даёт `401/403/404/422` строго по ролям.
+- **Safety** (`asmodeus-safety`): `CircuitBreaker` (CPU/таймаут/heartbeat) и `DeadManSwitch`.
+- **Telemetry** (`asmodeus-telemetry`): `Aggregate` — средние MTTD/MTTR, detection rate, экспозиция Prometheus.
+- **Control-plane** (`asmodeus-control-plane`): axum-сервер, каталог самоподписанных сценариев, движок прогона. Эндпоинты: `POST /scenarios/:id/run`, `POST /scenarios/abort`, `GET /telemetry/mttd`, `GET /metrics`, `GET /healthz`. RBAC даёт `401/403/404/422` строго по ролям.
+- **Runner** (`asmodeus-runner`): синтетический canary-инъектор (обратимый XOR, scope-guard) + gRPC-сервер `RunnerControl` (проверка подписи → INV-0 → инъекция → стрим событий), проверен end-to-end по TCP.
+- **Proto** (`asmodeus-proto`): tonic-контракт `RunnerControl`, mTLS-обвязка (сертификаты из env — операторские).
 
-Осталось: gRPC/mTLS канал к раннеру, синтетический canary-инъектор в `asmodeus-runner`, экспортёр Prometheus в `asmodeus-telemetry`.
+Осталось: диспатч из control-plane в живой раннер (замена in-process симуляции), заполнение `asmodeus-cli` и `asmodeus-testkit`, eBPF-инъекция сетевого хаоса (только на Linux-стенде).

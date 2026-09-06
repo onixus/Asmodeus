@@ -12,5 +12,16 @@ path = "src/main.rs"
 
 [dependencies]
 asmodeus-common = { workspace = true }
+asmodeus-crypto = { workspace = true }
 asmodeus-dsl = { workspace = true }
 asmodeus-safety = { workspace = true }
+asmodeus-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+ed25519-compact = { workspace = true }

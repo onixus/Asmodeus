@@ -1,0 +1,47 @@
+syntax = "proto3";
+package asmodeus.v1;
+
+// Control-plane -> Runner control channel (gRPC over mTLS in production).
+// The runner only ever performs SYNTHETIC actions (INV-0); it verifies the
+// scenario signature itself and refuses anything outside the canary scope.
+service RunnerControl {
+  // Dispatch one signed scenario. The runner streams lifecycle events back
+  // as it drives the state machine and runs the synthetic injection.
+  rpc Execute(ExecuteRequest) returns (stream RunnerEvent);
+
+  // Liveness probe for the operator view. The dead-man switch that aborts a
+  // run on lost control is runner-side; this is the control-plane's view of it.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+}
+
+message ExecuteRequest {
+  string scenario_id   = 1;
+  bytes  manifest      = 2;  // signed manifest bytes
+  bytes  signature     = 3;  // Ed25519 signature
+  bytes  public_key    = 4;  // trusted Red Team Lead public key
+  string target_dir    = 5;  // MUST be within canary scope
+  uint32 file_count    = 6;
+  uint32 chunk_size_kb = 7;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  STATE_CHANGED = 1;
+  COMPLETED     = 2;
+  REJECTED      = 3;
+}
+
+message RunnerEvent {
+  EventKind kind          = 1;
+  string    state         = 2;  // RunState name for STATE_CHANGED
+  uint32    files_created = 3;
+  uint64    bytes_written = 4;
+  uint64    inject_ms     = 5;
+  string    detail        = 6;  // reason for REJECTED
+}
+
+message HeartbeatRequest { string exercise_id = 1; }
+message HeartbeatReply {
+  string state   = 1;
+  bool   healthy = 2;
+}
