@@ -1,0 +1,12 @@
+[package]
+name = "asmodeus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+asmodeus-common = { workspace = true }
+asmodeus-crypto = { workspace = true }
+asmodeus-dsl = { workspace = true }

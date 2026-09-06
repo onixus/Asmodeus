@@ -1,0 +1,44 @@
+# Asmodeus — Offensive engine of the APEX DEFENSE ecosystem.
+# Workspace layout mirrors Ferrum conventions (see ARCHITECTURE.md).
+[workspace]
+resolver = "2"
+members = [
+    "crates/asmodeus-common",
+    "crates/asmodeus-proto",
+    "crates/asmodeus-crypto",
+    "crates/asmodeus-dsl",
+    "crates/asmodeus-safety",
+    "crates/asmodeus-runner",
+    "crates/asmodeus-control-plane",
+    "crates/asmodeus-telemetry",
+    "crates/asmodeus-cli",
+    "crates/asmodeus-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+rust-version = "1.90"
+publish = false
+
+# Internal crates are wired by path so the skeleton builds offline.
+# External deps (tokio, axum, tonic, aya, ed25519-compact, prometheus, ...)
+# are declared here as they land — see ARCHITECTURE.md §7.
+[workspace.dependencies]
+asmodeus-common       = { path = "crates/asmodeus-common" }
+asmodeus-proto        = { path = "crates/asmodeus-proto" }
+asmodeus-crypto       = { path = "crates/asmodeus-crypto" }
+asmodeus-dsl          = { path = "crates/asmodeus-dsl" }
+asmodeus-safety       = { path = "crates/asmodeus-safety" }
+asmodeus-runner       = { path = "crates/asmodeus-runner" }
+asmodeus-control-plane= { path = "crates/asmodeus-control-plane" }
+asmodeus-telemetry    = { path = "crates/asmodeus-telemetry" }
+asmodeus-testkit      = { path = "crates/asmodeus-testkit" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

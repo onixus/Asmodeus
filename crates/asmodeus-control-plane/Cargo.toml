@@ -1,0 +1,14 @@
+[package]
+name = "asmodeus-control-plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+asmodeus-common = { workspace = true }
+asmodeus-proto = { workspace = true }
+asmodeus-crypto = { workspace = true }
+asmodeus-dsl = { workspace = true }
+asmodeus-telemetry = { workspace = true }
