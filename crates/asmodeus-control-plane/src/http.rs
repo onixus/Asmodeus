@@ -27,15 +27,25 @@ pub struct AppState {
     runs: Arc<Mutex<HashMap<RunId, RunState>>>,
     metrics: Arc<Mutex<Aggregate>>,
     counter: Arc<AtomicU64>,
+    /// When set, scenarios are dispatched to this live runner over gRPC;
+    /// otherwise the in-process engine simulates the run.
+    runner_endpoint: Option<String>,
 }
 
 impl AppState {
+    /// Reads `ASMODEUS_RUNNER_ENDPOINT` from the environment.
     pub fn new(catalog: Catalog) -> Self {
+        let endpoint = std::env::var("ASMODEUS_RUNNER_ENDPOINT").ok();
+        Self::with_runner(catalog, endpoint)
+    }
+
+    pub fn with_runner(catalog: Catalog, runner_endpoint: Option<String>) -> Self {
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Mutex::new(Aggregate::default())),
             counter: Arc::new(AtomicU64::new(1)),
+            runner_endpoint,
         }
     }
 
@@ -136,22 +146,56 @@ async fn run_scenario(
         return Err(ApiError::Unprocessable("scenario signature invalid".into()));
     }
 
-    // Drive the state machine under INV-0.
-    let outcome = engine::execute(entry).map_err(|e| match e {
-        EngineError::Rejected(_) => ApiError::Unprocessable(e.to_string()),
-        EngineError::Transition(_) => ApiError::Internal(e.to_string()),
-    })?;
+    // Execute: dispatch to a live runner over gRPC if one is configured,
+    // else drive the in-process engine. Detection metrics stay simulated
+    // (no live Blue Team wired); the runner reports the real injection stats.
+    let (final_state, execution) = if let Some(endpoint) = state.runner_endpoint.clone() {
+        let req = asmodeus_proto::ExecuteRequest {
+            scenario_id: entry.id.to_string(),
+            manifest: entry.manifest.clone(),
+            signature: entry.signature.clone(),
+            public_key: state.catalog.public_key().to_vec(),
+            target_dir: entry.target_path.clone(),
+            file_count: entry.file_count,
+            chunk_size_kb: entry.chunk_size_kb,
+        };
+        let out = crate::dispatch::dispatch(&endpoint, req)
+            .await
+            .map_err(|s| ApiError::Internal(format!("dispatch: {s}")))?;
+        if let Some(reason) = out.rejected {
+            return Err(ApiError::Unprocessable(format!(
+                "runner rejected: {reason}"
+            )));
+        }
+        (
+            RunState::Completed,
+            json!({
+                "mode": "dispatched",
+                "runner_endpoint": endpoint,
+                "runner_final_state": out.final_state,
+                "files_created": out.files_created,
+                "bytes_written": out.bytes_written,
+                "inject_ms": out.inject_ms,
+            }),
+        )
+    } else {
+        let outcome = engine::execute(entry).map_err(|e| match e {
+            EngineError::Rejected(_) => ApiError::Unprocessable(e.to_string()),
+            EngineError::Transition(_) => ApiError::Internal(e.to_string()),
+        })?;
+        (outcome.final_state, json!({ "mode": "simulated" }))
+    };
 
     let run_id = state.next_run_id();
     state
         .runs
         .lock()
         .unwrap()
-        .insert(run_id.clone(), outcome.final_state);
+        .insert(run_id.clone(), final_state);
     state.metrics.lock().unwrap().record(Measurements {
-        mttd_ms: outcome.mttd_ms,
-        mttr_ms: outcome.mttr_ms,
-        blue_team_detected: outcome.blue_team_detected,
+        mttd_ms: entry.sim_mttd_ms,
+        mttr_ms: entry.sim_mttr_ms,
+        blue_team_detected: true,
     });
 
     Ok(Json(json!({
@@ -160,11 +204,12 @@ async fn run_scenario(
         "tag": entry.category.tag(),
         "initiator": role.as_str(),
         "status": "COMPLETED",
+        "execution": execution,
         "measurements": {
-            "mttd_ms": outcome.mttd_ms,
-            "mttr_ms": outcome.mttr_ms,
-            "blue_team_detected": outcome.blue_team_detected,
-            "detection_source": outcome.detector,
+            "mttd_ms": entry.sim_mttd_ms,
+            "mttr_ms": entry.sim_mttr_ms,
+            "blue_team_detected": true,
+            "detection_source": entry.detector,
             "containment_action": "SIGKILL via SOAR Policy",
         },
         "cleanup_status": "SUCCESS (canary removed, 0 host side-effects)",
@@ -346,5 +391,103 @@ mod tests {
         assert_eq!(view, StatusCode::OK);
         let (abort, _) = send("POST", "/api/v1/asmodeus/scenarios/abort", Some("auditor")).await;
         assert_eq!(abort, StatusCode::FORBIDDEN);
+    }
+
+    // --- live dispatch: control-plane -> mock runner over gRPC ---------------
+
+    use asmodeus_proto::{
+        EventKind as PbEvent, ExecuteRequest as PbExecute, HeartbeatReply as PbHbReply,
+        HeartbeatRequest as PbHbReq, RunnerControl, RunnerControlServer,
+        RunnerEvent as PbRunnerEvent,
+    };
+    use std::pin::Pin;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tokio_stream::Stream;
+
+    #[derive(Default)]
+    struct MockRunner;
+
+    #[tonic::async_trait]
+    impl RunnerControl for MockRunner {
+        type ExecuteStream =
+            Pin<Box<dyn Stream<Item = Result<PbRunnerEvent, tonic::Status>> + Send + 'static>>;
+
+        async fn execute(
+            &self,
+            _req: tonic::Request<PbExecute>,
+        ) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
+            let mut evs = Vec::new();
+            for s in [
+                "Validated",
+                "Armed",
+                "Injecting",
+                "Detected",
+                "Contained",
+                "Cleanup",
+            ] {
+                evs.push(PbRunnerEvent {
+                    kind: PbEvent::StateChanged as i32,
+                    state: s.into(),
+                    ..Default::default()
+                });
+            }
+            evs.push(PbRunnerEvent {
+                kind: PbEvent::Completed as i32,
+                state: "Completed".into(),
+                files_created: 20,
+                bytes_written: 40960,
+                inject_ms: 7,
+                detail: String::new(),
+            });
+            Ok(tonic::Response::new(Box::pin(tokio_stream::iter(
+                evs.into_iter().map(Ok),
+            ))))
+        }
+
+        async fn heartbeat(
+            &self,
+            _req: tonic::Request<PbHbReq>,
+        ) -> Result<tonic::Response<PbHbReply>, tonic::Status> {
+            Ok(tonic::Response::new(PbHbReply {
+                state: "Idle".into(),
+                healthy: true,
+            }))
+        }
+    }
+
+    async fn start_mock_runner() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(RunnerControlServer::new(MockRunner))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn dispatches_to_live_runner() {
+        let url = start_mock_runner().await;
+        let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["status"], "COMPLETED");
+        assert_eq!(body["execution"]["mode"], "dispatched");
+        assert_eq!(body["execution"]["runner_final_state"], "Completed");
+        assert_eq!(body["execution"]["files_created"], 20);
+        assert_eq!(body["execution"]["runner_endpoint"], url);
     }
 }

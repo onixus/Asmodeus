@@ -17,13 +17,11 @@ pub enum EngineError {
 }
 
 /// Result of a completed run.
+/// The engine drives the lifecycle; measurements are a catalog/telemetry
+/// concern (see `http.rs`), so the outcome is just the terminal state.
 #[derive(Debug, Clone)]
 pub struct Outcome {
     pub final_state: RunState,
-    pub mttd_ms: u64,
-    pub mttr_ms: u64,
-    pub blue_team_detected: bool,
-    pub detector: &'static str,
 }
 
 /// Execute a scenario end to end. Every step is a checked state transition:
@@ -43,13 +41,7 @@ pub fn execute(entry: &ScenarioEntry) -> Result<Outcome, EngineError> {
     state = state.on(RunEvent::Cleanup)?;
     state = state.on(RunEvent::Complete)?;
 
-    Ok(Outcome {
-        final_state: state,
-        mttd_ms: entry.sim_mttd_ms,
-        mttr_ms: entry.sim_mttr_ms,
-        blue_team_detected: true,
-        detector: entry.detector,
-    })
+    Ok(Outcome { final_state: state })
 }
 
 #[cfg(test)]
@@ -64,7 +56,6 @@ mod tests {
             let entry = cat.get(id).unwrap();
             let outcome = execute(entry).unwrap();
             assert_eq!(outcome.final_state, RunState::Completed);
-            assert!(outcome.blue_team_detected);
         }
     }
 }

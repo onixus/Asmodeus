@@ -78,4 +78,5 @@
 - [x] Runner: синтетический canary-инъектор (обратимый XOR, scope-guard, авто-очистка)
 - [x] Safety: circuit breaker + dead-man switch; Telemetry: MTTD/MTTR + экспортёр Prometheus
 - [x] gRPC/mTLS канал: proto-контракт (tonic), RunnerControl-сервер в раннере, mTLS-обвязка
-- [ ] *Следующий этап*: диспатч из control-plane в живой раннер (замена in-process симуляции) + CLI
+- [x] Замкнутый контур: control-plane диспатчит подписанный сценарий в живой раннер по gRPC (REST → gRPC → инъекция → откат)
+- [ ] *Следующий этап*: операторский CLI (`keygen`/`sign`/`validate`/`run`)

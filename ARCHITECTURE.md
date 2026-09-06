@@ -191,4 +191,6 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
 - **Runner** (`asmodeus-runner`): синтетический canary-инъектор (обратимый XOR, scope-guard) + gRPC-сервер `RunnerControl` (проверка подписи → INV-0 → инъекция → стрим событий), проверен end-to-end по TCP.
 - **Proto** (`asmodeus-proto`): tonic-контракт `RunnerControl`, mTLS-обвязка (сертификаты из env — операторские).
 
-Осталось: диспатч из control-plane в живой раннер (замена in-process симуляции), заполнение `asmodeus-cli` и `asmodeus-testkit`, eBPF-инъекция сетевого хаоса (только на Linux-стенде).
+- **Замкнутый контур**: при заданном `ASMODEUS_RUNNER_ENDPOINT` control-plane диспатчит подписанный сценарий в живой раннер по gRPC и сворачивает поток событий; иначе — in-process симуляция. Проверено сквозным прогоном двух бинарников.
+
+Осталось: заполнение `asmodeus-cli` (операторский keygen/sign/validate/run) и `asmodeus-testkit`, eBPF-инъекция сетевого хаоса (только на Linux-стенде).

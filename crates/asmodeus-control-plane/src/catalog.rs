@@ -23,6 +23,9 @@ pub struct ScenarioEntry {
     /// Synthetic, deterministic measurements for the MVP (real runs measure).
     pub sim_mttd_ms: u64,
     pub sim_mttr_ms: u64,
+    /// Injection parameters passed to the runner over gRPC.
+    pub file_count: u32,
+    pub chunk_size_kb: u32,
 }
 
 /// The scenario catalog plus the trusted signing public key.
@@ -76,6 +79,8 @@ impl Catalog {
                     signature,
                     sim_mttd_ms: mttd,
                     sim_mttr_ms: mttr,
+                    file_count: 20,
+                    chunk_size_kb: 64,
                 },
             );
         };

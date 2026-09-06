@@ -1,9 +1,11 @@
 //! asmodeus-control-plane — central coordinator: REST (OpenAPI 3.1) for the
 //! APEX gateway, RBAC engine (CISO/Auditor/SecOps => 403), signed-scenario
-//! catalog and the run state machine. gRPC to runners lands next.
-//! Budget: <= 10% CPU / <= 128 MB RAM (ARCHITECTURE.md §6).
+//! catalog and the run state machine. Dispatches signed scenarios to live
+//! runners over gRPC when `ASMODEUS_RUNNER_ENDPOINT` is set, else simulates
+//! in-process. Budget: <= 10% CPU / <= 128 MB RAM (ARCHITECTURE.md §6).
 
 mod catalog;
+mod dispatch;
 mod engine;
 mod http;
 
