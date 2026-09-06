@@ -20,6 +20,14 @@ use crate::canary::CanaryInjector;
 #[derive(Debug, Default, Clone)]
 pub struct RunnerService;
 
+/// Resource caps for a single injection, derived from the runner budget
+/// (<= 20 MB disk / <= 32 MB RAM, ARCHITECTURE.md §6). A request that exceeds
+/// any of these is refused before a single file is written, so an unbounded
+/// `file_count`/`chunk_size_kb` cannot exhaust memory or fill the sandbox.
+pub const MAX_FILE_COUNT: u32 = 1000;
+pub const MAX_CHUNK_KB: u32 = 256;
+pub const MAX_TOTAL_KB: u64 = 20 * 1024;
+
 /// Convenience constructors for the wire event.
 fn state_event(state: RunState) -> RunnerEvent {
     RunnerEvent {
@@ -51,10 +59,21 @@ impl RunnerService {
             return vec![rejected(format!("rejected: {reason:?}"))];
         }
 
+        // 3. Resource bounds: refuse oversized requests before any allocation
+        //    or write, so a client cannot exhaust memory or fill the sandbox.
+        let chunk_kb = req.chunk_size_kb.max(1);
+        let total_kb = req.file_count as u64 * chunk_kb as u64;
+        if req.file_count > MAX_FILE_COUNT || chunk_kb > MAX_CHUNK_KB || total_kb > MAX_TOTAL_KB {
+            return vec![rejected(format!(
+                "resource limit exceeded: file_count={} (max {MAX_FILE_COUNT}), chunk_kb={chunk_kb} (max {MAX_CHUNK_KB}), total_kb={total_kb} (max {MAX_TOTAL_KB})",
+                req.file_count
+            ))];
+        }
+
         let injector = match CanaryInjector::new(
             &req.target_dir,
             req.file_count as usize,
-            req.chunk_size_kb.max(1) as usize,
+            chunk_kb as usize,
         ) {
             Ok(i) => i,
             Err(e) => return vec![rejected(e.to_string())],
@@ -156,6 +175,41 @@ mod tests {
             .unwrap()
             .as_nanos();
         format!("/tmp/asmodeus-canary/grpc-{n}")
+    }
+
+    fn signed_request(file_count: u32, chunk_size_kb: u32) -> ExecuteRequest {
+        let kp = KeyPair::generate();
+        let manifest = b"kind: AttackScenario\nid: SCN-RT-001\n".to_vec();
+        let signature = kp.sk.sign(&manifest, None).as_ref().to_vec();
+        ExecuteRequest {
+            scenario_id: "RANSOMWARE_CANARY_SPIKE".into(),
+            manifest,
+            signature,
+            public_key: kp.pk.as_ref().to_vec(),
+            target_dir: unique_dir(),
+            file_count,
+            chunk_size_kb,
+        }
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_injection() {
+        // A signed, in-scope request with an absurd file_count must be refused
+        // by the resource bound, not run.
+        let req = signed_request(4_000_000_000, 1_000_000);
+        let events = RunnerService::plan(&req);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Rejected as i32);
+        assert!(events[0].detail.contains("resource limit exceeded"));
+        // The sandbox dir must not have been created.
+        assert!(!std::path::Path::new(&req.target_dir).exists());
+    }
+
+    #[test]
+    fn within_limits_request_runs() {
+        let req = signed_request(5, 1);
+        let events = RunnerService::plan(&req);
+        assert_eq!(events.last().unwrap().kind, EventKind::Completed as i32);
     }
 
     async fn start_server() -> String {

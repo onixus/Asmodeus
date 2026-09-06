@@ -167,6 +167,14 @@ async fn run_scenario(
                 "runner rejected: {reason}"
             )));
         }
+        if !out.completed {
+            // Stream ended without a terminal Completed event: the run did not
+            // finish. Never record it as a success.
+            return Err(ApiError::Internal(format!(
+                "runner ended without completing (last state: {})",
+                out.final_state
+            )));
+        }
         (
             RunState::Completed,
             json!({
@@ -468,6 +476,54 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// A runner whose Execute stream ends after Injecting, with no Completed
+    /// and no Rejected event — a partial/failed run.
+    #[derive(Default)]
+    struct PartialRunner;
+
+    #[tonic::async_trait]
+    impl RunnerControl for PartialRunner {
+        type ExecuteStream =
+            Pin<Box<dyn Stream<Item = Result<PbRunnerEvent, tonic::Status>> + Send + 'static>>;
+
+        async fn execute(
+            &self,
+            _req: tonic::Request<PbExecute>,
+        ) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
+            let evs = ["Validated", "Armed", "Injecting"].map(|s| PbRunnerEvent {
+                kind: PbEvent::StateChanged as i32,
+                state: s.into(),
+                ..Default::default()
+            });
+            Ok(tonic::Response::new(Box::pin(tokio_stream::iter(
+                evs.into_iter().map(Ok),
+            ))))
+        }
+
+        async fn heartbeat(
+            &self,
+            _req: tonic::Request<PbHbReq>,
+        ) -> Result<tonic::Response<PbHbReply>, tonic::Status> {
+            Ok(tonic::Response::new(PbHbReply {
+                state: "Injecting".into(),
+                healthy: false,
+            }))
+        }
+    }
+
+    async fn start_partial_runner() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(RunnerControlServer::new(PartialRunner))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn dispatches_to_live_runner() {
         let url = start_mock_runner().await;
@@ -489,5 +545,21 @@ mod tests {
         assert_eq!(body["execution"]["runner_final_state"], "Completed");
         assert_eq!(body["execution"]["files_created"], 20);
         assert_eq!(body["execution"]["runner_endpoint"], url);
+    }
+
+    #[tokio::test]
+    async fn partial_runner_is_not_reported_completed() {
+        let url = start_partial_runner().await;
+        let app = router(AppState::with_runner(Catalog::seeded(), Some(url)));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // A run that never completed must not be a 200 success.
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

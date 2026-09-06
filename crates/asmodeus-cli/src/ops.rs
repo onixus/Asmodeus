@@ -35,13 +35,23 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub fn from_hex(s: &str) -> Result<Vec<u8>, OpError> {
-    let s = s.trim();
-    if !s.len().is_multiple_of(2) {
+    // Work on bytes: slicing a str by byte index would panic on multibyte
+    // (non-ASCII) input. A hex digit is a single ASCII byte, so bytes are correct.
+    let bytes = s.trim().as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err(OpError::BadHex);
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| OpError::BadHex))
+    let nibble = |b: u8| -> Result<u8, OpError> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err(OpError::BadHex),
+        }
+    };
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }
 
@@ -87,6 +97,14 @@ mod tests {
         assert_eq!(from_hex("00a5ff10").unwrap(), bytes);
         assert!(from_hex("xyz").is_err());
         assert!(from_hex("abc").is_err()); // odd length
+    }
+
+    #[test]
+    fn from_hex_rejects_non_ascii_without_panic() {
+        // Multibyte UTF-8 input must return BadHex, never panic on a str slice.
+        assert_eq!(from_hex("aéa"), Err(OpError::BadHex));
+        assert_eq!(from_hex("éé"), Err(OpError::BadHex));
+        assert_eq!(from_hex("00é0"), Err(OpError::BadHex));
     }
 
     #[test]

@@ -11,7 +11,13 @@ use asmodeus_common::{ActionNature, RunState};
 /// Canary filesystem sandbox: the only paths any runner action may touch.
 pub const CANARY_PREFIXES: [&str; 2] = ["/var/tmp/asmodeus-canary/", "/tmp/asmodeus-canary/"];
 
+/// True iff `path` is confined to the canary blast radius. A bare prefix check
+/// is not enough: `..` components let a prefixed path escape the sandbox, so
+/// any traversal component rejects the path before the prefix check (INV-0).
 pub fn path_in_scope(path: &str) -> bool {
+    if path.split('/').any(|component| component == "..") {
+        return false;
+    }
     CANARY_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
@@ -56,5 +62,18 @@ mod tests {
     fn out_of_scope_path_is_rejected() {
         let r = validate(ActionNature::Synthetic, "/etc/passwd");
         assert_eq!(r, Err(RejectReason::OutOfScope));
+    }
+
+    #[test]
+    fn traversal_out_of_canary_is_rejected() {
+        // A prefixed path that escapes via `..` must not pass the gate.
+        assert!(!path_in_scope("/tmp/asmodeus-canary/../../etc/asmodeus"));
+        assert!(!path_in_scope("/tmp/asmodeus-canary/a/../../b"));
+        assert_eq!(
+            validate(ActionNature::Synthetic, "/tmp/asmodeus-canary/../../etc"),
+            Err(RejectReason::OutOfScope)
+        );
+        // A clean path inside the sandbox still passes.
+        assert!(path_in_scope("/tmp/asmodeus-canary/canary_000.docx"));
     }
 }

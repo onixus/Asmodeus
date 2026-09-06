@@ -14,6 +14,8 @@ pub struct DispatchOutcome {
     pub files_created: u32,
     pub bytes_written: u64,
     pub inject_ms: u64,
+    /// True iff the runner emitted a terminal `Completed` event.
+    pub completed: bool,
     /// Present iff the runner refused the scenario (signature / scope / INV-0).
     pub rejected: Option<String>,
 }
@@ -46,6 +48,7 @@ pub async fn dispatch(endpoint: &str, req: ExecuteRequest) -> Result<DispatchOut
         match EventKind::try_from(ev.kind) {
             Ok(EventKind::StateChanged) => outcome.final_state = ev.state,
             Ok(EventKind::Completed) => {
+                outcome.completed = true;
                 outcome.final_state = ev.state;
                 outcome.files_created = ev.files_created;
                 outcome.bytes_written = ev.bytes_written;
