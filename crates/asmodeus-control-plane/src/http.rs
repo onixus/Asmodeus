@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use asmodeus_common::{Category, Role, RunId, RunState, INV_0_SYNTHETIC_ONLY};
+use asmodeus_telemetry::{Aggregate, Measurements};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -24,6 +25,7 @@ use crate::engine::{self, EngineError};
 pub struct AppState {
     catalog: Arc<Catalog>,
     runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+    metrics: Arc<Mutex<Aggregate>>,
     counter: Arc<AtomicU64>,
 }
 
@@ -32,6 +34,7 @@ impl AppState {
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Mutex::new(Aggregate::default())),
             counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -46,6 +49,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/api/v1/asmodeus/scenarios/:id/run", post(run_scenario))
         .route("/api/v1/asmodeus/scenarios/abort", post(abort_all))
         .route("/api/v1/asmodeus/telemetry/mttd", get(telemetry_mttd))
@@ -91,6 +95,17 @@ async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok", "invariant": INV_0_SYNTHETIC_ONLY }))
 }
 
+/// Prometheus scrape endpoint (TT §4.3). Unauthenticated, like any exporter.
+async fn metrics(State(state): State<AppState>) -> Response {
+    let body = state.metrics.lock().unwrap().prometheus_text();
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response()
+}
+
 async fn run_scenario(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -133,6 +148,11 @@ async fn run_scenario(
         .lock()
         .unwrap()
         .insert(run_id.clone(), outcome.final_state);
+    state.metrics.lock().unwrap().record(Measurements {
+        mttd_ms: outcome.mttd_ms,
+        mttr_ms: outcome.mttr_ms,
+        blue_team_detected: outcome.blue_team_detected,
+    });
 
     Ok(Json(json!({
         "run_id": run_id.to_string(),
@@ -185,9 +205,13 @@ async fn telemetry_mttd(
         .values()
         .filter(|s| s.is_terminal())
         .count();
+    let agg = state.metrics.lock().unwrap();
     Ok(Json(json!({
         "runs_completed": completed,
         "catalog_size": state.catalog.ids().count(),
+        "mean_mttd_ms": agg.mean_mttd_ms(),
+        "mean_mttr_ms": agg.mean_mttr_ms(),
+        "detection_rate_pct": agg.detection_rate_pct(),
     })))
 }
 
@@ -286,6 +310,34 @@ mod tests {
     async fn unknown_scenario_is_not_found() {
         let (status, _) = send("POST", "/api/v1/asmodeus/scenarios/NOPE/run", Some("admin")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_reflect_a_run() {
+        // Drive one run then scrape /metrics on the SAME app instance.
+        let app = router(AppState::new(Catalog::seeded()));
+        let run = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(run).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let scrape = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(scrape).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("asmodeus_scenarios_executed_total 1"));
+        assert!(text.contains("asmodeus_mttd_seconds 0.142"));
     }
 
     #[tokio::test]

@@ -75,4 +75,6 @@
 - [x] Скелет workspace: 10 крейтов, собирается (`cargo build --workspace`)
 - [x] MVP-ядро: стейт-машина жизненного цикла, RBAC-матрица, верификация Ed25519 (24 теста)
 - [x] Control-plane: axum REST-сервер, каталог подписанных сценариев, движок прогона
-- [ ] *Следующий этап*: gRPC/mTLS канал к раннеру + синтетический canary-инъектор
+- [x] Runner: синтетический canary-инъектор (обратимый XOR, scope-guard, авто-очистка)
+- [x] Safety: circuit breaker + dead-man switch; Telemetry: MTTD/MTTR + экспортёр Prometheus
+- [ ] *Следующий этап*: gRPC/mTLS канал control-plane ↔ runner (tonic)

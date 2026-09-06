@@ -6,9 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[bin]]
+name = "asmodeus-runner"
+path = "src/main.rs"
+
 [dependencies]
 asmodeus-common = { workspace = true }
-asmodeus-proto = { workspace = true }
-asmodeus-crypto = { workspace = true }
 asmodeus-dsl = { workspace = true }
 asmodeus-safety = { workspace = true }
