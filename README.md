@@ -79,4 +79,5 @@
 - [x] Safety: circuit breaker + dead-man switch; Telemetry: MTTD/MTTR + экспортёр Prometheus
 - [x] gRPC/mTLS канал: proto-контракт (tonic), RunnerControl-сервер в раннере, mTLS-обвязка
 - [x] Замкнутый контур: control-plane диспатчит подписанный сценарий в живой раннер по gRPC (REST → gRPC → инъекция → откат)
-- [ ] *Следующий этап*: операторский CLI (`keygen`/`sign`/`validate`/`run`)
+- [x] Операторский CLI (`asmodeus`): `keygen`/`sign`/`verify`/`validate` — офлайн-подпись сценариев (Ed25519)
+- [ ] *Следующий этап*: `asmodeus run`/`status` (REST к control-plane) + заполнение testkit

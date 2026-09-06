@@ -6,7 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[bin]]
+name = "asmodeus"
+path = "src/main.rs"
+
 [dependencies]
 asmodeus-common = { workspace = true }
 asmodeus-crypto = { workspace = true }
 asmodeus-dsl = { workspace = true }
+clap = { workspace = true }
+ed25519-compact = { workspace = true }

@@ -175,6 +175,7 @@ cargo build --workspace        # весь workspace
 cargo test  --workspace        # 37 тестов (ядро, RBAC, крипта, DSL, REST, gRPC, canary)
 cargo run -p asmodeus-control-plane   # REST на 127.0.0.1:8842 (ASMODEUS_LISTEN)
 cargo run -p asmodeus-runner          # gRPC RunnerControl на 127.0.0.1:8850 (ASMODEUS_RUNNER_LISTEN)
+cargo run -p asmodeus-cli -- keygen   # операторский CLI: keygen/sign/verify/validate
 ASMODEUS_DRY_RUN=1 cargo run -p asmodeus-runner   # локальный синтетический прогон без control-plane
 ```
 
@@ -193,4 +194,6 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
 
 - **Замкнутый контур**: при заданном `ASMODEUS_RUNNER_ENDPOINT` control-plane диспатчит подписанный сценарий в живой раннер по gRPC и сворачивает поток событий; иначе — in-process симуляция. Проверено сквозным прогоном двух бинарников.
 
-Осталось: заполнение `asmodeus-cli` (операторский keygen/sign/validate/run) и `asmodeus-testkit`, eBPF-инъекция сетевого хаоса (только на Linux-стенде).
+- **CLI** (`asmodeus-cli`): офлайн-подпись сценариев оператором — `keygen`/`sign`/`verify`/`validate` (Ed25519, ключ пишется с правами 0600).
+
+Осталось: `asmodeus run`/`status` (REST к control-plane), заполнение `asmodeus-testkit`, eBPF-инъекция сетевого хаоса (только на Linux-стенде).
