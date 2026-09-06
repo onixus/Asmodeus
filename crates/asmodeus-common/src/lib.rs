@@ -39,3 +39,33 @@ pub enum Error {
 
 pub const EXERCISE_TAG_RED_TEAM: &str = "🔴 [RED TEAM EXERCISE]";
 pub const EXERCISE_TAG_CHAOS: &str = "⚡ [CHAOS TEST]";
+
+/// INV-0 (Synthetic-Only): the root safety invariant of Asmodeus.
+///
+/// Asmodeus imitates adversary techniques to measure Blue Team response; it
+/// never carries operational capability. Every action must be a synthetic
+/// marker (canary files, pseudo-encryption in canary scope, benign probes,
+/// test-segment network noise). Real malware, working exploits, real container
+/// escape, defense-evasion, or targeting outside the canary scope are
+/// OUT OF PROJECT SCOPE and must not be merged (see ARCHITECTURE.md §0).
+///
+/// The boundary is defined by the nature of the artifact, not the dev phase.
+pub const INV_0_SYNTHETIC_ONLY: &str =
+    "Asmodeus is synthetic-only: imitate techniques, never carry operational capability";
+
+/// Classifies whether a runner action stays within INV-0. Real/operational
+/// payloads are rejected before any state transition into `Injecting`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionNature {
+    /// Synthetic marker or benign probe — permitted.
+    Synthetic,
+    /// Operational/weaponizable capability — forbidden, out of scope.
+    Operational,
+}
+
+impl ActionNature {
+    /// INV-0 gate: only synthetic actions may execute.
+    pub fn is_permitted(self) -> bool {
+        matches!(self, ActionNature::Synthetic)
+    }
+}
