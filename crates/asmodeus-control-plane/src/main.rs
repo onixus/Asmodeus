@@ -1,10 +1,34 @@
 //! asmodeus-control-plane — central coordinator: REST (OpenAPI 3.1) for the
-//! APEX gateway, mTLS gRPC to runners, RBAC engine (CISO/Auditor => 403),
-//! signed-scenario catalog and the run state machine.
-//! Budget: <= 10% CPU / <= 128 MB RAM (see ARCHITECTURE.md §6).
-fn main() {
-    println!(
-        "asmodeus-control-plane {} — not serving yet (skeleton)",
-        env!("CARGO_PKG_VERSION")
-    );
+//! APEX gateway, RBAC engine (CISO/Auditor/SecOps => 403), signed-scenario
+//! catalog and the run state machine. gRPC to runners lands next.
+//! Budget: <= 10% CPU / <= 128 MB RAM (ARCHITECTURE.md §6).
+
+mod catalog;
+mod engine;
+mod http;
+
+use std::net::SocketAddr;
+
+use catalog::Catalog;
+use http::{router, AppState};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let state = AppState::new(Catalog::seeded());
+    let app = router(state);
+
+    let addr: SocketAddr = std::env::var("ASMODEUS_LISTEN")
+        .unwrap_or_else(|_| "127.0.0.1:8842".into())
+        .parse()?;
+
+    tracing::info!(%addr, "asmodeus-control-plane listening (synthetic-only, INV-0)");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }

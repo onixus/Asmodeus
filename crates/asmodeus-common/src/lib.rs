@@ -1,65 +1,74 @@
-//! asmodeus-common — shared domain types, error taxonomy and config primitives
-//! used across every Asmodeus crate. No external dependencies at skeleton stage.
+//! asmodeus-common — the core domain of Asmodeus: roles and the RBAC matrix,
+//! the run lifecycle state machine, ids, exercise tags and the root INV-0 gate.
+//! No async, no I/O — pure logic that every other crate builds on.
 
-/// Roles recognised by the RBAC engine. The CISO/Auditor/SecOps invariant
-/// (403 on any run/inject) is enforced in `asmodeus-control-plane`, never in
-/// the upstream APEX gateway.
+pub mod rbac;
+pub mod state;
+
+pub use rbac::{Capability, Role};
+pub use state::{RunEvent, RunState, StateError};
+
+use std::fmt;
+
+/// Category of a scenario. Decides which RBAC capability the caller needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Admin,
+pub enum Category {
+    /// Adversary emulation / BAS — requires `Capability::RunRedTeam`.
     RedTeam,
-    DevSecOps,
-    Ciso,
-    SecOps,
-    Auditor,
+    /// Infrastructure chaos — requires `Capability::InjectChaos`.
+    Chaos,
 }
 
-/// Canonical lifecycle state of a scenario run (see ARCHITECTURE.md §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunState {
-    Idle,
-    Validated,
-    Armed,
-    Injecting,
-    Detected,
-    Contained,
-    CircuitBreakerTripped,
-    Cleanup,
-    Completed,
+impl Category {
+    pub fn required_capability(self) -> Capability {
+        match self {
+            Category::RedTeam => Capability::RunRedTeam,
+            Category::Chaos => Capability::InjectChaos,
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            Category::RedTeam => EXERCISE_TAG_RED_TEAM,
+            Category::Chaos => EXERCISE_TAG_CHAOS,
+        }
+    }
 }
 
-/// Placeholder crate-wide error type; widen with `thiserror` when wiring deps.
-#[derive(Debug)]
-pub enum Error {
-    Unauthorized,
-    InvalidSignature,
-    OutOfScope,
-    CircuitBreaker,
+/// Opaque run identifier, e.g. `run_98f41e2a`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RunId(pub String);
+
+impl RunId {
+    pub fn new(raw: impl Into<String>) -> Self {
+        RunId(raw.into())
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 pub const EXERCISE_TAG_RED_TEAM: &str = "🔴 [RED TEAM EXERCISE]";
 pub const EXERCISE_TAG_CHAOS: &str = "⚡ [CHAOS TEST]";
 
-/// INV-0 (Synthetic-Only): the root safety invariant of Asmodeus.
-///
-/// Asmodeus imitates adversary techniques to measure Blue Team response; it
-/// never carries operational capability. Every action must be a synthetic
-/// marker (canary files, pseudo-encryption in canary scope, benign probes,
-/// test-segment network noise). Real malware, working exploits, real container
-/// escape, defense-evasion, or targeting outside the canary scope are
-/// OUT OF PROJECT SCOPE and must not be merged (see ARCHITECTURE.md §0).
-///
-/// The boundary is defined by the nature of the artifact, not the dev phase.
+// ---------------------------------------------------------------------------
+// INV-0 — Synthetic-Only, the root safety invariant (see ARCHITECTURE.md §0).
+// ---------------------------------------------------------------------------
+
+/// Human-readable statement of INV-0, referenced by the DSL validator.
 pub const INV_0_SYNTHETIC_ONLY: &str =
     "Asmodeus is synthetic-only: imitate techniques, never carry operational capability";
 
-/// Classifies whether a runner action stays within INV-0. Real/operational
-/// payloads are rejected before any state transition into `Injecting`.
+/// Whether a runner action is a synthetic marker or an operational capability.
+/// Operational actions are OUT OF PROJECT SCOPE and rejected before `Injecting`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionNature {
     /// Synthetic marker or benign probe — permitted.
     Synthetic,
-    /// Operational/weaponizable capability — forbidden, out of scope.
+    /// Operational / weaponizable capability — forbidden.
     Operational,
 }
 

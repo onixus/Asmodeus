@@ -171,10 +171,19 @@ Release-профиль (`Cargo.toml`) настроен на минимальны
 ## 9. Сборка
 
 ```bash
-cargo build --workspace        # весь скелет
-cargo run -p asmodeus-cli      # операторский CLI
-cargo run -p asmodeus-control-plane
-cargo run -p asmodeus-runner
+cargo build --workspace        # весь workspace
+cargo test  --workspace        # 24 теста (ядро, RBAC, крипта, DSL, REST)
+cargo run -p asmodeus-control-plane   # REST на 127.0.0.1:8842 (ASMODEUS_LISTEN)
+cargo run -p asmodeus-cli
 ```
 
 Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `clippy`).
+
+### Реализовано (MVP-ядро + control-plane)
+
+- **Ядро** (`asmodeus-common`): RBAC-матрица `Role × Capability` (§3, инвариант CISO/SecOps/Auditor → read-only) и стейт-машина `RunState::on(RunEvent)` — тотальная функция без паник, инвариант «нет `Injecting` без `Armed`».
+- **Крипта** (`asmodeus-crypto`): реальная верификация Ed25519 на `ed25519-compact`.
+- **DSL-гейт** (`asmodeus-dsl`): `validate` отклоняет несинтетические (INV-0) и вне-scope манифесты.
+- **Control-plane** (`asmodeus-control-plane`): axum-сервер, каталог самоподписанных сценариев, движок прогона поверх стейт-машины. Эндпоинты: `POST /scenarios/:id/run`, `POST /scenarios/abort`, `GET /telemetry/mttd`, `GET /healthz`. RBAC даёт `401/403/404/422` строго по ролям.
+
+Осталось: gRPC/mTLS канал к раннеру, синтетический canary-инъектор в `asmodeus-runner`, экспортёр Prometheus в `asmodeus-telemetry`.

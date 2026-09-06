@@ -8,3 +8,5 @@ publish = false
 
 [dependencies]
 asmodeus-common = { workspace = true }
+ed25519-compact = { workspace = true }
+thiserror = { workspace = true }

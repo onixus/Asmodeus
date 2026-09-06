@@ -36,6 +36,17 @@ asmodeus-control-plane= { path = "crates/asmodeus-control-plane" }
 asmodeus-telemetry    = { path = "crates/asmodeus-telemetry" }
 asmodeus-testkit      = { path = "crates/asmodeus-testkit" }
 
+# External deps (see ARCHITECTURE.md §7). Pinned major versions.
+ed25519-compact = { version = "2", features = ["random"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [profile.release]
 opt-level = "z"
 lto = true
