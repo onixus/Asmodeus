@@ -16,3 +16,5 @@ asmodeus-crypto = { workspace = true }
 asmodeus-dsl = { workspace = true }
 clap = { workspace = true }
 ed25519-compact = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }

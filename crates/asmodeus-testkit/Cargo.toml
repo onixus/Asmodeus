@@ -8,4 +8,6 @@ publish = false
 
 [dependencies]
 asmodeus-common = { workspace = true }
+asmodeus-crypto = { workspace = true }
 asmodeus-dsl = { workspace = true }
+ed25519-compact = { workspace = true }

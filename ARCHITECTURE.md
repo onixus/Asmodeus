@@ -172,7 +172,7 @@ Release-профиль (`Cargo.toml`) настроен на минимальны
 
 ```bash
 cargo build --workspace        # весь workspace
-cargo test  --workspace        # 37 тестов (ядро, RBAC, крипта, DSL, REST, gRPC, canary)
+cargo test  --workspace        # 46 тестов (ядро, RBAC, крипта, DSL, REST, gRPC, canary, CLI, testkit)
 cargo run -p asmodeus-control-plane   # REST на 127.0.0.1:8842 (ASMODEUS_LISTEN)
 cargo run -p asmodeus-runner          # gRPC RunnerControl на 127.0.0.1:8850 (ASMODEUS_RUNNER_LISTEN)
 cargo run -p asmodeus-cli -- keygen   # операторский CLI: keygen/sign/verify/validate
@@ -194,6 +194,7 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
 
 - **Замкнутый контур**: при заданном `ASMODEUS_RUNNER_ENDPOINT` control-plane диспатчит подписанный сценарий в живой раннер по gRPC и сворачивает поток событий; иначе — in-process симуляция. Проверено сквозным прогоном двух бинарников.
 
-- **CLI** (`asmodeus-cli`): офлайн-подпись сценариев оператором — `keygen`/`sign`/`verify`/`validate` (Ed25519, ключ пишется с правами 0600).
+- **CLI** (`asmodeus-cli`): операторский цикл — `keygen`/`sign`/`verify`/`validate` (офлайн, Ed25519, ключ 0600) и `run`/`status` (REST к control-plane).
+- **Testkit** (`asmodeus-testkit`): `Polygon` (self-cleaning canary-песочница) и `signed_scenario` (фикстура подписанного манифеста).
 
-Осталось: `asmodeus run`/`status` (REST к control-plane), заполнение `asmodeus-testkit`, eBPF-инъекция сетевого хаоса (только на Linux-стенде).
+Осталось (только на Linux-стенде): eBPF-инъекция сетевого хаоса в раннере через `aya` — на macOS не проверяется.

@@ -80,4 +80,6 @@
 - [x] gRPC/mTLS канал: proto-контракт (tonic), RunnerControl-сервер в раннере, mTLS-обвязка
 - [x] Замкнутый контур: control-plane диспатчит подписанный сценарий в живой раннер по gRPC (REST → gRPC → инъекция → откат)
 - [x] Операторский CLI (`asmodeus`): `keygen`/`sign`/`verify`/`validate` — офлайн-подпись сценариев (Ed25519)
-- [ ] *Следующий этап*: `asmodeus run`/`status` (REST к control-plane) + заполнение testkit
+- [x] CLI `run`/`status` (REST к control-plane) и `asmodeus-testkit` (полигон + фикстуры подписи)
+- [x] **MVP собран end-to-end**: 46 тестов, 10/10 крейтов с логикой
+- [ ] *Следующий этап (Linux-стенд)*: eBPF-инъекция сетевого хаоса в раннере (aya)
