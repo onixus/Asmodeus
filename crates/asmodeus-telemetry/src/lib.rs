@@ -10,6 +10,10 @@ pub struct Measurements {
     pub blue_team_detected: bool,
 }
 
+/// Containment-time target (ms). A run remediated within this scores full
+/// recovery; slower runs scale the recovery component down.
+pub const TARGET_MTTR_MS: u64 = 300;
+
 /// Integral 0..100 cyber-resilience index.
 pub fn resilience_score(attacks_repelled_pct: f32, recovery_speed_pct: f32) -> u8 {
     (0.5 * attacks_repelled_pct + 0.5 * recovery_speed_pct).clamp(0.0, 100.0) as u8
@@ -54,9 +58,24 @@ impl Aggregate {
         100.0 * self.detected as f32 / self.scenarios_executed as f32
     }
 
+    /// Recovery speed as a percentage of the containment target (0..100):
+    /// meeting or beating `TARGET_MTTR_MS` scores 100, slower runs scale down
+    /// linearly. This is the recovery half of the resilience score, so a slow
+    /// Blue Team actually lowers the index instead of it being a constant.
+    pub fn recovery_speed_pct(&self) -> f32 {
+        if self.scenarios_executed == 0 {
+            return 0.0;
+        }
+        let mean = self.mean_mttr_ms();
+        if mean == 0 {
+            return 100.0;
+        }
+        (100.0 * TARGET_MTTR_MS as f32 / mean as f32).clamp(0.0, 100.0)
+    }
+
     /// Prometheus text exposition (see TT §4.3).
     pub fn prometheus_text(&self) -> String {
-        let score = resilience_score(self.detection_rate_pct(), 100.0);
+        let score = resilience_score(self.detection_rate_pct(), self.recovery_speed_pct());
         format!(
             "# HELP asmodeus_resilience_score Integral cyber-resilience index (0..100)\n\
              # TYPE asmodeus_resilience_score gauge\n\
@@ -125,5 +144,31 @@ mod tests {
         let agg = Aggregate::default();
         assert_eq!(agg.mean_mttd_ms(), 0);
         assert_eq!(agg.detection_rate_pct(), 0.0);
+        assert_eq!(agg.recovery_speed_pct(), 0.0);
+    }
+
+    #[test]
+    fn slow_recovery_lowers_the_score() {
+        // Same detection (100%); only recovery differs, so it must move the score.
+        let mut fast = Aggregate::default();
+        fast.record(Measurements {
+            mttd_ms: 100,
+            mttr_ms: 100, // within the 300ms target
+            blue_team_detected: true,
+        });
+        let mut slow = Aggregate::default();
+        slow.record(Measurements {
+            mttd_ms: 100,
+            mttr_ms: 3000, // 10x the target
+            blue_team_detected: true,
+        });
+
+        assert_eq!(fast.recovery_speed_pct(), 100.0);
+        assert!(slow.recovery_speed_pct() < 20.0); // 300/3000 * 100 = 10
+
+        let fast_score = resilience_score(fast.detection_rate_pct(), fast.recovery_speed_pct());
+        let slow_score = resilience_score(slow.detection_rate_pct(), slow.recovery_speed_pct());
+        assert_eq!(fast_score, 100);
+        assert!(slow_score < fast_score);
     }
 }

@@ -165,28 +165,19 @@ impl RunnerControl for RunnerService {
 mod tests {
     use super::*;
     use asmodeus_proto::{RunnerControlClient, RunnerControlServer};
-    use ed25519_compact::KeyPair;
+    use asmodeus_testkit::{signed_scenario, Polygon};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
-    fn unique_dir() -> String {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("/tmp/asmodeus-canary/grpc-{n}")
-    }
-
-    fn signed_request(file_count: u32, chunk_size_kb: u32) -> ExecuteRequest {
-        let kp = KeyPair::generate();
-        let manifest = b"kind: AttackScenario\nid: SCN-RT-001\n".to_vec();
-        let signature = kp.sk.sign(&manifest, None).as_ref().to_vec();
+    /// Build a signed, in-scope request targeting `poly`'s sandbox.
+    fn request_in(poly: &Polygon, file_count: u32, chunk_size_kb: u32) -> ExecuteRequest {
+        let s = signed_scenario("SCN-RT-001");
         ExecuteRequest {
             scenario_id: "RANSOMWARE_CANARY_SPIKE".into(),
-            manifest,
-            signature,
-            public_key: kp.pk.as_ref().to_vec(),
-            target_dir: unique_dir(),
+            manifest: s.manifest,
+            signature: s.signature,
+            public_key: s.public_key,
+            target_dir: poly.path(),
             file_count,
             chunk_size_kb,
         }
@@ -196,18 +187,20 @@ mod tests {
     fn oversized_request_is_rejected_before_injection() {
         // A signed, in-scope request with an absurd file_count must be refused
         // by the resource bound, not run.
-        let req = signed_request(4_000_000_000, 1_000_000);
+        let poly = Polygon::new("oversized");
+        let req = request_in(&poly, 4_000_000_000, 1_000_000);
         let events = RunnerService::plan(&req);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::Rejected as i32);
         assert!(events[0].detail.contains("resource limit exceeded"));
         // The sandbox dir must not have been created.
-        assert!(!std::path::Path::new(&req.target_dir).exists());
+        assert!(!poly.dir().exists());
     }
 
     #[test]
     fn within_limits_request_runs() {
-        let req = signed_request(5, 1);
+        let poly = Polygon::new("within");
+        let req = request_in(&poly, 5, 1);
         let events = RunnerService::plan(&req);
         assert_eq!(events.last().unwrap().kind, EventKind::Completed as i32);
     }
@@ -240,19 +233,8 @@ mod tests {
         let url = start_server().await;
         let mut client = connect(&url).await;
 
-        let kp = KeyPair::generate();
-        let manifest = b"kind: AttackScenario\nid: SCN-RT-001\n".to_vec();
-        let signature = kp.sk.sign(&manifest, None).as_ref().to_vec();
-
-        let req = ExecuteRequest {
-            scenario_id: "RANSOMWARE_CANARY_SPIKE".into(),
-            manifest,
-            signature,
-            public_key: kp.pk.as_ref().to_vec(),
-            target_dir: unique_dir(),
-            file_count: 5,
-            chunk_size_kb: 1,
-        };
+        let poly = Polygon::new("grpc-complete");
+        let req = request_in(&poly, 5, 1);
 
         let mut stream = client.execute(req).await.unwrap().into_inner();
         let mut states = Vec::new();
@@ -287,16 +269,10 @@ mod tests {
         let url = start_server().await;
         let mut client = connect(&url).await;
 
-        let kp = KeyPair::generate();
-        let req = ExecuteRequest {
-            scenario_id: "RANSOMWARE_CANARY_SPIKE".into(),
-            manifest: b"manifest".to_vec(),
-            signature: vec![0u8; 64],
-            public_key: kp.pk.as_ref().to_vec(),
-            target_dir: unique_dir(),
-            file_count: 3,
-            chunk_size_kb: 1,
-        };
+        // A valid manifest/key but a zeroed signature must be refused.
+        let poly = Polygon::new("grpc-badsig");
+        let mut req = request_in(&poly, 3, 1);
+        req.signature = vec![0u8; 64];
 
         let mut stream = client.execute(req).await.unwrap().into_inner();
         let ev = stream.message().await.unwrap().unwrap();

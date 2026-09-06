@@ -142,7 +142,7 @@ dependencies = [
  "asmodeus-dsl",
  "asmodeus-proto",
  "asmodeus-safety",
- "ed25519-compact",
+ "asmodeus-testkit",
  "prost",
  "tokio",
  "tokio-stream",
