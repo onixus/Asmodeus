@@ -1,0 +1,27 @@
+[package]
+name = "asmodeus-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "asmodeus-runner"
+path = "src/main.rs"
+
+[dependencies]
+asmodeus-common = { workspace = true }
+asmodeus-crypto = { workspace = true }
+asmodeus-dsl = { workspace = true }
+asmodeus-safety = { workspace = true }
+asmodeus-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+asmodeus-testkit = { workspace = true }

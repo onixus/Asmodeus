@@ -1,0 +1,67 @@
+//! asmodeus-runner — minimal execution probe. Serves the gRPC `RunnerControl`
+//! channel (mTLS in production) through which the control-plane dispatches
+//! signed, synthetic scenarios; the runner verifies, injects in canary scope
+//! and streams lifecycle events back. Budget: <= 5% CPU / <= 32 MB RAM (§6).
+//!
+//! `ASMODEUS_DRY_RUN=1` runs a standalone synthetic canary pass instead of
+//! serving — handy for local validation without a control-plane.
+
+mod canary;
+mod service;
+
+use std::net::SocketAddr;
+
+use asmodeus_common::EXERCISE_TAG_RED_TEAM;
+use asmodeus_proto::RunnerControlServer;
+use canary::CanaryInjector;
+use service::RunnerService;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    if std::env::var("ASMODEUS_DRY_RUN").is_ok() {
+        return dry_run();
+    }
+
+    let addr: SocketAddr = std::env::var("ASMODEUS_RUNNER_LISTEN")
+        .unwrap_or_else(|_| "127.0.0.1:8850".into())
+        .parse()?;
+
+    let mut server = tonic::transport::Server::builder();
+    match asmodeus_proto::tls::server_from_env()? {
+        Some(tls) => {
+            server = server.tls_config(tls)?;
+            tracing::info!(%addr, "asmodeus-runner serving RunnerControl over mTLS");
+        }
+        None => tracing::warn!(%addr, "asmodeus-runner serving RunnerControl WITHOUT TLS (dev)"),
+    }
+
+    server
+        .add_service(RunnerControlServer::new(RunnerService))
+        .serve(addr)
+        .await?;
+    Ok(())
+}
+
+/// Standalone synthetic canary pass (no control-plane).
+fn dry_run() -> Result<(), Box<dyn std::error::Error>> {
+    let dir =
+        std::env::var("ASMODEUS_CANARY_DIR").unwrap_or_else(|_| "/tmp/asmodeus-canary/demo".into());
+    println!("{EXERCISE_TAG_RED_TEAM} asmodeus-runner dry-run in {dir}");
+
+    let injector = CanaryInjector::new(&dir, 20, 64)?;
+    println!("scope accepted: {}", injector.dir().display());
+    let report = injector.inject()?;
+    println!(
+        "injected: {} canary files, {} bytes (synthetic XOR, reversible)",
+        report.files_created, report.bytes_written
+    );
+    injector.cleanup()?;
+    println!("cleanup: SUCCESS (canary removed, 0 host side-effects)");
+    Ok(())
+}

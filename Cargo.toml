@@ -1,0 +1,61 @@
+# Asmodeus — Offensive engine of the APEX DEFENSE ecosystem.
+# Workspace layout mirrors Ferrum conventions (see ARCHITECTURE.md).
+[workspace]
+resolver = "2"
+members = [
+    "crates/asmodeus-common",
+    "crates/asmodeus-proto",
+    "crates/asmodeus-crypto",
+    "crates/asmodeus-dsl",
+    "crates/asmodeus-safety",
+    "crates/asmodeus-runner",
+    "crates/asmodeus-control-plane",
+    "crates/asmodeus-telemetry",
+    "crates/asmodeus-cli",
+    "crates/asmodeus-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+rust-version = "1.90"
+publish = false
+
+# Internal crates are wired by path so the skeleton builds offline.
+# External deps (tokio, axum, tonic, aya, ed25519-compact, prometheus, ...)
+# are declared here as they land — see ARCHITECTURE.md §7.
+[workspace.dependencies]
+asmodeus-common       = { path = "crates/asmodeus-common" }
+asmodeus-proto        = { path = "crates/asmodeus-proto" }
+asmodeus-crypto       = { path = "crates/asmodeus-crypto" }
+asmodeus-dsl          = { path = "crates/asmodeus-dsl" }
+asmodeus-safety       = { path = "crates/asmodeus-safety" }
+asmodeus-runner       = { path = "crates/asmodeus-runner" }
+asmodeus-control-plane= { path = "crates/asmodeus-control-plane" }
+asmodeus-telemetry    = { path = "crates/asmodeus-telemetry" }
+asmodeus-testkit      = { path = "crates/asmodeus-testkit" }
+
+# External deps (see ARCHITECTURE.md §7). Pinned major versions.
+ed25519-compact = { version = "2", features = ["random"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+axum = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = "0.12"
+prost = "0.13"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

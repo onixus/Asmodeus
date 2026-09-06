@@ -1,0 +1,32 @@
+[package]
+name = "asmodeus-control-plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "asmodeus-control-plane"
+path = "src/main.rs"
+
+[dependencies]
+asmodeus-common = { workspace = true }
+asmodeus-crypto = { workspace = true }
+asmodeus-dsl = { workspace = true }
+asmodeus-proto = { workspace = true }
+asmodeus-telemetry = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ed25519-compact = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+tokio-stream = { workspace = true }
+prost = { workspace = true }
