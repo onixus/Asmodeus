@@ -52,8 +52,8 @@ mod tests {
     #[test]
     fn seeded_scenarios_run_to_completed() {
         let cat = Catalog::seeded();
-        for id in ["RANSOMWARE_CANARY_SPIKE", "AGENT_CRASH_ENDPOINT"] {
-            let entry = cat.get(id).unwrap();
+        assert_eq!(cat.entries().count(), 11);
+        for entry in cat.entries() {
             let outcome = execute(entry).unwrap();
             assert_eq!(outcome.final_state, RunState::Completed);
         }

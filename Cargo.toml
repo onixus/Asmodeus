@@ -52,6 +52,7 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [profile.release]
 opt-level = "z"

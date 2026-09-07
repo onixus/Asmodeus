@@ -60,6 +60,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
+        .route("/api/v1/asmodeus/scenarios", get(list_scenarios))
+        .route("/api/v1/asmodeus/scenarios/mitre", get(mitre_matrix))
+        .route("/api/v1/asmodeus/scenarios/:id", get(get_scenario))
         .route("/api/v1/asmodeus/scenarios/:id/run", post(run_scenario))
         .route("/api/v1/asmodeus/scenarios/abort", post(abort_all))
         .route("/api/v1/asmodeus/telemetry/mttd", get(telemetry_mttd))
@@ -74,6 +77,7 @@ enum ApiError {
     NotFound(String),
     Unprocessable(String),
     Internal(String),
+    BadGateway(String),
 }
 
 impl IntoResponse for ApiError {
@@ -84,6 +88,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
         };
         (code, Json(json!({ "error": msg }))).into_response()
     }
@@ -161,7 +166,7 @@ async fn run_scenario(
         };
         let out = crate::dispatch::dispatch(&endpoint, req)
             .await
-            .map_err(|s| ApiError::Internal(format!("dispatch: {s}")))?;
+            .map_err(|s| ApiError::BadGateway(format!("dispatch: {s}")))?;
         if let Some(reason) = out.rejected {
             return Err(ApiError::Unprocessable(format!(
                 "runner rejected: {reason}"
@@ -209,6 +214,14 @@ async fn run_scenario(
     Ok(Json(json!({
         "run_id": run_id.to_string(),
         "scenario_id": entry.id,
+        "scenario_name": entry.name,
+        "category": match entry.category {
+            Category::RedTeam => "red_team",
+            Category::Chaos => "chaos",
+        },
+        "mitre_technique": entry.mitre.map(|m| m.id),
+        "mitre_tactic": entry.mitre.map(|m| m.tactic),
+        "severity": entry.severity,
         "tag": entry.category.tag(),
         "initiator": role.as_str(),
         "status": "COMPLETED",
@@ -221,6 +234,124 @@ async fn run_scenario(
             "containment_action": "SIGKILL via SOAR Policy",
         },
         "cleanup_status": "SUCCESS (canary removed, 0 host side-effects)",
+    })))
+}
+
+async fn list_scenarios(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view scenarios"));
+    }
+    let mut scenarios: Vec<_> = state
+        .catalog
+        .entries()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "name": entry.name,
+                "category": match entry.category {
+                    Category::RedTeam => "red_team",
+                    Category::Chaos => "chaos",
+                },
+                "mitre_technique": entry.mitre.map(|m| m.id),
+                "mitre_tactic": entry.mitre.map(|m| m.tactic),
+                "severity": entry.severity,
+                "detector": entry.detector,
+                "description": entry.description,
+            })
+        })
+        .collect();
+    scenarios.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(Json(json!(scenarios)))
+}
+
+async fn get_scenario(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view scenarios"));
+    }
+    let entry = state
+        .catalog
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown scenario_id: {id}")))?;
+
+    Ok(Json(json!({
+        "id": entry.id,
+        "name": entry.name,
+        "category": match entry.category {
+            Category::RedTeam => "red_team",
+            Category::Chaos => "chaos",
+        },
+        "mitre_technique": entry.mitre.map(|m| m.id),
+        "mitre_tactic": entry.mitre.map(|m| m.tactic),
+        "mitre_technique_name": entry.mitre.map(|m| m.name),
+        "mitre_description": entry.mitre.map(|m| m.description),
+        "severity": entry.severity,
+        "detector": entry.detector,
+        "description": entry.description,
+        "target_path": entry.target_path,
+        "sim_mttd_ms": entry.sim_mttd_ms,
+        "sim_mttr_ms": entry.sim_mttr_ms,
+    })))
+}
+
+async fn mitre_matrix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view MITRE matrix"));
+    }
+
+    let mut tactics_map: HashMap<&'static str, Vec<Value>> = HashMap::new();
+    let mut covered_techniques = std::collections::HashSet::new();
+    let mut mitre_scenarios_count = 0;
+
+    for entry in state.catalog.entries() {
+        if let Some(m) = entry.mitre {
+            mitre_scenarios_count += 1;
+            covered_techniques.insert(m.id);
+            tactics_map.entry(m.tactic).or_default().push(json!({
+                "scenario_id": entry.id,
+                "scenario_name": entry.name,
+                "technique_id": m.id,
+                "technique_name": m.name,
+                "severity": entry.severity,
+                "detector": entry.detector,
+            }));
+        }
+    }
+
+    let mut sorted_tactics: Vec<_> = tactics_map
+        .into_iter()
+        .map(|(tactic, mut scenarios)| {
+            scenarios.sort_by(|a, b| a["technique_id"].as_str().cmp(&b["technique_id"].as_str()));
+            json!({
+                "tactic": tactic,
+                "scenarios_count": scenarios.len(),
+                "scenarios": scenarios,
+            })
+        })
+        .collect();
+    sorted_tactics.sort_by(|a, b| a["tactic"].as_str().cmp(&b["tactic"].as_str()));
+
+    let total_scenarios = state.catalog.entries().count();
+
+    Ok(Json(json!({
+        "framework": "MITRE ATT&CK Enterprise Matrix",
+        "total_scenarios": total_scenarios,
+        "mitre_scenarios_count": mitre_scenarios_count,
+        "covered_techniques_count": covered_techniques.len(),
+        "tactics_count": sorted_tactics.len(),
+        "tactics": sorted_tactics,
     })))
 }
 
@@ -524,8 +655,24 @@ mod tests {
         format!("http://{addr}")
     }
 
+    static DISPATCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const ALL_CLIENT_TLS_VARS: &[&str] = &[
+        "ASMODEUS_CLIENT_TLS_CERT",
+        "ASMODEUS_CLIENT_TLS_KEY",
+        "ASMODEUS_CLIENT_TLS_CA",
+        "ASMODEUS_CLIENT_TLS_DOMAIN",
+        "ASMODEUS_TLS_CERT",
+        "ASMODEUS_TLS_KEY",
+        "ASMODEUS_TLS_CA",
+        "ASMODEUS_TLS_DOMAIN",
+    ];
+
     #[tokio::test]
     async fn dispatches_to_live_runner() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+
         let url = start_mock_runner().await;
         let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())));
 
@@ -549,6 +696,9 @@ mod tests {
 
     #[tokio::test]
     async fn partial_runner_is_not_reported_completed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+
         let url = start_partial_runner().await;
         let app = router(AppState::with_runner(Catalog::seeded(), Some(url)));
 
@@ -561,5 +711,238 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // A run that never completed must not be a 200 success.
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    async fn start_mock_mtls_runner(tls: tonic::transport::ServerTlsConfig) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(RunnerControlServer::new(MockRunner))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("https://{addr}")
+    }
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let mut saved = Vec::new();
+            for &(k, v) in vars {
+                saved.push((k, std::env::var(k).ok()));
+                std::env::set_var(k, v);
+            }
+            EnvGuard { vars: saved }
+        }
+
+        fn clear(keys: &[&'static str]) -> Self {
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k, std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            EnvGuard { vars: saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.vars {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatches_to_live_runner_over_mtls() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let mtls = asmodeus_testkit::TestMtls::generate();
+        let temp_dir = std::env::temp_dir().join("asmodeus-cp-mtls-test");
+        let paths = mtls.write_to_dir(&temp_dir).unwrap();
+
+        let _guard = EnvGuard::set(&[
+            (
+                "ASMODEUS_CLIENT_TLS_CERT",
+                paths.client_cert.to_str().unwrap(),
+            ),
+            (
+                "ASMODEUS_CLIENT_TLS_KEY",
+                paths.client_key.to_str().unwrap(),
+            ),
+            ("ASMODEUS_CLIENT_TLS_CA", paths.ca_cert.to_str().unwrap()),
+            ("ASMODEUS_CLIENT_TLS_DOMAIN", "asmodeus-runner"),
+        ]);
+
+        let url = start_mock_mtls_runner(mtls.server_tls_config()).await;
+        let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["status"], "COMPLETED");
+        assert_eq!(body["execution"]["mode"], "dispatched");
+        assert_eq!(body["execution"]["runner_final_state"], "Completed");
+        assert_eq!(body["execution"]["files_created"], 20);
+        assert_eq!(body["execution"]["runner_endpoint"], url);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_over_mtls_rejects_untrusted_client() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let mtls = asmodeus_testkit::TestMtls::generate();
+        let temp_dir = std::env::temp_dir().join("asmodeus-cp-mtls-rogue");
+        let paths = mtls.write_to_dir(&temp_dir).unwrap();
+
+        // Control plane uses rogue client cert (signed by untrusted CA)
+        let _guard = EnvGuard::set(&[
+            (
+                "ASMODEUS_CLIENT_TLS_CERT",
+                paths.rogue_client_cert.to_str().unwrap(),
+            ),
+            (
+                "ASMODEUS_CLIENT_TLS_KEY",
+                paths.rogue_client_key.to_str().unwrap(),
+            ),
+            ("ASMODEUS_CLIENT_TLS_CA", paths.ca_cert.to_str().unwrap()),
+            ("ASMODEUS_CLIENT_TLS_DOMAIN", "asmodeus-runner"),
+        ]);
+
+        let url = start_mock_mtls_runner(mtls.server_tls_config()).await;
+        let app = router(AppState::with_runner(Catalog::seeded(), Some(url)));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Handshake fails, run must not succeed
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn list_scenarios_returns_all_entries_with_mitre_metadata() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/scenarios")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let list = body.as_array().expect("array of scenarios");
+        assert_eq!(list.len(), 11);
+
+        // Verify MITRE technique is present on Red Team scenarios
+        let ransomware = list
+            .iter()
+            .find(|s| s["id"] == "RANSOMWARE_CANARY_SPIKE")
+            .unwrap();
+        assert_eq!(ransomware["mitre_technique"], "T1486");
+        assert_eq!(ransomware["mitre_tactic"], "Impact");
+
+        let beacon = list
+            .iter()
+            .find(|s| s["id"] == "C2_BEACONING_SIMULATION")
+            .unwrap();
+        assert_eq!(beacon["mitre_technique"], "T1071");
+        assert_eq!(beacon["mitre_tactic"], "Command and Control");
+    }
+
+    #[tokio::test]
+    async fn get_scenario_returns_single_scenario_details() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/scenarios/CREDENTIAL_ACCESS_CANARY")
+            .header("x-apex-role", "devsecops")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["id"], "CREDENTIAL_ACCESS_CANARY");
+        assert_eq!(body["mitre_technique"], "T1003");
+        assert_eq!(body["mitre_tactic"], "Credential Access");
+        assert_eq!(body["mitre_technique_name"], "OS Credential Dumping");
+        assert_eq!(body["category"], "red_team");
+    }
+
+    #[tokio::test]
+    async fn mitre_matrix_returns_coverage_report() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/scenarios/mitre")
+            .header("x-apex-role", "ciso")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["framework"], "MITRE ATT&CK Enterprise Matrix");
+        assert_eq!(body["total_scenarios"], 11);
+        let covered_count = body["covered_techniques_count"].as_u64().unwrap();
+        assert!(
+            covered_count >= 7,
+            "expected >= 7 covered techniques, got {covered_count}"
+        );
+        let tactics = body["tactics"].as_array().unwrap();
+        assert!(
+            tactics.len() >= 6,
+            "expected >= 6 covered tactics, got {}",
+            tactics.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_scenario_includes_mitre_and_scenario_name() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/C2_BEACONING_SIMULATION/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "COMPLETED");
+        assert_eq!(body["scenario_id"], "C2_BEACONING_SIMULATION");
+        assert_eq!(body["mitre_technique"], "T1071");
+        assert_eq!(body["mitre_tactic"], "Command and Control");
+        assert_eq!(
+            body["scenario_name"],
+            "C2 Beaconing & Dynamic Resolution Simulation"
+        );
     }
 }

@@ -164,8 +164,15 @@
       "enum": [
         "RANSOMWARE_CANARY_SPIKE",
         "K8S_ESCAPE_SIMULATION",
+        "C2_BEACONING_SIMULATION",
+        "CREDENTIAL_ACCESS_CANARY",
+        "LOG_TAMPER_CANARY",
+        "PERSISTENCE_CRON_CANARY",
+        "DATA_EXFILTRATION_CANARY",
+        "DEFENSE_IMPAIRMENT_CANARY",
         "LATENCY_SPIKE_VM",
-        "AGENT_CRASH_ENDPOINT"
+        "AGENT_CRASH_ENDPOINT",
+        "DNS_RPZ_SINKHOLE_DROP"
       ]
     },
     "initiator_role": {
