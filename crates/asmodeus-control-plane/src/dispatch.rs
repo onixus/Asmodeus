@@ -25,10 +25,11 @@ pub async fn connect_with_tls(
     endpoint: &str,
     tls: Option<ClientTlsConfig>,
 ) -> Result<RunnerControlClient<Channel>, Status> {
-    let target = if tls.is_some() && endpoint.starts_with("http://") {
+    let has_tls = tls.is_some();
+    let target = if has_tls && endpoint.starts_with("http://") {
         format!("https://{}", &endpoint["http://".len()..])
     } else if !endpoint.contains("://") {
-        if tls.is_some() {
+        if has_tls {
             format!("https://{endpoint}")
         } else {
             format!("http://{endpoint}")
@@ -36,6 +37,16 @@ pub async fn connect_with_tls(
     } else {
         endpoint.to_string()
     };
+
+    // Footgun guard: an `https://` target with no client TLS config would fail
+    // deep inside tonic with an opaque error. Reject it up front so the misconfig
+    // is obvious (set ASMODEUS_CLIENT_TLS_* or use http://).
+    if target.starts_with("https://") && !has_tls {
+        return Err(Status::invalid_argument(
+            "endpoint requests TLS (https://) but no client mTLS is configured; \
+             set ASMODEUS_CLIENT_TLS_* or use an http:// endpoint",
+        ));
+    }
 
     let mut ep = Channel::from_shared(target)
         .map_err(|e| Status::invalid_argument(format!("bad endpoint: {e}")))?;
@@ -51,14 +62,6 @@ pub async fn connect_with_tls(
         .await
         .map_err(|e| Status::unavailable(format!("runner unreachable: {e}")))?;
     Ok(RunnerControlClient::new(channel))
-}
-
-/// Connect to a runner endpoint, resolving TLS from the environment.
-#[allow(dead_code)]
-pub async fn connect(endpoint: &str) -> Result<RunnerControlClient<Channel>, Status> {
-    let tls = asmodeus_proto::tls::client_from_env("asmodeus-runner")
-        .map_err(|e| Status::internal(format!("tls config: {e}")))?;
-    connect_with_tls(endpoint, tls).await
 }
 
 /// Dispatch one scenario to `endpoint` with explicit TLS configuration.
