@@ -524,8 +524,24 @@ mod tests {
         format!("http://{addr}")
     }
 
+    static DISPATCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const ALL_CLIENT_TLS_VARS: &[&str] = &[
+        "ASMODEUS_CLIENT_TLS_CERT",
+        "ASMODEUS_CLIENT_TLS_KEY",
+        "ASMODEUS_CLIENT_TLS_CA",
+        "ASMODEUS_CLIENT_TLS_DOMAIN",
+        "ASMODEUS_TLS_CERT",
+        "ASMODEUS_TLS_KEY",
+        "ASMODEUS_TLS_CA",
+        "ASMODEUS_TLS_DOMAIN",
+    ];
+
     #[tokio::test]
     async fn dispatches_to_live_runner() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+
         let url = start_mock_runner().await;
         let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())));
 
@@ -549,6 +565,9 @@ mod tests {
 
     #[tokio::test]
     async fn partial_runner_is_not_reported_completed() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+
         let url = start_partial_runner().await;
         let app = router(AppState::with_runner(Catalog::seeded(), Some(url)));
 
@@ -561,5 +580,135 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // A run that never completed must not be a 200 success.
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    async fn start_mock_mtls_runner(tls: tonic::transport::ServerTlsConfig) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(RunnerControlServer::new(MockRunner))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("https://{addr}")
+    }
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let mut saved = Vec::new();
+            for &(k, v) in vars {
+                saved.push((k, std::env::var(k).ok()));
+                std::env::set_var(k, v);
+            }
+            EnvGuard { vars: saved }
+        }
+
+        fn clear(keys: &[&'static str]) -> Self {
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k, std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            EnvGuard { vars: saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.vars {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatches_to_live_runner_over_mtls() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let mtls = asmodeus_testkit::TestMtls::generate();
+        let temp_dir = std::env::temp_dir().join("asmodeus-cp-mtls-test");
+        let paths = mtls.write_to_dir(&temp_dir).unwrap();
+
+        let _guard = EnvGuard::set(&[
+            (
+                "ASMODEUS_CLIENT_TLS_CERT",
+                paths.client_cert.to_str().unwrap(),
+            ),
+            (
+                "ASMODEUS_CLIENT_TLS_KEY",
+                paths.client_key.to_str().unwrap(),
+            ),
+            ("ASMODEUS_CLIENT_TLS_CA", paths.ca_cert.to_str().unwrap()),
+            ("ASMODEUS_CLIENT_TLS_DOMAIN", "asmodeus-runner"),
+        ]);
+
+        let url = start_mock_mtls_runner(mtls.server_tls_config()).await;
+        let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["status"], "COMPLETED");
+        assert_eq!(body["execution"]["mode"], "dispatched");
+        assert_eq!(body["execution"]["runner_final_state"], "Completed");
+        assert_eq!(body["execution"]["files_created"], 20);
+        assert_eq!(body["execution"]["runner_endpoint"], url);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_over_mtls_rejects_untrusted_client() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let mtls = asmodeus_testkit::TestMtls::generate();
+        let temp_dir = std::env::temp_dir().join("asmodeus-cp-mtls-rogue");
+        let paths = mtls.write_to_dir(&temp_dir).unwrap();
+
+        // Control plane uses rogue client cert (signed by untrusted CA)
+        let _guard = EnvGuard::set(&[
+            (
+                "ASMODEUS_CLIENT_TLS_CERT",
+                paths.rogue_client_cert.to_str().unwrap(),
+            ),
+            (
+                "ASMODEUS_CLIENT_TLS_KEY",
+                paths.rogue_client_key.to_str().unwrap(),
+            ),
+            ("ASMODEUS_CLIENT_TLS_CA", paths.ca_cert.to_str().unwrap()),
+            ("ASMODEUS_CLIENT_TLS_DOMAIN", "asmodeus-runner"),
+        ]);
+
+        let url = start_mock_mtls_runner(mtls.server_tls_config()).await;
+        let app = router(AppState::with_runner(Catalog::seeded(), Some(url)));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Handshake fails, run must not succeed
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
