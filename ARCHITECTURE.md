@@ -197,4 +197,13 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
 - **CLI** (`asmodeus-cli`): операторский цикл — `keygen`/`sign`/`verify`/`validate` (офлайн, Ed25519, ключ 0600) и `run`/`status` (REST к control-plane).
 - **Testkit** (`asmodeus-testkit`): `Polygon` (self-cleaning canary-песочница) и `signed_scenario` (фикстура подписанного манифеста).
 
-Осталось (только на Linux-стенде): eBPF-инъекция сетевого хаоса в раннере через `aya` — на macOS не проверяется.
+- **Сетевой хаос** (`asmodeus-runner::netchaos`): синтетическая имитация
+  `LATENCY_SPIKE_VM` (задержка/джиттер/потери) на зарезервированном
+  тест-сегменте. INV-0 blast radius для сети (`net_target_in_scope` в DSL:
+  только loopback + RFC 5737 TEST-NET), бюджетные лимиты и `NetChaosSession` с
+  обязательным откатом через `Drop` (D7). Кросс-платформенный `SimBackend`
+  покрыт тестами; aya/TC-бэкенд — за фича-флагом `ebpf` на Linux-стенде.
+
+Осталось (только на Linux-стенде): собрать компилируемый BPF-объект и подключить
+его к aya/TC-бэкенду (`clsact` + `SchedClassifier`, `--features ebpf`) — на
+macOS не проверяется (§8).

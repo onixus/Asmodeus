@@ -84,4 +84,5 @@
 - [x] Операторский CLI (`asmodeus`): `keygen`/`sign`/`verify`/`validate` — офлайн-подпись сценариев (Ed25519)
 - [x] CLI `run`/`status` (REST к control-plane) и `asmodeus-testkit` (полигон + фикстуры подписи)
 - [x] **MVP собран end-to-end**: 46 тестов, 10/10 крейтов с логикой
-- [ ] *Следующий этап (Linux-стенд)*: eBPF-инъекция сетевого хаоса в раннере (aya)
+- [x] Сетевой хаос в раннере (`LATENCY_SPIKE_VM`): INV-0 сетевой scope (только тест-блоки RFC 5737 + loopback), бюджетные лимиты, `NetChaosSession` с обязательным откатом (D7); кросс-платформенный `SimBackend`, 65 тестов зелёные
+- [ ] *Следующий этап (Linux-стенд)*: подключить компилируемый BPF-объект к aya/TC-бэкенду (`--features ebpf`) — на macOS не проверяется

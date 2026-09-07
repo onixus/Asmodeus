@@ -10,6 +10,12 @@ publish = false
 name = "asmodeus-runner"
 path = "src/main.rs"
 
+[features]
+# Real eBPF/TC network-chaos backend via `aya` — Linux stand only. Off by
+# default so the workspace builds and tests on every platform (macOS included);
+# without it the runner uses the in-process SimBackend. See src/aya_backend.rs.
+ebpf = []
+
 [dependencies]
 asmodeus-common = { workspace = true }
 asmodeus-crypto = { workspace = true }
