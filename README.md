@@ -24,8 +24,8 @@
 1. 📋 **[Функционально-Технические Требования (FTT.md)](FTT.md)**:
    - Бизнес-цели и назначение системы;
    - Ролевая модель доступа (RBAC: Admin, Red Team, DevSecOps, CISO, Auditor);
-   - Сценарии атак по MITRE ATT&CK (`T1486 Ransomware`, `T1611 K8s Escape`, `T1071 C2 Beaconing`);
-   - Инфраструктурный хаос (сетевые задержки PT VM, аварийный сбой агентов);
+   - Сценарии атак по MITRE ATT&CK: 8 сценариев, покрывающих 7 тактик (`T1486 Ransomware`, `T1611 K8s Escape`, `T1071 C2 Beaconing`, `T1003 Honeytokens`, `T1070 Log Tamper`, `T1053 Persistence Cron`, `T1041 Exfiltration`, `T1562 Impair Defenses`);
+   - Инфраструктурный хаос (`LATENCY_SPIKE_VM`, `AGENT_CRASH_ENDPOINT`, `DNS_RPZ_SINKHOLE_DROP`);
    - Защитные барьеры (Blast Radius, Circuit Breaker, Auto-Rollback);
    - Замер метрик реакции Blue Team (MTTD, MTTR, Resilience Score).
 
@@ -83,6 +83,6 @@
 - [x] Замкнутый контур: control-plane диспатчит подписанный сценарий в живой раннер по gRPC (REST → gRPC → инъекция → откат)
 - [x] Операторский CLI (`asmodeus`): `keygen`/`sign`/`verify`/`validate` — офлайн-подпись сценариев (Ed25519)
 - [x] CLI `run`/`status` (REST к control-plane) и `asmodeus-testkit` (полигон + фикстуры подписи)
-- [x] **MVP собран end-to-end**: 46 тестов, 10/10 крейтов с логикой
-- [x] Сетевой хаос в раннере (`LATENCY_SPIKE_VM`): INV-0 сетевой scope (только тест-блоки RFC 5737 + loopback), бюджетные лимиты, `NetChaosSession` с обязательным откатом (D7); кросс-платформенный `SimBackend`, 65 тестов зелёные
+- [x] Сетевой хаос в раннере (`LATENCY_SPIKE_VM`): INV-0 сетевой scope (только тест-блоки RFC 5737 + loopback), бюджетные лимиты, `NetChaosSession` с обязательным откатом (D7); кросс-платформенный `SimBackend`
+- [x] **Расширение покрытия MITRE ATT&CK**: 11 сценариев (8 атак на 7 тактик + 3 хаоса), синтетические инъекторы в раннере под INV-0, REST-эндпоинты матрицы (`/api/v1/asmodeus/scenarios`, `/scenarios/mitre`), CLI команды `asmodeus scenarios`/`mitre`, 94 теста
 - [ ] *Следующий этап (Linux-стенд)*: подключить компилируемый BPF-объект к aya/TC-бэкенду (`--features ebpf`) — на macOS не проверяется

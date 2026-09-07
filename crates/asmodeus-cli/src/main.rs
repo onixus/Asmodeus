@@ -64,6 +64,20 @@ enum Cmd {
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
     },
+    /// List all catalogued attack and chaos scenarios with MITRE mappings.
+    Scenarios {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Display MITRE ATT&CK Enterprise Matrix coverage report.
+    Mitre {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
 }
 
 /// Send a request, print the (pretty) body and fail on a non-2xx status.
@@ -148,6 +162,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let endpoint = format!("{url}/api/v1/asmodeus/telemetry/mttd");
             let client = reqwest::blocking::Client::new();
             call(client.get(&endpoint).header("X-Apex-Role", &role), "status")?;
+        }
+        Cmd::Scenarios { role, url } => {
+            let endpoint = format!("{url}/api/v1/asmodeus/scenarios");
+            let client = reqwest::blocking::Client::new();
+            call(client.get(&endpoint).header("X-Apex-Role", &role), "scenarios")?;
+        }
+        Cmd::Mitre { role, url } => {
+            let endpoint = format!("{url}/api/v1/asmodeus/scenarios/mitre");
+            let client = reqwest::blocking::Client::new();
+            call(client.get(&endpoint).header("X-Apex-Role", &role), "mitre")?;
         }
     }
     Ok(())

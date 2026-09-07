@@ -60,6 +60,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
+        .route("/api/v1/asmodeus/scenarios", get(list_scenarios))
+        .route("/api/v1/asmodeus/scenarios/mitre", get(mitre_matrix))
+        .route("/api/v1/asmodeus/scenarios/:id", get(get_scenario))
         .route("/api/v1/asmodeus/scenarios/:id/run", post(run_scenario))
         .route("/api/v1/asmodeus/scenarios/abort", post(abort_all))
         .route("/api/v1/asmodeus/telemetry/mttd", get(telemetry_mttd))
@@ -209,6 +212,14 @@ async fn run_scenario(
     Ok(Json(json!({
         "run_id": run_id.to_string(),
         "scenario_id": entry.id,
+        "scenario_name": entry.name,
+        "category": match entry.category {
+            Category::RedTeam => "red_team",
+            Category::Chaos => "chaos",
+        },
+        "mitre_technique": entry.mitre.map(|m| m.id),
+        "mitre_tactic": entry.mitre.map(|m| m.tactic),
+        "severity": entry.severity,
         "tag": entry.category.tag(),
         "initiator": role.as_str(),
         "status": "COMPLETED",
@@ -221,6 +232,121 @@ async fn run_scenario(
             "containment_action": "SIGKILL via SOAR Policy",
         },
         "cleanup_status": "SUCCESS (canary removed, 0 host side-effects)",
+    })))
+}
+
+async fn list_scenarios(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view scenarios"));
+    }
+    let mut scenarios: Vec<_> = state
+        .catalog
+        .entries()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "name": entry.name,
+                "category": match entry.category {
+                    Category::RedTeam => "red_team",
+                    Category::Chaos => "chaos",
+                },
+                "mitre_technique": entry.mitre.map(|m| m.id),
+                "mitre_tactic": entry.mitre.map(|m| m.tactic),
+                "severity": entry.severity,
+                "detector": entry.detector,
+                "description": entry.description,
+            })
+        })
+        .collect();
+    scenarios.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(Json(json!(scenarios)))
+}
+
+async fn get_scenario(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view scenarios"));
+    }
+    let entry = state
+        .catalog
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown scenario_id: {id}")))?;
+
+    Ok(Json(json!({
+        "id": entry.id,
+        "name": entry.name,
+        "category": match entry.category {
+            Category::RedTeam => "red_team",
+            Category::Chaos => "chaos",
+        },
+        "mitre_technique": entry.mitre.map(|m| m.id),
+        "mitre_tactic": entry.mitre.map(|m| m.tactic),
+        "mitre_technique_name": entry.mitre.map(|m| m.name),
+        "mitre_description": entry.mitre.map(|m| m.description),
+        "severity": entry.severity,
+        "detector": entry.detector,
+        "description": entry.description,
+        "target_path": entry.target_path,
+        "sim_mttd_ms": entry.sim_mttd_ms,
+        "sim_mttr_ms": entry.sim_mttr_ms,
+    })))
+}
+
+async fn mitre_matrix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view MITRE matrix"));
+    }
+
+    let mut tactics_map: HashMap<&'static str, Vec<Value>> = HashMap::new();
+    let mut covered_techniques = std::collections::HashSet::new();
+
+    for entry in state.catalog.entries() {
+        if let Some(m) = entry.mitre {
+            covered_techniques.insert(m.id);
+            tactics_map.entry(m.tactic).or_default().push(json!({
+                "scenario_id": entry.id,
+                "scenario_name": entry.name,
+                "technique_id": m.id,
+                "technique_name": m.name,
+                "severity": entry.severity,
+                "detector": entry.detector,
+            }));
+        }
+    }
+
+    let mut sorted_tactics: Vec<_> = tactics_map
+        .into_iter()
+        .map(|(tactic, mut scenarios)| {
+            scenarios.sort_by(|a, b| a["technique_id"].as_str().cmp(&b["technique_id"].as_str()));
+            json!({
+                "tactic": tactic,
+                "scenarios_count": scenarios.len(),
+                "scenarios": scenarios,
+            })
+        })
+        .collect();
+    sorted_tactics.sort_by(|a, b| a["tactic"].as_str().cmp(&b["tactic"].as_str()));
+
+    let total_scenarios = state.catalog.entries().count();
+
+    Ok(Json(json!({
+        "framework": "MITRE ATT&CK Enterprise Matrix",
+        "total_scenarios": total_scenarios,
+        "covered_techniques_count": covered_techniques.len(),
+        "tactics_count": sorted_tactics.len(),
+        "tactics": sorted_tactics,
     })))
 }
 
@@ -710,5 +836,98 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn list_scenarios_returns_all_entries_with_mitre_metadata() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/scenarios")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let list = body.as_array().expect("array of scenarios");
+        assert_eq!(list.len(), 11);
+
+        // Verify MITRE technique is present on Red Team scenarios
+        let ransomware = list
+            .iter()
+            .find(|s| s["id"] == "RANSOMWARE_CANARY_SPIKE")
+            .unwrap();
+        assert_eq!(ransomware["mitre_technique"], "T1486");
+        assert_eq!(ransomware["mitre_tactic"], "Impact");
+
+        let beacon = list
+            .iter()
+            .find(|s| s["id"] == "C2_BEACONING_SIMULATION")
+            .unwrap();
+        assert_eq!(beacon["mitre_technique"], "T1071");
+        assert_eq!(beacon["mitre_tactic"], "Command and Control");
+    }
+
+    #[tokio::test]
+    async fn get_scenario_returns_single_scenario_details() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/scenarios/CREDENTIAL_ACCESS_CANARY")
+            .header("x-apex-role", "devsecops")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["id"], "CREDENTIAL_ACCESS_CANARY");
+        assert_eq!(body["mitre_technique"], "T1003");
+        assert_eq!(body["mitre_tactic"], "Credential Access");
+        assert_eq!(body["mitre_technique_name"], "OS Credential Dumping");
+        assert_eq!(body["category"], "red_team");
+    }
+
+    #[tokio::test]
+    async fn mitre_matrix_returns_coverage_report() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/scenarios/mitre")
+            .header("x-apex-role", "ciso")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["framework"], "MITRE ATT&CK Enterprise Matrix");
+        assert_eq!(body["total_scenarios"], 11);
+        let covered_count = body["covered_techniques_count"].as_u64().unwrap();
+        assert!(covered_count >= 7, "expected >= 7 covered techniques, got {covered_count}");
+        let tactics = body["tactics"].as_array().unwrap();
+        assert!(tactics.len() >= 6, "expected >= 6 covered tactics, got {}", tactics.len());
+    }
+
+    #[tokio::test]
+    async fn run_scenario_includes_mitre_and_scenario_name() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/C2_BEACONING_SIMULATION/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "COMPLETED");
+        assert_eq!(body["scenario_id"], "C2_BEACONING_SIMULATION");
+        assert_eq!(body["mitre_technique"], "T1071");
+        assert_eq!(body["mitre_tactic"], "Command and Control");
+        assert_eq!(body["scenario_name"], "C2 Beaconing & Dynamic Resolution Simulation");
     }
 }

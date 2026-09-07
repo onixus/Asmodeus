@@ -15,8 +15,6 @@ use asmodeus_proto::{
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use crate::canary::CanaryInjector;
-
 #[derive(Debug, Default, Clone)]
 pub struct RunnerService;
 
@@ -70,7 +68,8 @@ impl RunnerService {
             ))];
         }
 
-        let injector = match CanaryInjector::new(
+        let injector = match crate::injectors::create_injector(
+            &req.scenario_id,
             &req.target_dir,
             req.file_count as usize,
             chunk_kb as usize,
@@ -409,5 +408,42 @@ mod tests {
             res.is_err(),
             "client must reject a server cert signed by an untrusted CA, got Ok"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_streams_completed_for_mitre_scenarios_over_grpc() {
+        let url = start_server().await;
+        let mut client = connect(&url).await;
+
+        for scenario_id in [
+            "C2_BEACONING_SIMULATION",
+            "CREDENTIAL_ACCESS_CANARY",
+            "K8S_ESCAPE_SIMULATION",
+            "LOG_TAMPER_CANARY",
+        ] {
+            let poly = Polygon::new(&format!("grpc-{scenario_id}"));
+            let s = signed_scenario(scenario_id);
+            let req = ExecuteRequest {
+                scenario_id: scenario_id.into(),
+                manifest: s.manifest,
+                signature: s.signature,
+                public_key: s.public_key,
+                target_dir: poly.path(),
+                file_count: 3,
+                chunk_size_kb: 1,
+            };
+
+            let mut stream = client.execute(req).await.unwrap().into_inner();
+            let mut completed = None;
+            while let Some(ev) = stream.message().await.unwrap() {
+                if ev.kind == EventKind::Completed as i32 {
+                    completed = Some(ev);
+                }
+            }
+            assert!(completed.is_some(), "{scenario_id} did not complete");
+            if poly.dir().exists() {
+                assert_eq!(std::fs::read_dir(poly.dir()).unwrap().count(), 0);
+            }
+        }
     }
 }
