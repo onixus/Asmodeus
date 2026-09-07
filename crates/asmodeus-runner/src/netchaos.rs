@@ -24,10 +24,10 @@ pub const MAX_JITTER_MS: u32 = 1_000;
 pub const MAX_LOSS_PCT: u8 = 50;
 pub const MAX_DURATION_MS: u32 = 120_000;
 
-/// Interface-name allowlist markers (defence in depth on top of the CIDR
-/// scope): a chaos rule may only bind to a loopback or an explicitly test
-/// interface, never a production NIC like `eth0`/`en0`.
-const IFACE_MARKERS: [&str; 5] = ["lo", "test", "chaos", "veth", "dummy"];
+/// Distinctive test-interface markers (defence in depth on top of the CIDR
+/// scope). Loopback is matched separately and precisely; these are specific
+/// enough that a substring match cannot catch a production NIC.
+const IFACE_MARKERS: [&str; 4] = ["test", "chaos", "veth", "dummy"];
 
 /// Declarative network-chaos rule. Cross-platform and dependency-free so it can
 /// be validated and unit-tested anywhere; the backend turns it into a real rule
@@ -99,12 +99,18 @@ impl NetChaosSpec {
     }
 }
 
-/// True iff `iface` looks like a loopback or an explicit test interface.
+/// True iff `iface` is a loopback or an explicit test interface.
 fn iface_in_scope(iface: &str) -> bool {
     if iface.is_empty() || iface.len() > 15 {
         return false; // IFNAMSIZ is 16 incl. NUL
     }
-    IFACE_MARKERS.iter().any(|m| iface.contains(m))
+    // Loopback: exactly `lo`, or `lo` followed by an index (`lo`, `lo0`, ...).
+    // Matched precisely so it can't accept `flow0`/`silo0` as a loose substring.
+    let is_loopback = iface == "lo"
+        || iface
+            .strip_prefix("lo")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+    is_loopback || IFACE_MARKERS.iter().any(|m| iface.contains(m))
 }
 
 /// Why a chaos rule was refused or failed.
@@ -311,6 +317,19 @@ mod tests {
             spec.validate(),
             Err(NetChaosError::IfaceOutOfScope(_))
         ));
+    }
+
+    #[test]
+    fn iface_scope_is_precise_not_loose_substring() {
+        // Loopback and its indexed forms (lo0 is the macOS loopback) pass.
+        for ok in ["lo", "lo0", "lo1", "veth7", "chaos0", "eth-test"] {
+            assert!(iface_in_scope(ok), "{ok} should be in scope");
+        }
+        // Names that merely *contain* "lo" must NOT pass — the old loose
+        // substring check wrongly accepted these.
+        for bad in ["flow0", "silo0", "velo1", "eth0", "en0", "wlan0"] {
+            assert!(!iface_in_scope(bad), "{bad} must be out of scope");
+        }
     }
 
     #[test]
