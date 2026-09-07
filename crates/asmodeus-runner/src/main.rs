@@ -6,7 +6,10 @@
 //! `ASMODEUS_DRY_RUN=1` runs a standalone synthetic canary pass instead of
 //! serving — handy for local validation without a control-plane.
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+mod aya_backend;
 mod canary;
+mod netchaos;
 mod service;
 
 use std::net::SocketAddr;
@@ -63,5 +66,39 @@ fn dry_run() -> Result<(), Box<dyn std::error::Error>> {
     );
     injector.cleanup()?;
     println!("cleanup: SUCCESS (canary removed, 0 host side-effects)");
+
+    // Synthetic network-chaos pass on the reserved test segment (loopback).
+    net_chaos_demo();
     Ok(())
+}
+
+/// Standalone synthetic `LATENCY_SPIKE_VM` pass against loopback. Uses the
+/// platform default backend (simulator off Linux) and proves the mandatory
+/// rollback: the session installs a rule then reverts it, leaving no residue.
+fn net_chaos_demo() {
+    use netchaos::{default_backend, NetChaosBackend, NetChaosSession, NetChaosSpec};
+
+    let backend = default_backend();
+    let spec = NetChaosSpec::latency_spike_demo();
+    println!(
+        "{EXERCISE_TAG_RED_TEAM} net-chaos: {}ms +/-{}ms latency, {}% loss on {} -> {} (backend={})",
+        spec.latency_ms,
+        spec.jitter_ms,
+        spec.loss_pct,
+        spec.iface,
+        spec.target_cidr,
+        backend.name()
+    );
+    let started = NetChaosSession::start(&backend, &spec);
+    match started {
+        Ok(mut session) => {
+            let token = session.handle().map(|h| h.token).unwrap_or_default();
+            println!("net-chaos rule installed (token={token}, test segment only, in scope)");
+            match session.revert() {
+                Ok(()) => println!("net-chaos rollback: SUCCESS (rules reverted, 0 residue)"),
+                Err(e) => println!("net-chaos rollback FAILED: {e}"),
+            }
+        }
+        Err(e) => println!("net-chaos refused (safety gate): {e}"),
+    }
 }
