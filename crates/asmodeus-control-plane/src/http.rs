@@ -77,6 +77,7 @@ enum ApiError {
     NotFound(String),
     Unprocessable(String),
     Internal(String),
+    BadGateway(String),
 }
 
 impl IntoResponse for ApiError {
@@ -87,6 +88,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
         };
         (code, Json(json!({ "error": msg }))).into_response()
     }
@@ -164,7 +166,7 @@ async fn run_scenario(
         };
         let out = crate::dispatch::dispatch(&endpoint, req)
             .await
-            .map_err(|s| ApiError::Internal(format!("dispatch: {s}")))?;
+            .map_err(|s| ApiError::BadGateway(format!("dispatch: {s}")))?;
         if let Some(reason) = out.rejected {
             return Err(ApiError::Unprocessable(format!(
                 "runner rejected: {reason}"
@@ -311,9 +313,11 @@ async fn mitre_matrix(
 
     let mut tactics_map: HashMap<&'static str, Vec<Value>> = HashMap::new();
     let mut covered_techniques = std::collections::HashSet::new();
+    let mut mitre_scenarios_count = 0;
 
     for entry in state.catalog.entries() {
         if let Some(m) = entry.mitre {
+            mitre_scenarios_count += 1;
             covered_techniques.insert(m.id);
             tactics_map.entry(m.tactic).or_default().push(json!({
                 "scenario_id": entry.id,
@@ -344,6 +348,7 @@ async fn mitre_matrix(
     Ok(Json(json!({
         "framework": "MITRE ATT&CK Enterprise Matrix",
         "total_scenarios": total_scenarios,
+        "mitre_scenarios_count": mitre_scenarios_count,
         "covered_techniques_count": covered_techniques.len(),
         "tactics_count": sorted_tactics.len(),
         "tactics": sorted_tactics,
@@ -906,9 +911,16 @@ mod tests {
         assert_eq!(body["framework"], "MITRE ATT&CK Enterprise Matrix");
         assert_eq!(body["total_scenarios"], 11);
         let covered_count = body["covered_techniques_count"].as_u64().unwrap();
-        assert!(covered_count >= 7, "expected >= 7 covered techniques, got {covered_count}");
+        assert!(
+            covered_count >= 7,
+            "expected >= 7 covered techniques, got {covered_count}"
+        );
         let tactics = body["tactics"].as_array().unwrap();
-        assert!(tactics.len() >= 6, "expected >= 6 covered tactics, got {}", tactics.len());
+        assert!(
+            tactics.len() >= 6,
+            "expected >= 6 covered tactics, got {}",
+            tactics.len()
+        );
     }
 
     #[tokio::test]
@@ -928,6 +940,9 @@ mod tests {
         assert_eq!(body["scenario_id"], "C2_BEACONING_SIMULATION");
         assert_eq!(body["mitre_technique"], "T1071");
         assert_eq!(body["mitre_tactic"], "Command and Control");
-        assert_eq!(body["scenario_name"], "C2 Beaconing & Dynamic Resolution Simulation");
+        assert_eq!(
+            body["scenario_name"],
+            "C2 Beaconing & Dynamic Resolution Simulation"
+        );
     }
 }

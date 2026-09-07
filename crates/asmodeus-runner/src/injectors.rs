@@ -22,6 +22,16 @@ pub trait ScenarioInjector: Send + Sync {
     fn cleanup(&self) -> Result<(), InjectError>;
 }
 
+use std::io::Read;
+
+fn remove_file_idempotent(path: impl AsRef<Path>) -> Result<(), InjectError> {
+    match fs::remove_file(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(InjectError::Io(e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. T1486 — Ransomware Canary Encryption Spike
 // ---------------------------------------------------------------------------
@@ -82,9 +92,9 @@ impl ScenarioInjector for K8sEscapeInjector {
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("docker.sock.probe"));
-            let _ = fs::remove_file(self.dir.join("k8s_ns_escape.canary"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("docker.sock.probe"))?;
+            remove_file_idempotent(self.dir.join("k8s_ns_escape.canary"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -137,8 +147,8 @@ impl ScenarioInjector for C2BeaconInjector {
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("c2_beacon_events.log"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("c2_beacon_events.log"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -191,8 +201,8 @@ impl ScenarioInjector for CredentialAccessInjector {
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("honeytoken_credentials.json"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("honeytoken_credentials.json"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -238,8 +248,8 @@ impl ScenarioInjector for LogTamperInjector {
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("canary_audit.log"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("canary_audit.log"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -281,8 +291,8 @@ impl ScenarioInjector for PersistenceCronInjector {
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("canary_cron_task.job"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("canary_cron_task.job"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -317,19 +327,21 @@ impl ScenarioInjector for DataExfiltrationInjector {
         fs::create_dir_all(&self.dir)?;
         let exfil_file = self.dir.join("staged_canary_data.tar.gz");
 
-        let dummy_chunk = vec![0xEE; self.chunk_kb * 1024];
-        fs::write(&exfil_file, &dummy_chunk)?;
+        let mut file = fs::File::create(&exfil_file)?;
+        let bytes_to_write = (self.chunk_kb * 1024) as u64;
+        let mut reader = io::repeat(0xEE).take(bytes_to_write);
+        io::copy(&mut reader, &mut file)?;
 
         Ok(Report {
             files_created: 1,
-            bytes_written: dummy_chunk.len() as u64,
+            bytes_written: bytes_to_write,
         })
     }
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("staged_canary_data.tar.gz"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("staged_canary_data.tar.gz"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -371,8 +383,8 @@ impl ScenarioInjector for DefenseImpairmentInjector {
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("watchdog_recovery.pulse"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("watchdog_recovery.pulse"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -419,8 +431,8 @@ impl ScenarioInjector for NetChaosInjector {
 
     fn cleanup(&self) -> Result<(), InjectError> {
         if self.dir.exists() {
-            let _ = fs::remove_file(self.dir.join("netchaos_session.token"));
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_file_idempotent(self.dir.join("netchaos_session.token"))?;
+            let _ = fs::remove_dir(&self.dir);
         }
         Ok(())
     }
@@ -522,7 +534,8 @@ mod tests {
 
         for id in scenario_ids {
             let poly = Polygon::new(&format!("inj-{id}"));
-            let injector = create_injector(id, &poly.path(), 5, 2).expect("valid injector creation");
+            let injector =
+                create_injector(id, &poly.path(), 5, 2).expect("valid injector creation");
             let rep = injector.inject().expect("inject must succeed");
             assert!(rep.files_created > 0, "{id} should create files");
             assert!(rep.bytes_written > 0, "{id} should write bytes");
