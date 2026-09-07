@@ -279,4 +279,88 @@ mod tests {
         assert_eq!(ev.kind, EventKind::Rejected as i32);
         assert!(ev.detail.contains("signature"));
     }
+
+    async fn start_mtls_server(tls: tonic::transport::ServerTlsConfig) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(RunnerControlServer::new(RunnerService))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("https://{addr}")
+    }
+
+    async fn connect_mtls(
+        url: &str,
+        tls: tonic::transport::ClientTlsConfig,
+    ) -> Result<RunnerControlClient<tonic::transport::Channel>, tonic::transport::Error> {
+        let channel = tonic::transport::Channel::from_shared(url.to_string())
+            .unwrap()
+            .tls_config(tls)
+            .unwrap()
+            .connect()
+            .await?;
+        Ok(RunnerControlClient::new(channel))
+    }
+
+    #[tokio::test]
+    async fn execute_streams_completed_over_mtls() {
+        let mtls = asmodeus_testkit::TestMtls::generate();
+        let url = start_mtls_server(mtls.server_tls_config()).await;
+        let mut client = connect_mtls(&url, mtls.client_tls_config(Some("asmodeus-runner")))
+            .await
+            .expect("mtls handshake should succeed");
+
+        let poly = Polygon::new("mtls-complete");
+        let req = request_in(&poly, 4, 1);
+
+        let mut stream = client.execute(req).await.unwrap().into_inner();
+        let mut completed = false;
+        while let Some(ev) = stream.message().await.unwrap() {
+            if ev.kind == EventKind::Completed as i32 {
+                completed = true;
+                assert_eq!(ev.files_created, 4);
+            }
+        }
+        assert!(completed, "mTLS run must reach Completed");
+    }
+
+    #[tokio::test]
+    async fn untrusted_client_cert_is_rejected_by_mtls_runner() {
+        let mtls = asmodeus_testkit::TestMtls::generate();
+        let url = start_mtls_server(mtls.server_tls_config()).await;
+        // Rogue client presents certificate signed by untrusted rogue CA
+        let res = connect_mtls(&url, mtls.rogue_client_tls_config(Some("asmodeus-runner"))).await;
+        if let Ok(mut client) = res {
+            let poly = Polygon::new("mtls-rogue");
+            let req = request_in(&poly, 2, 1);
+            let call_res = client.execute(req).await;
+            assert!(
+                call_res.is_err(),
+                "untrusted client must be rejected during or after handshake"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_client_is_rejected_by_mtls_runner() {
+        let mtls = asmodeus_testkit::TestMtls::generate();
+        let url = start_mtls_server(mtls.server_tls_config()).await;
+        let plain_url = url.replace("https://", "http://");
+        let client_res = RunnerControlClient::connect(plain_url).await;
+        if let Ok(mut client) = client_res {
+            let poly = Polygon::new("mtls-plain");
+            let req = request_in(&poly, 2, 1);
+            let call_res = client.execute(req).await;
+            assert!(
+                call_res.is_err(),
+                "plaintext client must be rejected by TLS server"
+            );
+        }
+    }
 }

@@ -4,7 +4,7 @@
 //! certificates are configured (asmodeus_proto::tls); dev runs plaintext.
 
 use asmodeus_proto::{EventKind, ExecuteRequest, RunnerControlClient};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::Status;
 
 /// Folded result of a runner's event stream.
@@ -20,17 +20,32 @@ pub struct DispatchOutcome {
     pub rejected: Option<String>,
 }
 
-async fn connect(endpoint: &str) -> Result<RunnerControlClient<Channel>, Status> {
-    // TLS: build a client config from env; None => plaintext (dev only).
-    let tls = asmodeus_proto::tls::client_from_env("asmodeus-runner")
-        .map_err(|e| Status::internal(format!("tls config: {e}")))?;
-    let mut ep = Channel::from_shared(endpoint.to_string())
+/// Connect to a runner endpoint using explicit or absent TLS.
+pub async fn connect_with_tls(
+    endpoint: &str,
+    tls: Option<ClientTlsConfig>,
+) -> Result<RunnerControlClient<Channel>, Status> {
+    let target = if tls.is_some() && endpoint.starts_with("http://") {
+        format!("https://{}", &endpoint["http://".len()..])
+    } else if !endpoint.contains("://") {
+        if tls.is_some() {
+            format!("https://{endpoint}")
+        } else {
+            format!("http://{endpoint}")
+        }
+    } else {
+        endpoint.to_string()
+    };
+
+    let mut ep = Channel::from_shared(target)
         .map_err(|e| Status::invalid_argument(format!("bad endpoint: {e}")))?;
+
     if let Some(tls) = tls {
         ep = ep
             .tls_config(tls)
             .map_err(|e| Status::internal(format!("tls: {e}")))?;
     }
+
     let channel = ep
         .connect()
         .await
@@ -38,9 +53,21 @@ async fn connect(endpoint: &str) -> Result<RunnerControlClient<Channel>, Status>
     Ok(RunnerControlClient::new(channel))
 }
 
-/// Dispatch one scenario to `endpoint` and drain the event stream.
-pub async fn dispatch(endpoint: &str, req: ExecuteRequest) -> Result<DispatchOutcome, Status> {
-    let mut client = connect(endpoint).await?;
+/// Connect to a runner endpoint, resolving TLS from the environment.
+#[allow(dead_code)]
+pub async fn connect(endpoint: &str) -> Result<RunnerControlClient<Channel>, Status> {
+    let tls = asmodeus_proto::tls::client_from_env("asmodeus-runner")
+        .map_err(|e| Status::internal(format!("tls config: {e}")))?;
+    connect_with_tls(endpoint, tls).await
+}
+
+/// Dispatch one scenario to `endpoint` with explicit TLS configuration.
+pub async fn dispatch_with_tls(
+    endpoint: &str,
+    req: ExecuteRequest,
+    tls: Option<ClientTlsConfig>,
+) -> Result<DispatchOutcome, Status> {
+    let mut client = connect_with_tls(endpoint, tls).await?;
     let mut stream = client.execute(req).await?.into_inner();
 
     let mut outcome = DispatchOutcome::default();
@@ -59,4 +86,12 @@ pub async fn dispatch(endpoint: &str, req: ExecuteRequest) -> Result<DispatchOut
         }
     }
     Ok(outcome)
+}
+
+/// Dispatch one scenario to `endpoint` and drain the event stream.
+/// mTLS configuration is loaded from the environment (falling back to plaintext in dev).
+pub async fn dispatch(endpoint: &str, req: ExecuteRequest) -> Result<DispatchOutcome, Status> {
+    let tls = asmodeus_proto::tls::client_from_env("asmodeus-runner")
+        .map_err(|e| Status::internal(format!("tls config: {e}")))?;
+    dispatch_with_tls(endpoint, req, tls).await
 }

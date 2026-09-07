@@ -30,3 +30,4 @@ ed25519-compact = { workspace = true }
 tower = { workspace = true }
 tokio-stream = { workspace = true }
 prost = { workspace = true }
+asmodeus-testkit = { workspace = true }

@@ -190,12 +190,13 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
 - **Telemetry** (`asmodeus-telemetry`): `Aggregate` — средние MTTD/MTTR, detection rate, экспозиция Prometheus.
 - **Control-plane** (`asmodeus-control-plane`): axum-сервер, каталог самоподписанных сценариев, движок прогона. Эндпоинты: `POST /scenarios/:id/run`, `POST /scenarios/abort`, `GET /telemetry/mttd`, `GET /metrics`, `GET /healthz`. RBAC даёт `401/403/404/422` строго по ролям.
 - **Runner** (`asmodeus-runner`): синтетический canary-инъектор (обратимый XOR, scope-guard) + gRPC-сервер `RunnerControl` (проверка подписи → INV-0 → инъекция → стрим событий), проверен end-to-end по TCP.
-- **Proto** (`asmodeus-proto`): tonic-контракт `RunnerControl`, mTLS-обвязка (сертификаты из env — операторские).
+- **Proto** (`asmodeus-proto`): tonic-контракт `RunnerControl`, mTLS-обвязка с fail-closed семантикой (неполная конфигурация даёт ошибку конфигурации вместо отката в plaintext), поддержка независимых env-переменных (`ASMODEUS_RUNNER_TLS_*`, `ASMODEUS_CLIENT_TLS_*`, `ASMODEUS_TLS_DOMAIN`) и in-memory API (`MtlsConfig`, `server_tls_config`, `client_tls_config`).
 
-- **Замкнутый контур**: при заданном `ASMODEUS_RUNNER_ENDPOINT` control-plane диспатчит подписанный сценарий в живой раннер по gRPC и сворачивает поток событий; иначе — in-process симуляция. Проверено сквозным прогоном двух бинарников.
+- **Замкнутый контур**: при заданном `ASMODEUS_RUNNER_ENDPOINT` control-plane диспатчит подписанный сценарий в живой раннер по gRPC (включая сквозной mTLS) и сворачивает поток событий; иначе — in-process симуляция. Проверено сквозным прогоном двух бинарников.
 
 - **CLI** (`asmodeus-cli`): операторский цикл — `keygen`/`sign`/`verify`/`validate` (офлайн, Ed25519, ключ 0600) и `run`/`status` (REST к control-plane).
-- **Testkit** (`asmodeus-testkit`): `Polygon` (self-cleaning canary-песочница) и `signed_scenario` (фикстура подписанного манифеста).
+- **Testkit** (`asmodeus-testkit`): `Polygon` (self-cleaning canary-песочница), `signed_scenario` (фикстура подписанного манифеста) и `TestMtls` (генерация CA, server, client и rogue-сертификатов на `rcgen` для сквозного тестирования mTLS).
+
 
 - **Сетевой хаос** (`asmodeus-runner::netchaos`): синтетическая имитация
   `LATENCY_SPIKE_VM` (задержка/джиттер/потери) на зарезервированном
