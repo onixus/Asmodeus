@@ -8,6 +8,64 @@
 ## [Unreleased]
 
 ### Добавлено
+- **Спецификация OpenAPI 3.1.0 (`asmodeus-control-plane::openapi`)**:
+  - Канонический генератор схемы OpenAPI 3.1.0 (`openapi.json`) для бесшовной интеграции с APEX Unified Gateway (FastAPI) и веб-консолью управления хаос-инженерией (`/chaos`).
+  - Полное описание схем (`AuditRecord`, `Measurements`, `Campaign`, `Scenario`, `ResilienceReport`), эндпоинтов, схем аутентификации (`X-Apex-Role`) и кодов возврата (401, 403, 404, 422).
+  - **Эндпоинт REST API**:
+    - `GET /api/v1/asmodeus/openapi.json` — машиночитаемая спецификация OpenAPI 3.1.0.
+- **Персистентное хранилище и потоковый экспорт журнала аудита (`AuditTrail`)**:
+  - Потокобезопасная персистенция в файл в формате JSON Lines (JSONL) через переменную окружения `ASMODEUS_AUDIT_LOG`.
+  - Автоматическое добавление записей при прогонах и сохранение обновлений при замкнутом цикле реагирования Blue Team (`run_feedback`).
+  - Потоковый экспорт журнала аудита с валидацией RBAC (`Capability::ViewReports`):
+    - `GET /api/v1/asmodeus/audit/export?format=jsonl|json` — экспорт нефальсифицируемого журнала в форматах JSON Lines или JSON array.
+- **Динамическое управление кампаниями и плейбуками атак (Dynamic Attack Campaigns DSL)**:
+  - Методы динамической регистрации и дерегистрации в `CampaignCatalog` (`register`, `deregister`).
+  - Потокобезопасный доступ через `Arc<RwLock<CampaignCatalog>>` в `AppState`.
+  - **Эндпоинты REST API**:
+    - `POST /api/v1/asmodeus/campaigns` — регистрация кастомной цепочки атак (`Admin`, `RedTeam`);
+    - `DELETE /api/v1/asmodeus/campaigns/:id` — удаление кампании по идентификатору (`Admin`, `RedTeam`).
+- **Автоматическая загрузка внешних подписанных манифестов сценариев из директории**:
+  - Метод `Catalog::load_from_dir(&mut self, dir: &Path)`: рекурсивное сканирование YAML/JSON манифестов, проверка инварианта INV-0 через `asmodeus_dsl::manifest::parse_manifest`, криптографическая подпись и постановка в каталог сценариев.
+  - Поддержка переменной окружения `ASMODEUS_SCENARIOS_DIR` при инициализации `Catalog::seeded()`.
+- **Расширение операторского CLI (`asmodeus-cli`)**:
+  - `asmodeus campaigns register --manifest <PATH> [--role <ROLE>]` — регистрация кампании из файла YAML/JSON;
+  - `asmodeus campaigns delete --id <CAMPAIGN_ID> [--role <ROLE>]` — удаление зарегистрированной кампании;
+  - `asmodeus runs export [--format jsonl|json] [--out <PATH>]` — выгрузка криптографического журнала аудита в файл или stdout.
+- **Декларативный парсер и валидатор манифестов сценариев (`asmodeus-dsl::manifest`)**:
+  - **Типизированные структуры манифестов** по FTT §5 и TT §1.1: `ScenarioManifest`, `ManifestKind`,
+    `ManifestMetadata`, `TargetScope`, `SafetySpec`, `ActionSpec`, `ExpectedOutcome`.
+  - **Двойной парсер для YAML и JSON** (`parse_and_validate_manifest`) со строгой валидацией инварианта
+    INV-0 (`ActionNature::Synthetic`), белых списков canary-каталогов (`path_in_scope`), тестовых
+    подсетей RFC 5737 (`net_target_in_scope`), ресурсных бюджетов (CPU ≤ 85%, время ≤ 300с, лимиты
+    файлов/размеров) и верификацией идентификаторов техник MITRE ATT&CK.
+  - **Эндпоинт REST API**:
+    - `POST /api/v1/asmodeus/scenarios/validate` — пре-валидация манифестов перед подписью и постановкой в каталог.
+- **Движок валидации замкнутого цикла реагирования (NIST Closed-Loop & SOAR Feedback)**:
+  - **Приём событий реагирования Blue Team / SOAR** (`POST /api/v1/asmodeus/runs/:id/feedback`):
+    фиксация факта обнаружения (Ferrum eBPF, Lariska agent, BSDM proxy) и сдерживания (SOAR SIGKILL,
+    quarantine), расчет фактических задержек MTTD и MTTR.
+  - **Криптографическая переподпись записей аудита Ed25519**: обновление `AuditRecord` с сохранением
+    нефальсифицируемости и актуализацией статуса (`CONTAINED`, `UNCONTAINED`).
+  - **Динамический пересчёт метрик**: обновление скользящих агрегатов `Aggregate` и индекса
+    `ResilienceScore` с учётом реального времени реагирования защитного контура.
+- **Движок исполнительной отчётности NIST CSF 2.0 (`asmodeus-telemetry::reporting`)**:
+  - **Маппинг на 6 функций фреймворка NIST CSF 2.0**: Govern (GV), Identify (ID), Protect (PR),
+    Detect (DE), Respond (RS), Recover (RC).
+  - **Оценка устойчивости**: аудит соблюдения SLA (`TARGET_MTTR_MS = 300 мс`), процент детекции
+    по тактикам MITRE ATT&CK, формирование адресных рекомендаций для Blue Team.
+  - **Генерация отчётов** в форматах Markdown (структурированный документ с бейджами и таблицами)
+    и JSON (для интеграции с APEX FastAPI Gateway).
+  - **Эндпоинты REST API**:
+    - `GET /api/v1/asmodeus/reports/resilience` — сводный исполнительный отчёт устойчивости экосистемы;
+    - `GET /api/v1/asmodeus/runs/:id/report` — детальный отчёт по конкретному прогону учений.
+- **Расширение инструментов оператора в CLI (`asmodeus-cli`)**:
+  - `asmodeus validate [--target-dir <DIR> | --manifest <PATH>]` — валидация каталогов или полных декларативных манифестов;
+  - `asmodeus report [--format text|json]` — отображение исполнительного отчёта устойчивости NIST CSF 2.0;
+  - `asmodeus runs feedback --id <RUN_ID> --detected <bool> [--detector <SRC>] [--mttd-ms <MS>] --contained <bool> [--containment-action <ACT>] [--mttr-ms <MS>]` — передача отклика Blue Team;
+  - `asmodeus runs report --id <RUN_ID> [--format text|json]` — вывод детального отчёта по прогону.
+- **Политика защиты цепочки поставок (`deny.toml`)**:
+  - Конфигурация для `cargo-deny` в корне проекта (проверка открытых лицензий, запрет небезопасных
+    источников, контроль уязвимостей через RustSec Advisory Database).
 - **Криптографический Журнал Аудита (Signed Audit Trail Engine)**:
   - **Структура и подпись записей аудита** (`asmodeus-telemetry::audit`): структура `AuditRecord`
     со всеми параметрами прогона (run_id, scenario_id, category, mitre_technique, severity, tag,

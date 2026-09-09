@@ -219,7 +219,13 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
   - Эндпоинты REST API: `GET /api/v1/asmodeus/runs`, `GET /api/v1/asmodeus/runs/:id`, `GET /api/v1/asmodeus/runs/:id/verify`.
   - Оркестратор цепочек атак (Playbooks / Campaigns): `CAMP-RANSOMWARE-CHAIN`, `CAMP-K8S-ESCAPE-CHAOS`, `CAMP-PERSISTENCE-EXFIL` с вычислением композитного `ResilienceScore` по всей цепочке.
   - Фоновый `watchdog` в control-plane для периодической проверки доступности раннеров.
-  - Операторские команды CLI `asmodeus runs list/get/verify` и `asmodeus campaigns list/run`. 104 теста green.
+  - Операторские команды CLI `asmodeus runs list/get/verify` и `asmodeus campaigns list/run`.
+
+- **Декларативный DSL, Замкнутый Цикл NIST Closed-Loop и Исполнительная Отчётность** (`asmodeus-dsl::manifest`, `asmodeus-telemetry::reporting`, `asmodeus-control-plane`):
+  - Полный декларативный парсер и валидатор сценариев (`AttackScenario`, `ChaosExperiment`) по спецификации `FTT.md §5` с поддержкой YAML и JSON, проверкой инварианта `INV-0` и ресурсных лимитов (`POST /scenarios/validate`, `asmodeus validate --manifest`).
+  - Замкнутый цикл реагирования (Closed-Loop Feedback): приём оповещений от защитных датчиков (Ferrum/Lariska/SOAR) через `POST /runs/:id/feedback` и `asmodeus runs feedback`, динамический замер MTTD/MTTR и автоматическая криптографическая переподпись аудиторской записи Ed25519.
+  - Отчётность кибер-устойчивости NIST CSF 2.0 (Govern, Identify, Protect, Detect, Respond, Recover) с расчётом SLA (`TARGET_MTTR_MS`), тактическим анализом и генерацией документов в форматах Markdown и JSON (`GET /reports/resilience`, `GET /runs/:id/report`, `asmodeus report`).
+  - Политика защиты цепочки поставок (`deny.toml`) для строгой проверки лицензий и безопасности зависимостей в CI. 110 тестов green.
 
 Осталось (только на Linux-стенде): собрать компилируемый BPF-объект и подключить
 его к aya/TC-бэкенду (`clsact` + `SchedClassifier`, `--features ebpf`) — на

@@ -83,6 +83,9 @@ dependencies = [
 [[package]]
 name = "asmodeus-common"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "asmodeus-control-plane"
@@ -122,6 +125,8 @@ name = "asmodeus-dsl"
 version = "0.1.0"
 dependencies = [
  "asmodeus-common",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

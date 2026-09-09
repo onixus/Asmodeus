@@ -44,10 +44,12 @@ enum Cmd {
         #[arg(long)]
         pubkey: PathBuf,
     },
-    /// Check that a target directory lies within the canary scope (INV-0).
+    /// Check that a target directory or declarative manifest complies with INV-0.
     Validate {
         #[arg(long)]
-        target_dir: String,
+        target_dir: Option<String>,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Run a scenario via the control-plane REST API.
     Run {
@@ -77,6 +79,15 @@ enum Cmd {
     },
     /// Display MITRE ATT&CK Enterprise Matrix coverage report.
     Mitre {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Generate or view NIST CSF 2.0 Cyber-Resilience executive report.
+    Report {
+        #[arg(long, default_value = "text")]
+        format: String,
         #[arg(long, default_value = "auditor")]
         role: String,
         #[arg(long, default_value = "http://127.0.0.1:8842")]
@@ -132,6 +143,49 @@ enum RunsAction {
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
     },
+    /// Submit Blue Team detection and containment feedback for closed-loop validation.
+    Feedback {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        detected: bool,
+        #[arg(long)]
+        mttd_ms: Option<u64>,
+        #[arg(long)]
+        detector: Option<String>,
+        #[arg(long, default_value_t = false)]
+        contained: bool,
+        #[arg(long)]
+        mttr_ms: Option<u64>,
+        #[arg(long)]
+        containment_action: Option<String>,
+        #[arg(long, default_value = "secops")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// View detailed NIST CSF report for a single run.
+    Report {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "text")]
+        format: String,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Export the signed audit trail in JSON or JSONL format.
+    Export {
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -139,6 +193,24 @@ enum CampaignsAction {
     /// List all preconfigured attack campaigns and playbooks.
     List {
         #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Register a declarative attack campaign from a YAML or JSON file.
+    Register {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = "red_team")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Delete a registered attack campaign by ID.
+    Delete {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "admin")]
         role: String,
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
@@ -261,13 +333,31 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ops::verify(&data, &signature, pk.trim())?;
             println!("OK: signature verifies");
         }
-        Cmd::Validate { target_dir } => {
-            if ops::validate_scope(&target_dir) {
-                println!("OK: {target_dir} is within canary scope");
-            } else {
-                return Err(
-                    format!("REFUSED: {target_dir} is outside canary scope (INV-0)").into(),
+        Cmd::Validate {
+            target_dir,
+            manifest,
+        } => {
+            if let Some(m) = manifest {
+                let raw = std::fs::read_to_string(&m)?;
+                let parsed = asmodeus_dsl::parse_and_validate_manifest(&raw)?;
+                println!(
+                    "VALID: manifest '{}' ({}) conforms to INV-0 (synthetic only)",
+                    parsed.metadata.id, parsed.metadata.name
                 );
+                println!(
+                    "  category: {:?}, severity: {}, mitre: {}",
+                    parsed.metadata.category,
+                    parsed.metadata.severity,
+                    parsed.metadata.mitre_technique.as_deref().unwrap_or("N/A")
+                );
+            } else if let Some(d) = target_dir {
+                if ops::validate_scope(&d) {
+                    println!("OK: {d} is within canary scope");
+                } else {
+                    return Err(format!("REFUSED: {d} is outside canary scope (INV-0)").into());
+                }
+            } else {
+                return Err("please provide either --manifest <PATH> or --target-dir <DIR>".into());
             }
         }
         Cmd::Run {
@@ -301,6 +391,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let endpoint = format!("{url}/api/v1/asmodeus/scenarios/mitre");
             let client = reqwest::blocking::Client::new();
             call(client.get(&endpoint).header("X-Apex-Role", &role), "mitre")?;
+        }
+        Cmd::Report { format, role, url } => {
+            let endpoint = format!("{url}/api/v1/asmodeus/reports/resilience?format={format}");
+            let client = reqwest::blocking::Client::new();
+            call(
+                client.get(&endpoint).header("X-Apex-Role", &role),
+                "resilience report",
+            )?;
         }
         Cmd::Runners { action } => match action {
             RunnersAction::List { role, url } => {
@@ -392,6 +490,69 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "runs verify",
                 )?;
             }
+            RunsAction::Feedback {
+                id,
+                detected,
+                mttd_ms,
+                detector,
+                contained,
+                mttr_ms,
+                containment_action,
+                role,
+                url,
+            } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/runs/{id}/feedback");
+                let client = reqwest::blocking::Client::new();
+                let payload = json!({
+                    "detected": detected,
+                    "mttd_ms": mttd_ms,
+                    "detection_source": detector,
+                    "contained": contained,
+                    "mttr_ms": mttr_ms,
+                    "containment_action": containment_action,
+                });
+                call(
+                    client
+                        .post(&endpoint)
+                        .header("X-Apex-Role", &role)
+                        .json(&payload),
+                    "runs feedback",
+                )?;
+            }
+            RunsAction::Report {
+                id,
+                format,
+                role,
+                url,
+            } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/runs/{id}/report?format={format}");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "runs report",
+                )?;
+            }
+            RunsAction::Export {
+                format,
+                out,
+                role,
+                url,
+            } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/audit/export?format={format}");
+                let client = reqwest::blocking::Client::new();
+                let resp = client.get(&endpoint).header("X-Apex-Role", &role).send()?;
+                let status = resp.status();
+                let text = resp.text()?;
+                if !status.is_success() {
+                    return Err(format!("runs export failed: HTTP {status} - {text}").into());
+                }
+                if let Some(out_path) = out {
+                    std::fs::write(&out_path, &text)?;
+                    println!("Exported audit trail to {}", out_path.display());
+                } else {
+                    print!("{text}");
+                }
+            }
         },
         Cmd::Campaigns { action } => match action {
             CampaignsAction::List { role, url } => {
@@ -400,6 +561,36 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 call(
                     client.get(&endpoint).header("X-Apex-Role", &role),
                     "campaigns list",
+                )?;
+            }
+            CampaignsAction::Register {
+                manifest,
+                role,
+                url,
+            } => {
+                let content = std::fs::read_to_string(&manifest)?;
+                let json_val = if manifest.extension().and_then(|e| e.to_str()) == Some("json")
+                    || content.trim().starts_with('{')
+                {
+                    serde_json::from_str::<serde_json::Value>(&content)?
+                } else {
+                    asmodeus_dsl::parse_yaml_to_json_value(&content)
+                        .map_err(|e| format!("invalid YAML campaign manifest: {e:?}"))?
+                };
+                let endpoint = format!("{url}/api/v1/asmodeus/campaigns");
+                let client = reqwest::blocking::Client::new();
+                let req = client
+                    .post(&endpoint)
+                    .header("X-Apex-Role", &role)
+                    .json(&json_val);
+                call(req, "campaigns register")?;
+            }
+            CampaignsAction::Delete { id, role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/campaigns/{id}");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.delete(&endpoint).header("X-Apex-Role", &role),
+                    "campaigns delete",
                 )?;
             }
             CampaignsAction::Run {
@@ -447,6 +638,66 @@ mod tests {
 
         let cli = Cli::try_parse_from([
             "asmodeus",
+            "runs",
+            "export",
+            "--format",
+            "json",
+            "--out",
+            "audit_backup.json",
+        ])
+        .expect("parse export");
+        match cli.cmd {
+            Cmd::Runs {
+                action: RunsAction::Export { format, out, .. },
+            } => {
+                assert_eq!(format, "json");
+                assert_eq!(out, Some(PathBuf::from("audit_backup.json")));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "campaigns",
+            "register",
+            "--manifest",
+            "campaign.yaml",
+            "--role",
+            "red_team",
+        ])
+        .expect("parse campaign register");
+        match cli.cmd {
+            Cmd::Campaigns {
+                action: CampaignsAction::Register { manifest, role, .. },
+            } => {
+                assert_eq!(manifest, PathBuf::from("campaign.yaml"));
+                assert_eq!(role, "red_team");
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "campaigns",
+            "delete",
+            "--id",
+            "CAMP-TEST-001",
+            "--role",
+            "admin",
+        ])
+        .expect("parse campaign delete");
+        match cli.cmd {
+            Cmd::Campaigns {
+                action: CampaignsAction::Delete { id, role, .. },
+            } => {
+                assert_eq!(id, "CAMP-TEST-001");
+                assert_eq!(role, "admin");
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "asmodeus",
             "campaigns",
             "run",
             "--id",
@@ -461,6 +712,61 @@ mod tests {
             } => {
                 assert_eq!(id, "CAMP-RANSOMWARE-CHAIN");
                 assert_eq!(target, Some("k8s_workload".into()));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "runs",
+            "feedback",
+            "--id",
+            "run_999",
+            "--detected",
+            "--mttd-ms",
+            "125",
+            "--contained",
+            "--mttr-ms",
+            "250",
+            "--containment-action",
+            "SIGKILL",
+        ])
+        .expect("parse feedback");
+        match cli.cmd {
+            Cmd::Runs {
+                action:
+                    RunsAction::Feedback {
+                        id,
+                        detected,
+                        mttd_ms,
+                        contained,
+                        mttr_ms,
+                        containment_action,
+                        ..
+                    },
+            } => {
+                assert_eq!(id, "run_999");
+                assert!(detected);
+                assert_eq!(mttd_ms, Some(125));
+                assert!(contained);
+                assert_eq!(mttr_ms, Some(250));
+                assert_eq!(containment_action, Some("SIGKILL".into()));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from(["asmodeus", "report", "--format", "markdown"])
+            .expect("parse report");
+        match cli.cmd {
+            Cmd::Report { format, .. } => assert_eq!(format, "markdown"),
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from(["asmodeus", "validate", "--manifest", "scenario.yaml"])
+            .expect("parse validate manifest");
+        match cli.cmd {
+            Cmd::Validate { manifest, .. } => {
+                assert_eq!(manifest, Some(PathBuf::from("scenario.yaml")))
             }
             _ => panic!("unexpected command"),
         }

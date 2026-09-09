@@ -110,6 +110,26 @@ impl CampaignCatalog {
             .iter()
             .find(|c| c.id.eq_ignore_ascii_case(id))
     }
+
+    /// Register a campaign, replacing any existing campaign with the same id (case-insensitive).
+    pub fn register(&mut self, campaign: Campaign) {
+        if let Some(pos) = self
+            .campaigns
+            .iter()
+            .position(|c| c.id.eq_ignore_ascii_case(&campaign.id))
+        {
+            self.campaigns[pos] = campaign;
+        } else {
+            self.campaigns.push(campaign);
+        }
+    }
+
+    /// Deregister a campaign by ID. Returns true if removed, false if not found.
+    pub fn deregister(&mut self, id: &str) -> bool {
+        let initial_len = self.campaigns.len();
+        self.campaigns.retain(|c| !c.id.eq_ignore_ascii_case(id));
+        self.campaigns.len() < initial_len
+    }
 }
 
 #[cfg(test)]
@@ -118,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_seeded_campaigns() {
-        let catalog = CampaignCatalog::seeded();
+        let mut catalog = CampaignCatalog::seeded();
         let list = catalog.list();
         assert_eq!(list.len(), 3);
 
@@ -135,5 +155,27 @@ mod tests {
         assert_eq!(k8s.steps.len(), 3);
 
         assert!(catalog.get("NON_EXISTENT").is_none());
+
+        // Dynamic registration
+        let custom = Campaign {
+            id: "CAMP-CUSTOM-01".to_string(),
+            name: "Custom Kill-Chain".to_string(),
+            description: "Custom test campaign".to_string(),
+            steps: vec![CampaignStep {
+                order: 1,
+                scenario_id: "CREDENTIAL_ACCESS_CANARY".to_string(),
+            }],
+        };
+        catalog.register(custom.clone());
+        assert_eq!(catalog.list().len(), 4);
+        assert_eq!(
+            catalog.get("camp-custom-01").unwrap().name,
+            "Custom Kill-Chain"
+        );
+
+        // Deregister
+        assert!(catalog.deregister("camp-custom-01"));
+        assert_eq!(catalog.list().len(), 3);
+        assert!(!catalog.deregister("non-existent"));
     }
 }

@@ -9,6 +9,7 @@ mod catalog;
 mod dispatch;
 mod engine;
 mod http;
+mod openapi;
 mod registry;
 mod watchdog;
 

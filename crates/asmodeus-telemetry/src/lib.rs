@@ -3,7 +3,10 @@
 //! Pure computation + text exposition; no async scrape server yet.
 
 pub mod audit;
+pub mod reporting;
+
 pub use audit::*;
+pub use reporting::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +44,19 @@ impl Aggregate {
         }
         self.sum_mttd_ms += m.mttd_ms;
         self.sum_mttr_ms += m.mttr_ms;
+    }
+
+    /// Update an existing measurement (e.g. from closed-loop feedback).
+    pub fn update_measurement(&mut self, old: Measurements, new: Measurements) {
+        if old.blue_team_detected != new.blue_team_detected {
+            if new.blue_team_detected {
+                self.detected += 1;
+            } else if self.detected > 0 {
+                self.detected -= 1;
+            }
+        }
+        self.sum_mttd_ms = self.sum_mttd_ms.saturating_sub(old.mttd_ms) + new.mttd_ms;
+        self.sum_mttr_ms = self.sum_mttr_ms.saturating_sub(old.mttr_ms) + new.mttr_ms;
     }
 
     pub fn mean_mttd_ms(&self) -> u64 {
