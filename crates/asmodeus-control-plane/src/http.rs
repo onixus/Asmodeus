@@ -214,20 +214,28 @@ async fn execute_single_scenario(
         return Err(ApiError::Unprocessable("scenario signature invalid".into()));
     }
 
-    // Target resolution: find matching runner in registry or fall back to static endpoint
+    // Target resolution. An explicitly requested target must resolve to a
+    // registered runner: we never silently fall back to the static default
+    // endpoint, otherwise a mistyped or unavailable target would fire the
+    // scenario against the wrong runner. The static endpoint is only used when
+    // no target was requested at all.
+    let explicit_target = target_override.map(str::trim).filter(|t| !t.is_empty());
     let matched_runner = state.registry.find_for_target(target_override);
-    let target_endpoint = matched_runner
-        .as_ref()
-        .map(|r| r.endpoint.clone())
-        .or_else(|| state.runner_endpoint.clone());
-
-    if let Some(target) = target_override {
-        if target_endpoint.is_none() {
-            return Err(ApiError::NotFound(format!(
-                "target runner not found: {target}"
-            )));
+    let target_endpoint = if let Some(target) = explicit_target {
+        match matched_runner.as_ref() {
+            Some(runner) => Some(runner.endpoint.clone()),
+            None => {
+                return Err(ApiError::NotFound(format!(
+                    "target runner not found: {target}"
+                )))
+            }
         }
-    }
+    } else {
+        matched_runner
+            .as_ref()
+            .map(|r| r.endpoint.clone())
+            .or_else(|| state.runner_endpoint.clone())
+    };
 
     // Execute: dispatch to a live runner over gRPC if one is configured,
     // else drive the in-process engine. Detection metrics stay simulated
@@ -735,7 +743,10 @@ async fn verify_run(
     let record = trail
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
-    let verified = record.verify();
+    // Pin verification to the control plane's trusted signing key rather than
+    // the public key embedded in the record, so a tampered + re-signed record
+    // cannot report itself as verified.
+    let verified = record.verify_with_key(state.catalog.public_key());
     Ok(Json(json!({
         "run_id": record.run_id,
         "scenario_id": record.scenario_id,
@@ -790,47 +801,79 @@ async fn run_campaign(
     let mut detected_count = 0usize;
     let total_steps = campaign.steps.len();
 
+    // Execute the kill-chain stage by stage. A failing stage stops the chain
+    // (later stages typically depend on earlier ones) but never discards the
+    // work already done: the stage is recorded as failed and the partial
+    // report is returned to the caller instead of a bare error.
     for step in &campaign.steps {
-        let entry = state.catalog.get(&step.scenario_id).ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "scenario in campaign not found: {}",
-                step.scenario_id
-            ))
-        })?;
+        let entry = match state.catalog.get(&step.scenario_id) {
+            Some(entry) => entry,
+            None => {
+                step_results.push(crate::campaign::CampaignStepResult {
+                    step_order: step.order,
+                    scenario_id: step.scenario_id.clone(),
+                    run_id: String::new(),
+                    status: "SCENARIO_NOT_FOUND".to_string(),
+                    mttd_ms: 0,
+                    mttr_ms: 0,
+                    detected: false,
+                });
+                break;
+            }
+        };
 
-        let (run_id, _exec, audit_rec) =
-            execute_single_scenario(&state, entry, role, payload.target_override.as_deref())
-                .await?;
+        match execute_single_scenario(&state, entry, role, payload.target_override.as_deref()).await
+        {
+            Ok((run_id, _exec, audit_rec)) => {
+                sum_mttd += audit_rec.measurements.mttd_ms;
+                sum_mttr += audit_rec.measurements.mttr_ms;
+                if audit_rec.measurements.blue_team_detected {
+                    detected_count += 1;
+                }
 
-        sum_mttd += audit_rec.measurements.mttd_ms;
-        sum_mttr += audit_rec.measurements.mttr_ms;
-        if audit_rec.measurements.blue_team_detected {
-            detected_count += 1;
+                step_results.push(crate::campaign::CampaignStepResult {
+                    step_order: step.order,
+                    scenario_id: step.scenario_id.clone(),
+                    run_id: run_id.to_string(),
+                    status: audit_rec.status,
+                    mttd_ms: audit_rec.measurements.mttd_ms,
+                    mttr_ms: audit_rec.measurements.mttr_ms,
+                    detected: audit_rec.measurements.blue_team_detected,
+                });
+            }
+            Err(_) => {
+                step_results.push(crate::campaign::CampaignStepResult {
+                    step_order: step.order,
+                    scenario_id: step.scenario_id.clone(),
+                    run_id: String::new(),
+                    status: "FAILED".to_string(),
+                    mttd_ms: 0,
+                    mttr_ms: 0,
+                    detected: false,
+                });
+                break;
+            }
         }
-
-        step_results.push(crate::campaign::CampaignStepResult {
-            step_order: step.order,
-            scenario_id: step.scenario_id.clone(),
-            run_id: run_id.to_string(),
-            status: audit_rec.status,
-            mttd_ms: audit_rec.measurements.mttd_ms,
-            mttr_ms: audit_rec.measurements.mttr_ms,
-            detected: audit_rec.measurements.blue_team_detected,
-        });
     }
 
-    let mean_mttd = if total_steps > 0 {
-        sum_mttd / total_steps as u64
+    // Aggregate only over the stages that actually completed, so a partial
+    // chain does not dilute the means with zero-valued failed stages.
+    let successful_steps = step_results
+        .iter()
+        .filter(|r| r.status == "COMPLETED")
+        .count();
+    let mean_mttd = if successful_steps > 0 {
+        sum_mttd / successful_steps as u64
     } else {
         0
     };
-    let mean_mttr = if total_steps > 0 {
-        sum_mttr / total_steps as u64
+    let mean_mttr = if successful_steps > 0 {
+        sum_mttr / successful_steps as u64
     } else {
         0
     };
-    let detection_rate_pct = if total_steps > 0 {
-        100.0 * detected_count as f32 / total_steps as f32
+    let detection_rate_pct = if successful_steps > 0 {
+        100.0 * detected_count as f32 / successful_steps as f32
     } else {
         0.0
     };
@@ -848,7 +891,7 @@ async fn run_campaign(
         initiator: role.as_str().to_string(),
         target_override: payload.target_override,
         total_steps,
-        successful_steps: step_results.len(),
+        successful_steps,
         step_results,
         mean_mttd_ms: mean_mttd,
         mean_mttr_ms: mean_mttr,
@@ -1683,5 +1726,30 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["total"], 4);
+    }
+
+    #[tokio::test]
+    async fn explicit_target_never_falls_back_to_static_endpoint() {
+        // A static default runner endpoint is configured, but the requested
+        // target matches no registered runner. The request must be rejected
+        // with 404 rather than silently dispatched to the default runner.
+        let app = router(AppState::with_runner(
+            Catalog::seeded(),
+            Some("http://127.0.0.1:59999".to_string()),
+        ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "target_override": "no_such_tag" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // 404 (target not found) — crucially NOT a dispatch attempt to the
+        // static endpoint (which would surface as 502 BadGateway).
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

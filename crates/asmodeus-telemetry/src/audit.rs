@@ -30,20 +30,40 @@ pub struct AuditRecord {
 
 impl AuditRecord {
     /// Deterministic canonical byte representation for Ed25519 signing.
+    ///
+    /// Covers every attestable field of the record (everything except the
+    /// signature and public key themselves), using an unambiguous
+    /// length-prefixed encoding so that no combination of field values can
+    /// collide with another record (e.g. a `:` inside a value can no longer
+    /// shift field boundaries).
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            self.run_id,
-            self.scenario_id,
-            self.status,
-            self.initiator,
-            self.runner_id,
-            self.timestamp_utc,
-            self.measurements.mttd_ms,
-            self.measurements.mttr_ms,
-            self.measurements.blue_team_detected
-        )
-        .into_bytes()
+        fn field(buf: &mut Vec<u8>, value: &str) {
+            buf.extend_from_slice(value.len().to_string().as_bytes());
+            buf.push(b':');
+            buf.extend_from_slice(value.as_bytes());
+            buf.push(b'|');
+        }
+
+        let mut buf = Vec::new();
+        field(&mut buf, &self.run_id);
+        field(&mut buf, &self.scenario_id);
+        field(&mut buf, &self.scenario_name);
+        field(&mut buf, &self.category);
+        field(&mut buf, &self.mitre_technique);
+        field(&mut buf, &self.mitre_tactic);
+        field(&mut buf, &self.severity);
+        field(&mut buf, &self.tag);
+        field(&mut buf, &self.initiator);
+        field(&mut buf, &self.runner_id);
+        field(&mut buf, &self.status);
+        field(&mut buf, &self.measurements.mttd_ms.to_string());
+        field(&mut buf, &self.measurements.mttr_ms.to_string());
+        field(&mut buf, &self.measurements.blue_team_detected.to_string());
+        field(&mut buf, &self.detection_source);
+        field(&mut buf, &self.containment_action);
+        field(&mut buf, &self.cleanup_status);
+        field(&mut buf, &self.timestamp_utc);
+        buf
     }
 
     /// Sign this audit record using the operator's Ed25519 private key.
@@ -56,21 +76,41 @@ impl AuditRecord {
         Ok(self)
     }
 
-    /// Verify this audit record's digital signature against its public key.
-    pub fn verify(&self) -> bool {
-        if self.signature_hex.is_empty() || self.public_key_hex.is_empty() {
+    /// Verify this audit record's digital signature against a *trusted* public
+    /// key (the operator / Red Team Lead key held by the control plane).
+    ///
+    /// This is the authoritative check: it does NOT trust the public key
+    /// embedded in the record, so an attacker who rewrites a field and
+    /// re-signs with their own keypair (also overwriting `public_key_hex`)
+    /// cannot make the record verify.
+    pub fn verify_with_key(&self, trusted_public_key: &[u8]) -> bool {
+        if self.signature_hex.is_empty() {
             return false;
         }
         let sig = match from_hex(&self.signature_hex) {
             Some(bytes) => bytes,
             None => return false,
         };
+        let canonical = self.canonical_bytes();
+        asmodeus_crypto::is_valid(&canonical, &sig, trusted_public_key)
+    }
+
+    /// Verify this record's signature against the public key embedded in the
+    /// record itself.
+    ///
+    /// This only proves internal self-consistency (the signature matches the
+    /// bundled public key) and provides NO tamper-evidence against an actor
+    /// who can rewrite the record and re-sign it. Callers that need real
+    /// integrity guarantees must use [`verify_with_key`] with a trusted key.
+    pub fn verify(&self) -> bool {
+        if self.public_key_hex.is_empty() {
+            return false;
+        }
         let pk = match from_hex(&self.public_key_hex) {
             Some(bytes) => bytes,
             None => return false,
         };
-        let canonical = self.canonical_bytes();
-        asmodeus_crypto::is_valid(&canonical, &sig, &pk)
+        self.verify_with_key(&pk)
     }
 }
 
@@ -280,6 +320,57 @@ mod tests {
         let limited = trail.list(Some(1), None, None);
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].run_id, "run-test-02"); // newest first
+    }
+
+    #[test]
+    fn test_verify_with_key_rejects_forged_re_signed_record() {
+        // Legitimate record signed by the trusted operator key.
+        let (trusted_pk, trusted_sk) = generate_keypair();
+        let record = sample_record().sign(&trusted_sk).expect("sign");
+        assert!(record.verify_with_key(&trusted_pk));
+
+        // Attacker rewrites a field and re-signs with their OWN keypair,
+        // overwriting both the signature and the embedded public key.
+        let (attacker_pk, attacker_sk) = generate_keypair();
+        let mut forged = record.clone();
+        forged.status = "COMPLETED".to_string();
+        forged.cleanup_status = "SUCCESS (nothing to see here)".to_string();
+        let forged = forged.sign(&attacker_sk).expect("re-sign");
+
+        // Self-consistent verify() is fooled, but pinning to the trusted key
+        // rejects the forgery.
+        assert!(
+            forged.verify(),
+            "self-check verifies the attacker's own key"
+        );
+        assert_eq!(forged.public_key_hex, to_hex(&attacker_pk));
+        assert!(
+            !forged.verify_with_key(&trusted_pk),
+            "forged record must NOT verify against the trusted key"
+        );
+    }
+
+    #[test]
+    fn test_tampering_unmeasured_fields_breaks_signature() {
+        let (pk, sk) = generate_keypair();
+        let record = sample_record().sign(&sk).expect("sign");
+
+        // Fields outside the old 9-field canonical set must now be covered.
+        for mutate in [
+            (|r: &mut AuditRecord| r.cleanup_status = "host artifacts remain".into())
+                as fn(&mut AuditRecord),
+            |r: &mut AuditRecord| r.detection_source = "NONE".into(),
+            |r: &mut AuditRecord| r.containment_action = "ignored".into(),
+            |r: &mut AuditRecord| r.severity = "Low".into(),
+            |r: &mut AuditRecord| r.mitre_technique = "T0000".into(),
+        ] {
+            let mut tampered = record.clone();
+            mutate(&mut tampered);
+            assert!(
+                !tampered.verify_with_key(&pk),
+                "tampering a signed field must invalidate the signature"
+            );
+        }
     }
 
     #[test]

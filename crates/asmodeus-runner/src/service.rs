@@ -24,6 +24,10 @@ pub struct RunnerService {
     active_exercise: Arc<Mutex<Option<String>>>,
     current_state: Arc<Mutex<RunState>>,
     dead_man: Arc<Mutex<DeadManSwitch>>,
+    /// Health of the most recent injection: cleared when a run ends in a
+    /// rejected / circuit-breaker-tripped state so the control-plane watchdog
+    /// can observe a degraded-but-reachable runner.
+    healthy: Arc<Mutex<bool>>,
 }
 
 impl Default for RunnerService {
@@ -33,6 +37,7 @@ impl Default for RunnerService {
             active_exercise: Arc::new(Mutex::new(None)),
             current_state: Arc::new(Mutex::new(RunState::Idle)),
             dead_man: Arc::new(Mutex::new(DeadManSwitch::default())),
+            healthy: Arc::new(Mutex::new(true)),
         }
     }
 }
@@ -197,11 +202,17 @@ impl RunnerControl for RunnerService {
 
         let events = Self::plan(&req);
 
+        // A run that ends in a Rejected event (bad request, injection failure,
+        // or circuit-breaker trip) leaves the runner degraded until the next
+        // clean run; surface that through the heartbeat.
+        let run_healthy = !events.iter().any(|e| e.kind == EventKind::Rejected as i32);
+
         {
             let mut active = self.active_exercise.lock().unwrap();
             *active = None;
             let mut state = self.current_state.lock().unwrap();
             *state = RunState::Idle;
+            *self.healthy.lock().unwrap() = run_healthy;
         }
 
         let stream = tokio_stream::iter(events.into_iter().map(Ok));
@@ -212,10 +223,14 @@ impl RunnerControl for RunnerService {
         &self,
         _request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
-        {
+        // Evaluate the dead-man switch (has the control plane gone silent?)
+        // before recording this beat, then reset it now that we've heard from it.
+        let dead_man_expired = {
             let mut dms = self.dead_man.lock().unwrap();
+            let expired = dms.is_expired();
             dms.record_beat();
-        }
+            expired
+        };
 
         let state = *self.current_state.lock().unwrap();
         let active = self
@@ -224,10 +239,11 @@ impl RunnerControl for RunnerService {
             .unwrap()
             .clone()
             .unwrap_or_default();
+        let healthy = *self.healthy.lock().unwrap() && !dead_man_expired;
 
         Ok(Response::new(HeartbeatReply {
             state: format!("{state:?}"),
-            healthy: true,
+            healthy,
             cpu_usage_pct: 2,
             active_exercise_id: active,
             version: env!("CARGO_PKG_VERSION").to_string(),
