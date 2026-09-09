@@ -27,7 +27,8 @@ pub const T1611_ESCAPE_TO_HOST: MitreTechnique = MitreTechnique {
     id: "T1611",
     name: "Escape to Host",
     tactic: "Privilege Escalation",
-    description: "Adversaries may break out of a container to gain access to the underlying host system.",
+    description:
+        "Adversaries may break out of a container to gain access to the underlying host system.",
 };
 
 pub const T1059_COMMAND_AND_SCRIPTING_INTERPRETER: MitreTechnique = MitreTechnique {
@@ -102,7 +103,10 @@ pub const ALL_TECHNIQUES: [MitreTechnique; 10] = [
 
 /// Look up a MITRE ATT&CK technique by its ID (e.g., `"T1486"` or `"T1562"`).
 pub fn lookup_technique(id: &str) -> Option<MitreTechnique> {
-    ALL_TECHNIQUES.iter().copied().find(|t| t.id.eq_ignore_ascii_case(id))
+    ALL_TECHNIQUES
+        .iter()
+        .copied()
+        .find(|t| t.id.eq_ignore_ascii_case(id))
 }
 
 #[cfg(test)]

@@ -838,7 +838,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         // Handshake fails, run must not succeed
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

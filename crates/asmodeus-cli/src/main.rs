@@ -166,7 +166,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Scenarios { role, url } => {
             let endpoint = format!("{url}/api/v1/asmodeus/scenarios");
             let client = reqwest::blocking::Client::new();
-            call(client.get(&endpoint).header("X-Apex-Role", &role), "scenarios")?;
+            call(
+                client.get(&endpoint).header("X-Apex-Role", &role),
+                "scenarios",
+            )?;
         }
         Cmd::Mitre { role, url } => {
             let endpoint = format!("{url}/api/v1/asmodeus/scenarios/mitre");
