@@ -87,6 +87,74 @@ enum Cmd {
         #[command(subcommand)]
         action: RunnersAction,
     },
+    /// Inspect and verify cryptographically signed audit trail of scenario runs.
+    Runs {
+        #[command(subcommand)]
+        action: RunsAction,
+    },
+    /// List and execute multi-stage attack campaigns and kill-chains.
+    Campaigns {
+        #[command(subcommand)]
+        action: CampaignsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunsAction {
+    /// List all recorded runs from the signed audit trail.
+    List {
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        scenario: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Get full audit record for a run ID.
+    Get {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Cryptographically verify the Ed25519 digital signature of an audit record.
+    Verify {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CampaignsAction {
+    /// List all preconfigured attack campaigns and playbooks.
+    List {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Execute an attack campaign kill-chain.
+    Run {
+        #[arg(long)]
+        id: String,
+        /// Optional target override or environment tag (e.g. k8s_workload)
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value = "red_team")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -280,6 +348,121 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
         },
+        Cmd::Runs { action } => match action {
+            RunsAction::List {
+                limit,
+                scenario,
+                status,
+                role,
+                url,
+            } => {
+                let mut endpoint = format!("{url}/api/v1/asmodeus/runs");
+                let mut params = Vec::new();
+                if let Some(l) = limit {
+                    params.push(format!("limit={l}"));
+                }
+                if let Some(s) = scenario {
+                    params.push(format!("scenario_id={s}"));
+                }
+                if let Some(st) = status {
+                    params.push(format!("status={st}"));
+                }
+                if !params.is_empty() {
+                    endpoint = format!("{endpoint}?{}", params.join("&"));
+                }
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "runs list",
+                )?;
+            }
+            RunsAction::Get { id, role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/runs/{id}");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "runs get",
+                )?;
+            }
+            RunsAction::Verify { id, role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/runs/{id}/verify");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "runs verify",
+                )?;
+            }
+        },
+        Cmd::Campaigns { action } => match action {
+            CampaignsAction::List { role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/campaigns");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "campaigns list",
+                )?;
+            }
+            CampaignsAction::Run {
+                id,
+                target,
+                role,
+                url,
+            } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/campaigns/{id}/run");
+                let client = reqwest::blocking::Client::new();
+                let mut req = client.post(&endpoint).header("X-Apex-Role", &role);
+                if let Some(t) = target {
+                    req = req.json(&json!({ "target_override": t }));
+                }
+                call(req, "campaigns run")?;
+            }
+        },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parsing_runs_and_campaigns() {
+        let cli =
+            Cli::try_parse_from(["asmodeus", "runs", "list", "--limit", "10"]).expect("parse list");
+        match cli.cmd {
+            Cmd::Runs {
+                action: RunsAction::List { limit, .. },
+            } => assert_eq!(limit, Some(10)),
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from(["asmodeus", "runs", "verify", "--id", "run_123"])
+            .expect("parse verify");
+        match cli.cmd {
+            Cmd::Runs {
+                action: RunsAction::Verify { id, .. },
+            } => assert_eq!(id, "run_123"),
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "campaigns",
+            "run",
+            "--id",
+            "CAMP-RANSOMWARE-CHAIN",
+            "--target",
+            "k8s_workload",
+        ])
+        .expect("parse campaign run");
+        match cli.cmd {
+            Cmd::Campaigns {
+                action: CampaignsAction::Run { id, target, .. },
+            } => {
+                assert_eq!(id, "CAMP-RANSOMWARE-CHAIN");
+                assert_eq!(target, Some("k8s_workload".into()));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
 }

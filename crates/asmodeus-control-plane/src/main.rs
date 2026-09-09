@@ -4,11 +4,13 @@
 //! runners over gRPC when `ASMODEUS_RUNNER_ENDPOINT` is set, else simulates
 //! in-process. Budget: <= 10% CPU / <= 128 MB RAM (ARCHITECTURE.md §6).
 
+mod campaign;
 mod catalog;
 mod dispatch;
 mod engine;
 mod http;
 mod registry;
+mod watchdog;
 
 use std::net::SocketAddr;
 
@@ -24,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let state = AppState::new(Catalog::seeded());
+    let _watchdog = watchdog::spawn_watchdog(state.registry.clone(), 30);
     let app = router(state);
 
     let addr: SocketAddr = std::env::var("ASMODEUS_LISTEN")

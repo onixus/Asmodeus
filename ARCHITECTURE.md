@@ -212,7 +212,14 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
   нагрузка CPU, активное упражнение). Интеграция `DeadManSwitch` и `CircuitBreaker` из
   `asmodeus-safety` в цикл исполнения раннера с безусловным срабатыванием `TripBreaker`
   и очисткой. Операторские команды CLI `asmodeus runners list/register/deregister/ping`
-  и флаг `--target` для запуска сценариев. 100 тестов green.
+  и флаг `--target` для запуска сценариев.
+
+- **Криптографический журнал аудита и оркестрация кампаний** (`asmodeus-telemetry::audit`, `asmodeus-control-plane::campaign`, `asmodeus-control-plane::watchdog`):
+  - Нефальсифицируемый журнал `AuditRecord` с канонической цифровой подписью Ed25519 (ключ Red Team Lead) и in-memory хранилищем `AuditTrail`.
+  - Эндпоинты REST API: `GET /api/v1/asmodeus/runs`, `GET /api/v1/asmodeus/runs/:id`, `GET /api/v1/asmodeus/runs/:id/verify`.
+  - Оркестратор цепочек атак (Playbooks / Campaigns): `CAMP-RANSOMWARE-CHAIN`, `CAMP-K8S-ESCAPE-CHAOS`, `CAMP-PERSISTENCE-EXFIL` с вычислением композитного `ResilienceScore` по всей цепочке.
+  - Фоновый `watchdog` в control-plane для периодической проверки доступности раннеров.
+  - Операторские команды CLI `asmodeus runs list/get/verify` и `asmodeus campaigns list/run`. 104 теста green.
 
 Осталось (только на Linux-стенде): собрать компилируемый BPF-объект и подключить
 его к aya/TC-бэкенду (`clsact` + `SchedClassifier`, `--features ebpf`) — на

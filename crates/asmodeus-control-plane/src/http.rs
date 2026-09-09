@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use asmodeus_common::{Category, Role, RunId, RunState, INV_0_SYNTHETIC_ONLY};
-use asmodeus_telemetry::{Aggregate, Measurements};
+use asmodeus_telemetry::{Aggregate, AuditRecord, AuditTrail, Measurements};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -15,8 +15,10 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::campaign::CampaignCatalog;
 use crate::catalog::Catalog;
 use crate::engine::{self, EngineError};
 use crate::registry::{RunnerRecord, RunnerRegistry};
@@ -32,6 +34,9 @@ pub struct AppState {
     /// otherwise the in-process engine simulates the run.
     pub runner_endpoint: Option<String>,
     pub registry: RunnerRegistry,
+    pub audit_trail: Arc<std::sync::RwLock<AuditTrail>>,
+    pub campaigns: Arc<CampaignCatalog>,
+    pub signing_key: [u8; 64],
 }
 
 impl AppState {
@@ -51,6 +56,17 @@ impl AppState {
         } else {
             RunnerRegistry::new()
         };
+        let signing_key = if let Some(sk_bytes) = catalog.secret_key() {
+            let mut k = [0u8; 64];
+            if sk_bytes.len() == 64 {
+                k.copy_from_slice(sk_bytes);
+                k
+            } else {
+                asmodeus_crypto::generate_keypair().1
+            }
+        } else {
+            asmodeus_crypto::generate_keypair().1
+        };
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
@@ -58,11 +74,25 @@ impl AppState {
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint,
             registry,
+            audit_trail: Arc::new(std::sync::RwLock::new(AuditTrail::new())),
+            campaigns: Arc::new(CampaignCatalog::seeded()),
+            signing_key,
         }
     }
 
     #[allow(dead_code)]
     pub fn with_registry(catalog: Catalog, registry: RunnerRegistry) -> Self {
+        let signing_key = if let Some(sk_bytes) = catalog.secret_key() {
+            let mut k = [0u8; 64];
+            if sk_bytes.len() == 64 {
+                k.copy_from_slice(sk_bytes);
+                k
+            } else {
+                asmodeus_crypto::generate_keypair().1
+            }
+        } else {
+            asmodeus_crypto::generate_keypair().1
+        };
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
@@ -70,6 +100,9 @@ impl AppState {
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint: None,
             registry,
+            audit_trail: Arc::new(std::sync::RwLock::new(AuditTrail::new())),
+            campaigns: Arc::new(CampaignCatalog::seeded()),
+            signing_key,
         }
     }
 
@@ -99,6 +132,11 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/asmodeus/runners/:id/ping",
             get(ping_runner_handler),
         )
+        .route("/api/v1/asmodeus/runs", get(list_runs))
+        .route("/api/v1/asmodeus/runs/:id", get(get_run))
+        .route("/api/v1/asmodeus/runs/:id/verify", get(verify_run))
+        .route("/api/v1/asmodeus/campaigns", get(list_campaigns))
+        .route("/api/v1/asmodeus/campaigns/:id/run", post(run_campaign))
         .with_state(state)
 }
 
@@ -161,34 +199,12 @@ pub struct RunScenarioPayload {
     pub timeout_sec: Option<u32>,
 }
 
-async fn run_scenario(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
-    let role = caller_role(&headers)?;
-    let payload: RunScenarioPayload = if body.is_empty() {
-        RunScenarioPayload::default()
-    } else {
-        serde_json::from_slice(&body)
-            .map_err(|e| ApiError::Unprocessable(format!("invalid JSON body: {e}")))?
-    };
-
-    let entry = state
-        .catalog
-        .get(&id)
-        .ok_or_else(|| ApiError::NotFound(format!("unknown scenario_id: {id}")))?;
-
-    // RBAC (D5): the required capability depends on the scenario category.
-    let cap = entry.category.required_capability();
-    if !role.can(cap) {
-        return Err(ApiError::Forbidden(match entry.category {
-            Category::RedTeam => "role may not launch Red Team scenarios",
-            Category::Chaos => "role may not inject chaos",
-        }));
-    }
-
+async fn execute_single_scenario(
+    state: &AppState,
+    entry: &crate::catalog::ScenarioEntry,
+    role: Role,
+    target_override: Option<&str>,
+) -> Result<(RunId, Value, AuditRecord), ApiError> {
     // Integrity (D6): the catalogued manifest must verify against the trusted key.
     if !asmodeus_crypto::is_valid(
         &entry.manifest,
@@ -199,15 +215,13 @@ async fn run_scenario(
     }
 
     // Target resolution: find matching runner in registry or fall back to static endpoint
-    let matched_runner = state
-        .registry
-        .find_for_target(payload.target_override.as_deref());
+    let matched_runner = state.registry.find_for_target(target_override);
     let target_endpoint = matched_runner
         .as_ref()
         .map(|r| r.endpoint.clone())
         .or_else(|| state.runner_endpoint.clone());
 
-    if let Some(ref target) = payload.target_override {
+    if let Some(target) = target_override {
         if target_endpoint.is_none() {
             return Err(ApiError::NotFound(format!(
                 "target runner not found: {target}"
@@ -218,7 +232,7 @@ async fn run_scenario(
     // Execute: dispatch to a live runner over gRPC if one is configured,
     // else drive the in-process engine. Detection metrics stay simulated
     // (no live Blue Team wired); the runner reports the real injection stats.
-    let (final_state, execution) = if let Some(endpoint) = target_endpoint {
+    let (final_state, execution, runner_id_str) = if let Some(endpoint) = target_endpoint {
         let runner_id = matched_runner
             .as_ref()
             .map(|r| r.id.clone())
@@ -259,13 +273,18 @@ async fn run_scenario(
                 "bytes_written": out.bytes_written,
                 "inject_ms": out.inject_ms,
             }),
+            runner_id,
         )
     } else {
         let outcome = engine::execute(entry).map_err(|e| match e {
             EngineError::Rejected(_) => ApiError::Unprocessable(e.to_string()),
             EngineError::Transition(_) => ApiError::Internal(e.to_string()),
         })?;
-        (outcome.final_state, json!({ "mode": "simulated" }))
+        (
+            outcome.final_state,
+            json!({ "mode": "simulated" }),
+            "in-process-sim".to_string(),
+        )
     };
 
     let run_id = state.next_run_id();
@@ -280,6 +299,81 @@ async fn run_scenario(
         blue_team_detected: true,
     });
 
+    let raw_record = AuditRecord {
+        run_id: run_id.to_string(),
+        scenario_id: entry.id.to_string(),
+        scenario_name: entry.name.to_string(),
+        category: match entry.category {
+            Category::RedTeam => "red_team".to_string(),
+            Category::Chaos => "chaos".to_string(),
+        },
+        mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
+        mitre_tactic: entry
+            .mitre
+            .map(|m| m.tactic.to_string())
+            .unwrap_or_default(),
+        severity: entry.severity.to_string(),
+        tag: entry.category.tag().to_string(),
+        initiator: role.as_str().to_string(),
+        runner_id: runner_id_str,
+        status: "COMPLETED".to_string(),
+        measurements: Measurements {
+            mttd_ms: entry.sim_mttd_ms,
+            mttr_ms: entry.sim_mttr_ms,
+            blue_team_detected: true,
+        },
+        detection_source: entry.detector.to_string(),
+        containment_action: "SIGKILL via SOAR Policy".to_string(),
+        cleanup_status: "SUCCESS (canary removed, 0 host side-effects)".to_string(),
+        timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+        signature_hex: String::new(),
+        public_key_hex: String::new(),
+    };
+
+    let signed_record = raw_record
+        .sign(&state.signing_key)
+        .map_err(|e| ApiError::Internal(format!("audit signing: {e}")))?;
+
+    state
+        .audit_trail
+        .write()
+        .unwrap()
+        .append(signed_record.clone());
+
+    Ok((run_id, execution, signed_record))
+}
+
+async fn run_scenario(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    let payload: RunScenarioPayload = if body.is_empty() {
+        RunScenarioPayload::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::Unprocessable(format!("invalid JSON body: {e}")))?
+    };
+
+    let entry = state
+        .catalog
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown scenario_id: {id}")))?;
+
+    // RBAC (D5): the required capability depends on the scenario category.
+    let cap = entry.category.required_capability();
+    if !role.can(cap) {
+        return Err(ApiError::Forbidden(match entry.category {
+            Category::RedTeam => "role may not launch Red Team scenarios",
+            Category::Chaos => "role may not inject chaos",
+        }));
+    }
+
+    let (run_id, execution, audit_rec) =
+        execute_single_scenario(&state, entry, role, payload.target_override.as_deref()).await?;
+
     Ok(Json(json!({
         "run_id": run_id.to_string(),
         "scenario_id": entry.id,
@@ -293,16 +387,19 @@ async fn run_scenario(
         "severity": entry.severity,
         "tag": entry.category.tag(),
         "initiator": role.as_str(),
-        "status": "COMPLETED",
+        "status": audit_rec.status,
         "execution": execution,
         "measurements": {
-            "mttd_ms": entry.sim_mttd_ms,
-            "mttr_ms": entry.sim_mttr_ms,
-            "blue_team_detected": true,
-            "detection_source": entry.detector,
-            "containment_action": "SIGKILL via SOAR Policy",
+            "mttd_ms": audit_rec.measurements.mttd_ms,
+            "mttr_ms": audit_rec.measurements.mttr_ms,
+            "blue_team_detected": audit_rec.measurements.blue_team_detected,
+            "detection_source": audit_rec.detection_source,
+            "containment_action": audit_rec.containment_action,
         },
-        "cleanup_status": "SUCCESS (canary removed, 0 host side-effects)",
+        "cleanup_status": audit_rec.cleanup_status,
+        "timestamp_utc": audit_rec.timestamp_utc,
+        "signature_hex": audit_rec.signature_hex,
+        "public_key_hex": audit_rec.public_key_hex,
     })))
 }
 
@@ -578,6 +675,190 @@ async fn ping_runner_handler(
             )))
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListRunsQuery {
+    pub limit: Option<usize>,
+    pub scenario_id: Option<String>,
+    pub status: Option<String>,
+}
+
+async fn list_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ListRunsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view run history"));
+    }
+    let trail = state.audit_trail.read().unwrap();
+    let records = trail.list(
+        query.limit,
+        query.scenario_id.as_deref(),
+        query.status.as_deref(),
+    );
+    Ok(Json(json!({
+        "total": trail.len(),
+        "returned": records.len(),
+        "runs": records,
+    })))
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view run details"));
+    }
+    let trail = state.audit_trail.read().unwrap();
+    let record = trail
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
+    Ok(Json(json!(record)))
+}
+
+async fn verify_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not verify runs"));
+    }
+    let trail = state.audit_trail.read().unwrap();
+    let record = trail
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
+    let verified = record.verify();
+    Ok(Json(json!({
+        "run_id": record.run_id,
+        "scenario_id": record.scenario_id,
+        "verified": verified,
+        "signature_hex": record.signature_hex,
+        "public_key_hex": record.public_key_hex,
+        "timestamp_utc": record.timestamp_utc,
+    })))
+}
+
+async fn list_campaigns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view campaigns"));
+    }
+    Ok(Json(json!({
+        "campaigns": state.campaigns.list(),
+    })))
+}
+
+async fn run_campaign(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+    {
+        return Err(ApiError::Forbidden("role may not launch attack campaigns"));
+    }
+    let payload: RunScenarioPayload = if body.is_empty() {
+        RunScenarioPayload::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::Unprocessable(format!("invalid JSON body: {e}")))?
+    };
+
+    let campaign = state
+        .campaigns
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("campaign not found: {id}")))?
+        .clone();
+
+    let mut step_results = Vec::new();
+    let mut sum_mttd = 0u64;
+    let mut sum_mttr = 0u64;
+    let mut detected_count = 0usize;
+    let total_steps = campaign.steps.len();
+
+    for step in &campaign.steps {
+        let entry = state.catalog.get(&step.scenario_id).ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "scenario in campaign not found: {}",
+                step.scenario_id
+            ))
+        })?;
+
+        let (run_id, _exec, audit_rec) =
+            execute_single_scenario(&state, entry, role, payload.target_override.as_deref())
+                .await?;
+
+        sum_mttd += audit_rec.measurements.mttd_ms;
+        sum_mttr += audit_rec.measurements.mttr_ms;
+        if audit_rec.measurements.blue_team_detected {
+            detected_count += 1;
+        }
+
+        step_results.push(crate::campaign::CampaignStepResult {
+            step_order: step.order,
+            scenario_id: step.scenario_id.clone(),
+            run_id: run_id.to_string(),
+            status: audit_rec.status,
+            mttd_ms: audit_rec.measurements.mttd_ms,
+            mttr_ms: audit_rec.measurements.mttr_ms,
+            detected: audit_rec.measurements.blue_team_detected,
+        });
+    }
+
+    let mean_mttd = if total_steps > 0 {
+        sum_mttd / total_steps as u64
+    } else {
+        0
+    };
+    let mean_mttr = if total_steps > 0 {
+        sum_mttr / total_steps as u64
+    } else {
+        0
+    };
+    let detection_rate_pct = if total_steps > 0 {
+        100.0 * detected_count as f32 / total_steps as f32
+    } else {
+        0.0
+    };
+    let recovery_speed_pct = if mean_mttr == 0 {
+        100.0
+    } else {
+        (100.0 * asmodeus_telemetry::TARGET_MTTR_MS as f32 / mean_mttr as f32).clamp(0.0, 100.0)
+    };
+    let resilience_score =
+        asmodeus_telemetry::resilience_score(detection_rate_pct, recovery_speed_pct);
+
+    let result = crate::campaign::CampaignRunResult {
+        campaign_id: campaign.id,
+        campaign_name: campaign.name,
+        initiator: role.as_str().to_string(),
+        target_override: payload.target_override,
+        total_steps,
+        successful_steps: step_results.len(),
+        step_results,
+        mean_mttd_ms: mean_mttd,
+        mean_mttr_ms: mean_mttr,
+        detection_rate_pct,
+        recovery_speed_pct,
+        resilience_score,
+        timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+    };
+
+    Ok(Json(json!(result)))
 }
 
 #[cfg(test)]
@@ -1267,5 +1548,140 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn runs_history_and_crypto_verification() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. Initially no runs
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/runs")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["total"], 0);
+
+        // 2. Execute a scenario
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/CREDENTIAL_ACCESS_CANARY/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let run_body: Value = serde_json::from_slice(&bytes).unwrap();
+        let run_id = run_body["run_id"].as_str().unwrap();
+        assert!(!run_body["signature_hex"].as_str().unwrap().is_empty());
+
+        // 3. Auditor fetches run list
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/runs")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let list_body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(list_body["total"], 1);
+        assert_eq!(list_body["runs"][0]["run_id"], run_id);
+
+        // 4. Auditor fetches single run details
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/asmodeus/runs/{run_id}"))
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let single_body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(single_body["run_id"], run_id);
+        assert_eq!(single_body["scenario_id"], "CREDENTIAL_ACCESS_CANARY");
+
+        // 5. Verify cryptographic signature of the audit record
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/asmodeus/runs/{run_id}/verify"))
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let verify_body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(verify_body["run_id"], run_id);
+        assert_eq!(verify_body["verified"], true);
+    }
+
+    #[tokio::test]
+    async fn campaigns_execution_and_rbac() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. List campaigns
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/campaigns")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let campaigns = body["campaigns"].as_array().unwrap();
+        assert!(campaigns.len() >= 3);
+
+        // 2. CISO and Auditor receive 403 on run campaign (SoD)
+        for forbidden_role in &["ciso", "auditor", "secops"] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/asmodeus/campaigns/CAMP-RANSOMWARE-CHAIN/run")
+                .header("x-apex-role", *forbidden_role)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        // 3. Red Team launches ransomware campaign
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/campaigns/CAMP-RANSOMWARE-CHAIN/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let res: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(res["campaign_id"], "CAMP-RANSOMWARE-CHAIN");
+        assert_eq!(res["total_steps"], 4);
+        assert_eq!(res["successful_steps"], 4);
+        assert_eq!(res["step_results"].as_array().unwrap().len(), 4);
+        assert!(res["resilience_score"].as_u64().unwrap() > 0);
+
+        // 4. All 4 steps are recorded in audit trail
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/runs")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["total"], 4);
     }
 }

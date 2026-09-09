@@ -38,6 +38,7 @@ pub struct ScenarioEntry {
 pub struct Catalog {
     entries: HashMap<String, ScenarioEntry>,
     public_key: Vec<u8>,
+    secret_key: Option<Vec<u8>>,
 }
 
 impl Catalog {
@@ -49,6 +50,11 @@ impl Catalog {
     /// The public key every entry's signature must verify against.
     pub fn public_key(&self) -> &[u8] {
         &self.public_key
+    }
+
+    /// The private signing key if available in this node.
+    pub fn secret_key(&self) -> Option<&[u8]> {
+        self.secret_key.as_deref()
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &str> {
@@ -288,6 +294,7 @@ impl Catalog {
         Catalog {
             entries,
             public_key: kp.pk.as_ref().to_vec(),
+            secret_key: Some(kp.sk.as_ref().to_vec()),
         }
     }
 }

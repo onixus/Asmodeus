@@ -2,8 +2,13 @@
 //! and exports Prometheus metrics into the shared APEX ClickHouse bus.
 //! Pure computation + text exposition; no async scrape server yet.
 
+pub mod audit;
+pub use audit::*;
+
+use serde::{Deserialize, Serialize};
+
 /// Detection/containment timings for one run.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Measurements {
     pub mttd_ms: u64,
     pub mttr_ms: u64,
