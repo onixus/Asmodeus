@@ -45,8 +45,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 tokio-stream = { version = "0.1", features = ["net"] }
 axum = "0.7"
 tower = { version = "0.5", features = ["util"] }
-tonic = { version = "0.12", features = ["tls"] }
-tonic-build = "0.12"
+tonic = { version = "0.13", features = ["tls-ring"] }
+tonic-build = "0.13"
 prost = "0.13"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

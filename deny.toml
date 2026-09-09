@@ -13,11 +13,7 @@ targets = [
 ]
 
 [advisories]
-ignore = [
-    # rustls-pemfile repository archived August 2025; used transitively by tonic 0.12.3.
-    # No safe upgrade available until tonic upgrades to rustls-pki-types PemObject.
-    "RUSTSEC-2025-0134",
-]
+ignore = []
 
 [licenses]
 allow = [
