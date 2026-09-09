@@ -85,6 +85,12 @@ pipeline {
                     steps {
                         sh '''
                             set -eu
+                            # asmodeus-proto/build.rs → tonic-build нужен protoc, которого нет
+                            # в rust:1-bookworm. Ставим идемпотентно (guard на command -v),
+                            # чтобы шаг был безопасен при любом переиспользовании контейнера.
+                            command -v protoc >/dev/null 2>&1 || {
+                                apt-get update -qq && apt-get install -y -qq protobuf-compiler
+                            }
                             cargo clippy --workspace --all-targets --locked -- -D warnings
                             # feature-gated aya-backend: только компиляция, не тесты.
                             cargo clippy -p asmodeus-runner --features ebpf --all-targets --locked -- -D warnings
@@ -95,6 +101,9 @@ pipeline {
                     steps {
                         sh '''
                             set -eu
+                            command -v protoc >/dev/null 2>&1 || {
+                                apt-get update -qq && apt-get install -y -qq protobuf-compiler
+                            }
                             cargo test --workspace --locked
                         '''
                     }
