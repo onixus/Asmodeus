@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use serde_json::json;
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +53,9 @@ enum Cmd {
     Run {
         #[arg(long)]
         scenario: String,
+        /// Optional target override or environment tag (e.g. k8s_workload)
+        #[arg(long)]
+        target: Option<String>,
         #[arg(long, default_value = "red_team")]
         role: String,
         #[arg(long, default_value = "http://127.0.0.1:8842")]
@@ -73,6 +77,55 @@ enum Cmd {
     },
     /// Display MITRE ATT&CK Enterprise Matrix coverage report.
     Mitre {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Manage and inspect registered runner probes.
+    Runners {
+        #[command(subcommand)]
+        action: RunnersAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunnersAction {
+    /// List all registered runners with status and health metrics.
+    List {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Register a new runner probe.
+    Register {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Remove a registered runner probe.
+    Deregister {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Send an active gRPC Heartbeat liveness probe to a runner.
+    Ping {
+        #[arg(long)]
+        id: String,
         #[arg(long, default_value = "auditor")]
         role: String,
         #[arg(long, default_value = "http://127.0.0.1:8842")]
@@ -151,12 +204,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Run {
             scenario,
+            target,
             role,
             url,
         } => {
             let endpoint = format!("{url}/api/v1/asmodeus/scenarios/{scenario}/run");
             let client = reqwest::blocking::Client::new();
-            call(client.post(&endpoint).header("X-Apex-Role", &role), "run")?;
+            let mut req = client.post(&endpoint).header("X-Apex-Role", &role);
+            if let Some(t) = target {
+                req = req.json(&json!({ "target_override": t }));
+            }
+            call(req, "run")?;
         }
         Cmd::Status { role, url } => {
             let endpoint = format!("{url}/api/v1/asmodeus/telemetry/mttd");
@@ -176,6 +234,52 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let client = reqwest::blocking::Client::new();
             call(client.get(&endpoint).header("X-Apex-Role", &role), "mitre")?;
         }
+        Cmd::Runners { action } => match action {
+            RunnersAction::List { role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/runners");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "runners list",
+                )?;
+            }
+            RunnersAction::Register {
+                id,
+                name,
+                endpoint,
+                tags,
+                role,
+                url,
+            } => {
+                let api = format!("{url}/api/v1/asmodeus/runners");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.post(&api).header("X-Apex-Role", &role).json(&json!({
+                        "id": id,
+                        "name": name,
+                        "endpoint": endpoint,
+                        "tags": tags,
+                    })),
+                    "runners register",
+                )?;
+            }
+            RunnersAction::Deregister { id, role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/runners/{id}");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.delete(&endpoint).header("X-Apex-Role", &role),
+                    "runners deregister",
+                )?;
+            }
+            RunnersAction::Ping { id, role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/runners/{id}/ping");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "runners ping",
+                )?;
+            }
+        },
     }
     Ok(())
 }

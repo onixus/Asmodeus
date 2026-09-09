@@ -85,4 +85,5 @@
 - [x] CLI `run`/`status` (REST к control-plane) и `asmodeus-testkit` (полигон + фикстуры подписи)
 - [x] Сетевой хаос в раннере (`LATENCY_SPIKE_VM`): INV-0 сетевой scope (только тест-блоки RFC 5737 + loopback), бюджетные лимиты, `NetChaosSession` с обязательным откатом (D7); кросс-платформенный `SimBackend`
 - [x] **Расширение покрытия MITRE ATT&CK**: 11 сценариев (8 атак на 7 тактик + 3 хаоса), синтетические инъекторы в раннере под INV-0, REST-эндпоинты матрицы (`/api/v1/asmodeus/scenarios`, `/scenarios/mitre`), CLI команды `asmodeus scenarios`/`mitre`, 94 теста
+- [x] **Реестр раннеров, gRPC Heartbeat и динамическая маршрутизация**: потокобезопасный `RunnerRegistry`, диспетчеризация по `target_override` и тегам целевого окружения, REST API зондов (`/api/v1/asmodeus/runners`), интеграция `DeadManSwitch` и `CircuitBreaker` в раннер, CLI команды `asmodeus runners list/register/deregister/ping`, 100 тестов
 - [ ] *Следующий этап (Linux-стенд)*: подключить компилируемый BPF-объект к aya/TC-бэкенду (`--features ebpf`) — на macOS не проверяется

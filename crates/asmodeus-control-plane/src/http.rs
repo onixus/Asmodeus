@@ -12,24 +12,26 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde_json::{json, Value};
 
 use crate::catalog::Catalog;
 use crate::engine::{self, EngineError};
+use crate::registry::{RunnerRecord, RunnerRegistry};
 
 /// Shared, cheaply cloneable server state.
 #[derive(Clone)]
 pub struct AppState {
-    catalog: Arc<Catalog>,
-    runs: Arc<Mutex<HashMap<RunId, RunState>>>,
-    metrics: Arc<Mutex<Aggregate>>,
+    pub catalog: Arc<Catalog>,
+    pub runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+    pub metrics: Arc<Mutex<Aggregate>>,
     counter: Arc<AtomicU64>,
     /// When set, scenarios are dispatched to this live runner over gRPC;
     /// otherwise the in-process engine simulates the run.
-    runner_endpoint: Option<String>,
+    pub runner_endpoint: Option<String>,
+    pub registry: RunnerRegistry,
 }
 
 impl AppState {
@@ -40,12 +42,34 @@ impl AppState {
     }
 
     pub fn with_runner(catalog: Catalog, runner_endpoint: Option<String>) -> Self {
+        let registry = if let Some(ref ep) = runner_endpoint {
+            RunnerRegistry::with_default(
+                "default-runner",
+                ep,
+                vec!["default".into(), "endpoint_agent".into()],
+            )
+        } else {
+            RunnerRegistry::new()
+        };
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Mutex::new(Aggregate::default())),
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint,
+            registry,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_registry(catalog: Catalog, registry: RunnerRegistry) -> Self {
+        AppState {
+            catalog: Arc::new(catalog),
+            runs: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(Mutex::new(Aggregate::default())),
+            counter: Arc::new(AtomicU64::new(1)),
+            runner_endpoint: None,
+            registry,
         }
     }
 
@@ -66,6 +90,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/asmodeus/scenarios/:id/run", post(run_scenario))
         .route("/api/v1/asmodeus/scenarios/abort", post(abort_all))
         .route("/api/v1/asmodeus/telemetry/mttd", get(telemetry_mttd))
+        .route(
+            "/api/v1/asmodeus/runners",
+            get(list_runners).post(register_runner),
+        )
+        .route("/api/v1/asmodeus/runners/:id", delete(deregister_runner))
+        .route(
+            "/api/v1/asmodeus/runners/:id/ping",
+            get(ping_runner_handler),
+        )
         .with_state(state)
 }
 
@@ -121,12 +154,26 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RunScenarioPayload {
+    pub target_override: Option<String>,
+    #[allow(dead_code)]
+    pub timeout_sec: Option<u32>,
+}
+
 async fn run_scenario(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let role = caller_role(&headers)?;
+    let payload: RunScenarioPayload = if body.is_empty() {
+        RunScenarioPayload::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| ApiError::Unprocessable(format!("invalid JSON body: {e}")))?
+    };
 
     let entry = state
         .catalog
@@ -151,10 +198,31 @@ async fn run_scenario(
         return Err(ApiError::Unprocessable("scenario signature invalid".into()));
     }
 
+    // Target resolution: find matching runner in registry or fall back to static endpoint
+    let matched_runner = state
+        .registry
+        .find_for_target(payload.target_override.as_deref());
+    let target_endpoint = matched_runner
+        .as_ref()
+        .map(|r| r.endpoint.clone())
+        .or_else(|| state.runner_endpoint.clone());
+
+    if let Some(ref target) = payload.target_override {
+        if target_endpoint.is_none() {
+            return Err(ApiError::NotFound(format!(
+                "target runner not found: {target}"
+            )));
+        }
+    }
+
     // Execute: dispatch to a live runner over gRPC if one is configured,
     // else drive the in-process engine. Detection metrics stay simulated
     // (no live Blue Team wired); the runner reports the real injection stats.
-    let (final_state, execution) = if let Some(endpoint) = state.runner_endpoint.clone() {
+    let (final_state, execution) = if let Some(endpoint) = target_endpoint {
+        let runner_id = matched_runner
+            .as_ref()
+            .map(|r| r.id.clone())
+            .unwrap_or_else(|| "default-runner".into());
         let req = asmodeus_proto::ExecuteRequest {
             scenario_id: entry.id.to_string(),
             manifest: entry.manifest.clone(),
@@ -184,6 +252,7 @@ async fn run_scenario(
             RunState::Completed,
             json!({
                 "mode": "dispatched",
+                "runner_id": runner_id,
                 "runner_endpoint": endpoint,
                 "runner_final_state": out.final_state,
                 "files_created": out.files_created,
@@ -399,6 +468,118 @@ async fn telemetry_mttd(
     })))
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct RegisterRunnerRequest {
+    pub id: String,
+    pub name: Option<String>,
+    pub endpoint: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+async fn list_runners(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view runners"));
+    }
+    let runners = state.registry.list();
+    Ok(Json(json!(runners)))
+}
+
+async fn register_runner(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RegisterRunnerRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let role = caller_role(&headers)?;
+    let may_register = role.can(asmodeus_common::Capability::RunRedTeam)
+        || role.can(asmodeus_common::Capability::InjectChaos);
+    if !may_register {
+        return Err(ApiError::Forbidden("role may not register runners"));
+    }
+
+    let id = payload.id.trim();
+    if id.is_empty() {
+        return Err(ApiError::Unprocessable("runner id cannot be empty".into()));
+    }
+    let endpoint = payload.endpoint.trim();
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return Err(ApiError::Unprocessable(
+            "runner endpoint must start with http:// or https://".into(),
+        ));
+    }
+
+    let name = payload.name.unwrap_or_else(|| id.to_string());
+    let record = RunnerRecord::new(id, name, endpoint, payload.tags);
+    state.registry.register(record.clone());
+
+    Ok((StatusCode::CREATED, Json(json!(record))))
+}
+
+async fn deregister_runner(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    let may_deregister = role.can(asmodeus_common::Capability::RunRedTeam)
+        || role.can(asmodeus_common::Capability::InjectChaos);
+    if !may_deregister {
+        return Err(ApiError::Forbidden("role may not deregister runners"));
+    }
+
+    if state.registry.deregister(&id) {
+        Ok(Json(json!({ "status": "DEREGISTERED", "id": id })))
+    } else {
+        Err(ApiError::NotFound(format!("runner not found: {id}")))
+    }
+}
+
+async fn ping_runner_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not ping runners"));
+    }
+
+    let runner = state
+        .registry
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("runner not found: {id}")))?;
+
+    match crate::dispatch::ping(&runner.endpoint).await {
+        Ok(reply) => {
+            state.registry.update_heartbeat(
+                &id,
+                reply.healthy,
+                reply.cpu_usage_pct,
+                &reply.version,
+            );
+            Ok(Json(json!({
+                "id": id,
+                "endpoint": runner.endpoint,
+                "healthy": reply.healthy,
+                "state": reply.state,
+                "cpu_usage_pct": reply.cpu_usage_pct,
+                "active_exercise_id": reply.active_exercise_id,
+                "version": reply.version,
+            })))
+        }
+        Err(status) => {
+            state.registry.mark_unresponsive(&id);
+            Err(ApiError::BadGateway(format!(
+                "runner ping failed: {status}"
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,6 +771,9 @@ mod tests {
             Ok(tonic::Response::new(PbHbReply {
                 state: "Idle".into(),
                 healthy: true,
+                cpu_usage_pct: 2,
+                active_exercise_id: String::new(),
+                version: "0.1.0".into(),
             }))
         }
     }
@@ -638,6 +822,9 @@ mod tests {
             Ok(tonic::Response::new(PbHbReply {
                 state: "Injecting".into(),
                 healthy: false,
+                cpu_usage_pct: 88,
+                active_exercise_id: "PARTIAL".into(),
+                version: "0.1.0".into(),
             }))
         }
     }
@@ -944,5 +1131,141 @@ mod tests {
             body["scenario_name"],
             "C2 Beaconing & Dynamic Resolution Simulation"
         );
+    }
+
+    #[tokio::test]
+    async fn runners_lifecycle_and_rbac() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. CISO cannot register runner (403)
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/runners")
+            .header("x-apex-role", "ciso")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "probe-ciso",
+                    "endpoint": "http://127.0.0.1:8850"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 2. Admin registers runner (201)
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/runners")
+            .header("x-apex-role", "admin")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id": "probe-k8s",
+                    "name": "K8s Worker Probe",
+                    "endpoint": "http://127.0.0.1:8850",
+                    "tags": ["k8s_workload", "prod"]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["id"], "probe-k8s");
+        assert_eq!(body["status"], "active");
+
+        // 3. Auditor can list runners
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/runners")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let list: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(list.iter().any(|r| r["id"] == "probe-k8s"));
+
+        // 4. DevSecOps deregisters runner
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/runners/probe-k8s")
+            .header("x-apex-role", "devsecops")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_target_override_and_ping() {
+        let _lock = DISPATCH_TEST_LOCK.lock().await;
+        let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+
+        let runner_url = start_mock_runner().await;
+        let reg = RunnerRegistry::new();
+        reg.register(RunnerRecord::new(
+            "k8s-probe-01",
+            "Targeted K8s Probe",
+            &runner_url,
+            vec!["k8s_workload".into()],
+        ));
+
+        let app = router(AppState::with_registry(Catalog::seeded(), reg));
+
+        // 1. Ping runner over gRPC
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/runners/k8s-probe-01/ping")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["healthy"], true);
+        assert_eq!(body["state"], "Idle");
+
+        // 2. Run with target_override matching tag
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "target_override": "k8s_workload"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "COMPLETED");
+        assert_eq!(body["execution"]["mode"], "dispatched");
+        assert_eq!(body["execution"]["runner_id"], "k8s-probe-01");
+
+        // 3. Run with unknown target returns 404
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "target_override": "unknown-node"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

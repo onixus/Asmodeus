@@ -40,8 +40,16 @@ message RunnerEvent {
   string    detail        = 6;  // reason for REJECTED
 }
 
-message HeartbeatRequest { string exercise_id = 1; }
+message HeartbeatRequest {
+  string exercise_id = 1;
+  string runner_id = 2;
+  uint64 timestamp_utc = 3;
+}
+
 message HeartbeatReply {
   string state   = 1;
   bool   healthy = 2;
+  uint32 cpu_usage_pct = 3;
+  string active_exercise_id = 4;
+  string version = 5;
 }
