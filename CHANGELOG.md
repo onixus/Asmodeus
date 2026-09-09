@@ -8,6 +8,58 @@
 ## [Unreleased]
 
 ### Добавлено
+- **Криптографический Журнал Аудита (Signed Audit Trail Engine)**:
+  - **Структура и подпись записей аудита** (`asmodeus-telemetry::audit`): структура `AuditRecord`
+    со всеми параметрами прогона (run_id, scenario_id, category, mitre_technique, severity, tag,
+    initiator, runner_id, status, measurements MTTD/MTTR, detection_source, containment_action,
+    cleanup_status, timestamp_utc) и детерминированным каноническим представлением байтов.
+  - **Цифровая подпись Ed25519**: подпись закрытым ключом Red Team Lead и верификация по публичному ключу
+    (`AuditRecord::sign`, `AuditRecord::verify`), предотвращающие подделку факта проведения учений.
+  - **Журнал `AuditTrail`**: потокобезопасная коллекция для хранения и фильтрации записей аудита.
+  - **Эндпоинты REST API**:
+    - `GET /api/v1/asmodeus/runs` — история прогонов с фильтрацией по лимиту, сценарию и статусу;
+    - `GET /api/v1/asmodeus/runs/:id` — детальный отчёт о прогоне;
+    - `GET /api/v1/asmodeus/runs/:id/verify` — независимая криптографическая проверка подписи записи аудита.
+- **Оркестрация Кампаний и Плейбуков (Multi-Stage Attack Campaigns & Kill-Chains)**:
+  - **Доменные модели кампаний** (`asmodeus-control-plane::campaign`): `Campaign`, `CampaignStep`,
+    `CampaignStepResult`, `CampaignRunResult`.
+  - **Предустановленный каталог кампаний** (`CampaignCatalog::seeded`):
+    - `CAMP-RANSOMWARE-CHAIN`: цепочка вымогателя (Credential Dumping ➔ Persistence ➔ C2 ➔ Ransomware Spike);
+    - `CAMP-K8S-ESCAPE-CHAOS`: побег из контейнера K8s в сочетании с сетевым хаосом и отказом DNS RPZ;
+    - `CAMP-PERSISTENCE-EXFIL`: закрепление, зачистка логов и эксфильтрация данных по C2.
+  - **Движок исполнения цепочек**: последовательное выполнение шагов, агрегация промежуточных замеров
+    MTTD/MTTR, вычисление интегрального индекса устойчивости `ResilienceScore` по всей цепочке.
+  - **Эндпоинты REST API**:
+    - `GET /api/v1/asmodeus/campaigns` — список зарегистрированных кампаний;
+    - `POST /api/v1/asmodeus/campaigns/:id/run` — запуск комплексной цепочки атак с поддержкой `target_override`.
+- **Фоновый Heartbeat Watchdog** (`asmodeus-control-plane::watchdog`):
+  - Асинхронный воркер в control-plane, периодически опрашивающий зонды по gRPC Heartbeat и
+    актуализирующий их статус доступности (`Active` vs `Unresponsive`).
+- **Инструменты оператора в CLI (`asmodeus-cli`)**:
+  - `asmodeus runs list [--limit <N>] [--scenario <ID>] [--status <ST>]` — просмотр истории прогонов;
+  - `asmodeus runs get --id <RUN_ID>` — детали записи аудита;
+  - `asmodeus runs verify --id <RUN_ID>` — криптографическая проверка подписи записи аудита;
+  - `asmodeus campaigns list` — просмотр каталога цепочек атак;
+  - `asmodeus campaigns run --id <CAMPAIGN_ID> [--target <TARGET>]` — запуск многоэтапного учения.
+- **Реестр раннеров, динамическая диспетчеризация и gRPC Heartbeat**:
+  - **Реестр зондов** (`asmodeus-control-plane::registry`): потокобезопасный `RunnerRegistry`
+    для динамического управления распределёнными раннерами с поддержкой тегов
+    (`k8s_workload`, `endpoint_agent`, `network_gateway`), статусов (`Active`, `Unresponsive`, `Draining`)
+    и сопоставления по `target_override` вместо одного статического эндпоинта.
+  - **Эндпоинты REST API управления зондами**:
+    - `GET /api/v1/asmodeus/runners` — список зарегистрированных зондов с их статусами и метриками;
+    - `POST /api/v1/asmodeus/runners` — динамическая регистрация зонда с проверкой роли RBAC;
+    - `DELETE /api/v1/asmodeus/runners/:id` — снятие зонда с регистрации;
+    - `GET /api/v1/asmodeus/runners/:id/ping` — активный опрос доступности (liveness probe) через gRPC Heartbeat.
+  - **Маршрутизация сценариев по `target_override`**: запуск через `POST /scenarios/:id/run`
+    принимает JSON с целевым узлом или тегом и диспетчеризирует сценарий на соответствующий зонд.
+  - **Расширение gRPC контракта `Heartbeat`** (`asmodeus-proto`): передача состояния раннера
+    (`Idle`, `Injecting`), флага здоровья, нагрузки CPU, идентификатора активного упражнения и версии.
+  - **Интеграция Dead-Man Switch & Circuit Breaker в раннер** (`asmodeus-runner::service`):
+    контроль времени и ресурсов во время инъекции с безусловным срабатыванием `TripBreaker`
+    и автоматической очисткой, фиксация сердцебиений для защиты от отказа управляющего контура.
+  - **Команды CLI** (`asmodeus runners list/register/deregister/ping` и `--target` в `asmodeus run`):
+    полный операторский цикл взаимодействия с распределёнными зондами.
 - **Расширение покрытия MITRE ATT&CK**:
   - **Доменная модель техник** (`asmodeus-dsl::mitre`): типизированные структуры
     `MitreTechnique` с идентификаторами, тактиками, именами и описаниями,
@@ -86,7 +138,6 @@
 
 ### Планируется
 - eBPF-инъекция сетевого хаоса в раннере через `aya` (только на Linux-стенде).
-- Реестр раннеров и реальный heartbeat/dead-man в gRPC-петле.
 
 
 ## [0.1.0] — 2026-09-07

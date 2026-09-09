@@ -418,7 +418,7 @@ impl ScenarioInjector for NetChaosInjector {
 
         let backend = default_backend();
         let session = NetChaosSession::start(&backend, &self.spec)
-            .map_err(|e| InjectError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| InjectError::Io(io::Error::other(e.to_string())))?;
 
         let token = session.handle().map(|h| h.token).unwrap_or_default();
         fs::write(&session_marker, format!("token={token}").as_bytes())?;
