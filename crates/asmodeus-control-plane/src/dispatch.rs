@@ -98,3 +98,28 @@ pub async fn dispatch(endpoint: &str, req: ExecuteRequest) -> Result<DispatchOut
         .map_err(|e| Status::internal(format!("tls config: {e}")))?;
     dispatch_with_tls(endpoint, req, tls).await
 }
+
+/// Ping a runner via gRPC Heartbeat probe.
+pub async fn ping_with_tls(
+    endpoint: &str,
+    tls: Option<ClientTlsConfig>,
+) -> Result<asmodeus_proto::HeartbeatReply, Status> {
+    let mut client = connect_with_tls(endpoint, tls).await?;
+    let req = asmodeus_proto::HeartbeatRequest {
+        exercise_id: String::new(),
+        runner_id: "control-plane".to_string(),
+        timestamp_utc: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let resp = client.heartbeat(req).await?;
+    Ok(resp.into_inner())
+}
+
+/// Ping a runner with environment-derived mTLS settings.
+pub async fn ping(endpoint: &str) -> Result<asmodeus_proto::HeartbeatReply, Status> {
+    let tls = asmodeus_proto::tls::client_from_env("asmodeus-runner")
+        .map_err(|e| Status::internal(format!("tls config: {e}")))?;
+    ping_with_tls(endpoint, tls).await
+}

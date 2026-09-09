@@ -205,6 +205,15 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
   обязательным откатом через `Drop` (D7). Кросс-платформенный `SimBackend`
   покрыт тестами; aya/TC-бэкенд — за фича-флагом `ebpf` на Linux-стенде.
 
+- **Реестр раннеров и gRPC Heartbeat** (`asmodeus-control-plane::registry`, `asmodeus-runner::service`):
+  потокобезопасный `RunnerRegistry` для управления распределёнными зондами с поддержкой
+  тегов (`k8s_workload`, `endpoint_agent`, `network_gateway`) и динамической маршрутизации
+  по `target_override`. Расширенный gRPC-контракт `Heartbeat` (liveness probe, состояние `IDLE`/`INJECTING`,
+  нагрузка CPU, активное упражнение). Интеграция `DeadManSwitch` и `CircuitBreaker` из
+  `asmodeus-safety` в цикл исполнения раннера с безусловным срабатыванием `TripBreaker`
+  и очисткой. Операторские команды CLI `asmodeus runners list/register/deregister/ping`
+  и флаг `--target` для запуска сценариев. 100 тестов green.
+
 Осталось (только на Linux-стенде): собрать компилируемый BPF-объект и подключить
 его к aya/TC-бэкенду (`clsact` + `SchedClassifier`, `--features ebpf`) — на
 macOS не проверяется (§8).

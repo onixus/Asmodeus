@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     server
-        .add_service(RunnerControlServer::new(RunnerService))
+        .add_service(RunnerControlServer::new(RunnerService::default()))
         .serve(addr)
         .await?;
     Ok(())

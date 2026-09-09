@@ -8,6 +8,7 @@ mod catalog;
 mod dispatch;
 mod engine;
 mod http;
+mod registry;
 
 use std::net::SocketAddr;
 
