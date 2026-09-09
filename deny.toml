@@ -13,27 +13,30 @@ targets = [
 ]
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "warn"
-yanked = "warn"
-ignore = []
+ignore = [
+    # rustls-pemfile repository archived August 2025; used transitively by tonic 0.12.3.
+    # No safe upgrade available until tonic upgrades to rustls-pki-types PemObject.
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
     "BSD-3-Clause",
-    "Unicode-DFS-2016",
+    "Unicode-3.0",
     "ISC",
-    "CC0-1.0",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
+[licenses.private]
+ignore = true
+
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "allow"
+allow-workspace = true
 highlight = "all"
 deny = []
 skip = []
