@@ -4,11 +4,15 @@
 
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// Roles recognised by the system, carried in the `X-Apex-Role` header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Admin,
     RedTeam,
+    #[serde(rename = "devsecops")]
     DevSecOps,
     Ciso,
     SecOps,
@@ -46,7 +50,8 @@ impl Role {
 }
 
 /// Actions guarded by RBAC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Capability {
     /// Launch adversary-emulation (Red Team) scenarios.
     RunRedTeam,

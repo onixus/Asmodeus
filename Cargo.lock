@@ -100,6 +100,7 @@ dependencies = [
  "axum 0.7.9",
  "ed25519-compact",
  "prost",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

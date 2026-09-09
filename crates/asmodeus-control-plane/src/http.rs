@@ -24,6 +24,8 @@ use crate::campaign::CampaignCatalog;
 use crate::catalog::Catalog;
 use crate::engine::{self, EngineError};
 use crate::registry::{RunnerRecord, RunnerRegistry};
+use crate::scheduler::{CreateScheduleRequest, ScheduleCatalog, ScheduledJob};
+use crate::webhook::WebhookDispatcher;
 
 /// Shared, cheaply cloneable server state.
 #[derive(Clone)]
@@ -38,6 +40,8 @@ pub struct AppState {
     pub registry: RunnerRegistry,
     pub audit_trail: Arc<std::sync::RwLock<AuditTrail>>,
     pub campaigns: Arc<std::sync::RwLock<CampaignCatalog>>,
+    pub schedules: Arc<std::sync::RwLock<ScheduleCatalog>>,
+    pub webhook: Arc<WebhookDispatcher>,
     pub signing_key: [u8; 64],
     pub audit_file_path: Option<std::path::PathBuf>,
 }
@@ -87,6 +91,8 @@ impl AppState {
             registry,
             audit_trail: Arc::new(std::sync::RwLock::new(audit_trail)),
             campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
+            schedules: Arc::new(std::sync::RwLock::new(ScheduleCatalog::seeded())),
+            webhook: Arc::new(WebhookDispatcher::from_env()),
             signing_key,
             audit_file_path,
         }
@@ -122,6 +128,8 @@ impl AppState {
             registry,
             audit_trail: Arc::new(std::sync::RwLock::new(audit_trail)),
             campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
+            schedules: Arc::new(std::sync::RwLock::new(ScheduleCatalog::seeded())),
+            webhook: Arc::new(WebhookDispatcher::from_env()),
             signing_key,
             audit_file_path,
         }
@@ -166,6 +174,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/asmodeus/reports/resilience",
             get(get_resilience_report),
         )
+        .route(
+            "/api/v1/asmodeus/reports/compliance",
+            get(get_compliance_report),
+        )
         .route("/api/v1/asmodeus/openapi.json", get(openapi_spec))
         .route("/api/v1/asmodeus/audit/export", get(export_audit_trail))
         .route(
@@ -174,12 +186,18 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/asmodeus/campaigns/:id", delete(delete_campaign))
         .route("/api/v1/asmodeus/campaigns/:id/run", post(run_campaign))
+        .route(
+            "/api/v1/asmodeus/schedules",
+            get(list_schedules).post(create_schedule),
+        )
+        .route("/api/v1/asmodeus/schedules/:id", delete(delete_schedule))
         .with_state(state)
 }
 
 // --- error type -----------------------------------------------------------
 
-enum ApiError {
+#[derive(Debug)]
+pub(crate) enum ApiError {
     Unauthorized(&'static str),
     Forbidden(&'static str),
     NotFound(String),
@@ -187,6 +205,21 @@ enum ApiError {
     Internal(String),
     BadGateway(String),
 }
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Unauthorized(m) => write!(f, "Unauthorized: {m}"),
+            ApiError::Forbidden(m) => write!(f, "Forbidden: {m}"),
+            ApiError::NotFound(m) => write!(f, "Not Found: {m}"),
+            ApiError::Unprocessable(m) => write!(f, "Unprocessable: {m}"),
+            ApiError::Internal(m) => write!(f, "Internal: {m}"),
+            ApiError::BadGateway(m) => write!(f, "Bad Gateway: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -236,7 +269,7 @@ pub struct RunScenarioPayload {
     pub timeout_sec: Option<u32>,
 }
 
-async fn execute_single_scenario(
+pub(crate) async fn execute_single_scenario(
     state: &AppState,
     entry: &crate::catalog::ScenarioEntry,
     role: Role,
@@ -250,6 +283,24 @@ async fn execute_single_scenario(
     ) {
         return Err(ApiError::Unprocessable("scenario signature invalid".into()));
     }
+
+    state.webhook.dispatch(
+        crate::webhook::WebhookPayload {
+            event: "exercise_started".into(),
+            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+            exercise_id: String::new(),
+            scenario_id: entry.id.to_string(),
+            mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
+            target: target_override.unwrap_or("default").to_string(),
+            initiator: role.as_str().to_string(),
+            tag: entry.category.tag().to_string(),
+            data: json!({
+                "scenario_name": entry.name,
+                "category": entry.category.as_str(),
+            }),
+        },
+        Some(&state.signing_key),
+    );
 
     // Target resolution. An explicitly requested target must resolve to a
     // registered runner: we never silently fall back to the static default
@@ -388,6 +439,26 @@ async fn execute_single_scenario(
     if let Some(ref path) = state.audit_file_path {
         let _ = AuditTrail::append_to_file(&signed_record, path);
     }
+
+    state.webhook.dispatch(
+        crate::webhook::WebhookPayload {
+            event: "exercise_completed".into(),
+            timestamp_utc: signed_record.timestamp_utc.clone(),
+            exercise_id: signed_record.run_id.clone(),
+            scenario_id: entry.id.to_string(),
+            mitre_technique: signed_record.mitre_technique.clone(),
+            target: target_override.unwrap_or("default").to_string(),
+            initiator: role.as_str().to_string(),
+            tag: entry.category.tag().to_string(),
+            data: json!({
+                "status": signed_record.status,
+                "mttd_ms": signed_record.measurements.mttd_ms,
+                "mttr_ms": signed_record.measurements.mttr_ms,
+                "runner_id": signed_record.runner_id,
+            }),
+        },
+        Some(&state.signing_key),
+    );
 
     Ok((run_id, execution, signed_record))
 }
@@ -584,6 +655,24 @@ async fn abort_all(
     let mut runs = state.runs.lock().unwrap();
     let aborted = runs.len();
     runs.clear();
+
+    state.webhook.dispatch(
+        crate::webhook::WebhookPayload {
+            event: "exercise_aborted".into(),
+            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+            exercise_id: "all".into(),
+            scenario_id: "all".into(),
+            mitre_technique: String::new(),
+            target: "all".into(),
+            initiator: role.as_str().to_string(),
+            tag: "🛑 [EMERGENCY ABORT]".into(),
+            data: json!({
+                "runs_cleared": aborted,
+            }),
+        },
+        Some(&state.signing_key),
+    );
+
     Ok(Json(
         json!({ "status": "ABORTED", "runs_cleared": aborted }),
     ))
@@ -961,6 +1050,43 @@ async fn get_resilience_report(
     }
 }
 
+async fn get_compliance_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ReportQuery>,
+) -> Result<Response, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view compliance reports"));
+    }
+
+    let trail = state.audit_trail.read().unwrap();
+    let records = trail.list(None, None, None);
+    let scenario_metas: Vec<asmodeus_telemetry::ScenarioMeta> = state
+        .catalog
+        .ids()
+        .filter_map(|id| state.catalog.get(id))
+        .map(|entry| asmodeus_telemetry::ScenarioMeta {
+            id: entry.id.to_string(),
+            name: entry.name.to_string(),
+            category: entry.category.as_str().to_string(),
+            mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
+        })
+        .collect();
+    let report = asmodeus_telemetry::ComplianceReport::generate(&scenario_metas, &records);
+
+    if query.format.as_deref() == Some("markdown") {
+        Ok((
+            StatusCode::OK,
+            [("content-type", "text/markdown; charset=utf-8")],
+            report.to_markdown(),
+        )
+            .into_response())
+    } else {
+        Ok(Json(json!(report)).into_response())
+    }
+}
+
 async fn get_run_report(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1017,24 +1143,47 @@ async fn export_audit_trail(
         .unwrap_or("jsonl")
         .to_ascii_lowercase();
 
-    if fmt == "json" {
-        let json_body = trail
-            .export_json()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        Ok((
-            StatusCode::OK,
-            [("content-type", "application/json; charset=utf-8")],
-            json_body,
-        )
-            .into_response())
-    } else {
-        let jsonl_body = trail.export_jsonl();
-        Ok((
-            StatusCode::OK,
-            [("content-type", "application/x-ndjson; charset=utf-8")],
-            jsonl_body,
-        )
-            .into_response())
+    match fmt.as_str() {
+        "json" => {
+            let json_body = trail
+                .export_json()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/json; charset=utf-8")],
+                json_body,
+            )
+                .into_response())
+        }
+        "clickhouse" | "clickhouse_sql" | "sql" => {
+            let sql_body = trail.export_clickhouse_sql();
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/sql; charset=utf-8")],
+                sql_body,
+            )
+                .into_response())
+        }
+        "clickhouse_ndjson" => {
+            let ndjson_body = trail
+                .export_clickhouse_ndjson()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/x-ndjson; charset=utf-8")],
+                ndjson_body,
+            )
+                .into_response())
+        }
+        _ => {
+            let jsonl_body = trail.export_jsonl();
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/x-ndjson; charset=utf-8")],
+                jsonl_body,
+            )
+                .into_response())
+        }
     }
 }
 
@@ -1246,6 +1395,112 @@ async fn run_campaign(
     };
 
     Ok(Json(json!(result)))
+}
+
+async fn list_schedules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not view schedules"));
+    }
+    let schedules = state.schedules.read().unwrap().list();
+    Ok(Json(json!({ "schedules": schedules })))
+}
+
+async fn create_schedule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateScheduleRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ManageScenarios)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not schedule exercises"));
+    }
+
+    if req.name.trim().is_empty() {
+        return Err(ApiError::Unprocessable(
+            "schedule name cannot be empty".into(),
+        ));
+    }
+    if req.interval_sec < 5 {
+        return Err(ApiError::Unprocessable(
+            "interval must be at least 5 seconds".into(),
+        ));
+    }
+    if !state.catalog.ids().any(|id| id == req.scenario_id) {
+        return Err(ApiError::NotFound(format!(
+            "scenario not found: {}",
+            req.scenario_id
+        )));
+    }
+
+    let id = req.id.unwrap_or_else(|| {
+        format!(
+            "SCHED-{}",
+            req.name
+                .to_ascii_uppercase()
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+        )
+    });
+
+    let job = ScheduledJob {
+        id,
+        name: req.name,
+        scenario_id: req.scenario_id,
+        interval_sec: req.interval_sec,
+        role: if role == Role::DevSecOps || role == Role::Admin {
+            Role::RedTeam
+        } else {
+            role
+        },
+        target_override: req.target_override,
+        enabled: req.enabled.unwrap_or(true),
+        created_at_utc: asmodeus_telemetry::current_utc_iso8601(),
+        last_run_utc: None,
+        last_run_epoch_secs: None,
+        last_status: None,
+        last_mttd_ms: None,
+        baseline_mttd_ms: req.baseline_mttd_ms,
+        drift_detected: false,
+        drift_factor: None,
+    };
+
+    state.schedules.write().unwrap().register(job.clone());
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "status": "created", "schedule": job })),
+    ))
+}
+
+async fn delete_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ManageScenarios)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not delete schedules"));
+    }
+
+    if state.schedules.write().unwrap().deregister(&id) {
+        Ok(Json(json!({ "status": "deleted", "id": id })))
+    } else {
+        Err(ApiError::NotFound(format!("schedule not found: {id}")))
+    }
 }
 
 #[cfg(test)]
@@ -2402,6 +2657,189 @@ spec:
         let req = Request::builder()
             .method("DELETE")
             .uri("/api/v1/asmodeus/campaigns/CAMP-DYNAMIC-001")
+            .header("x-apex-role", "admin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audit_export_clickhouse_formats() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // Run scenario to generate audit record
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Export ClickHouse SQL
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/audit/export?format=clickhouse_sql")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/sql; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let sql = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(sql.contains("INSERT INTO apex.asmodeus_runs"));
+        assert!(sql.contains("RANSOMWARE_CANARY_SPIKE"));
+
+        // Export ClickHouse NDJSON
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/audit/export?format=clickhouse_ndjson")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-ndjson; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let ndjson = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(ndjson.contains("RANSOMWARE_CANARY_SPIKE"));
+    }
+
+    #[tokio::test]
+    async fn compliance_report_json_and_markdown() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // Run scenario to seed some audit data
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 1. JSON report
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/reports/compliance")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(report["total_controls"].as_u64().unwrap() >= 6);
+        assert!(report["controls"].as_array().unwrap().len() >= 6);
+
+        // 2. Markdown report
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/reports/compliance?format=markdown")
+            .header("x-apex-role", "ciso")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/markdown; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let md = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(md.contains("NIST CSF 2.0 / PCI-DSS v4.0"));
+        assert!(md.contains("DE.CM-01"));
+
+        // 3. Missing role -> 401
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/reports/compliance")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn schedules_crud_and_rbac() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. List seeded schedules as auditor
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/schedules")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let list: Value = serde_json::from_slice(&bytes).unwrap();
+        let scheds = list["schedules"].as_array().unwrap();
+        assert!(scheds.iter().any(|s| s["id"] == "SCHED-BASE-RANSOMWARE"));
+
+        // 2. SecOps forbidden from creating schedule -> 403
+        let new_sched = json!({
+            "id": "SCHED-TEST-001",
+            "name": "Test Schedule",
+            "scenario_id": "RANSOMWARE_CANARY_SPIKE",
+            "interval_sec": 60
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/schedules")
+            .header("x-apex-role", "secops")
+            .header("content-type", "application/json")
+            .body(Body::from(new_sched.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 3. RedTeam creates schedule -> 201 Created
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/schedules")
+            .header("x-apex-role", "red_team")
+            .header("content-type", "application/json")
+            .body(Body::from(new_sched.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // 4. Auditor deletes schedule -> 403
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 5. Admin deletes schedule -> 200 OK
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
+            .header("x-apex-role", "admin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 6. Delete again -> 404
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
             .header("x-apex-role", "admin")
             .body(Body::empty())
             .unwrap();

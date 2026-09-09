@@ -199,6 +199,16 @@ impl AuditTrail {
         serde_json::to_string_pretty(&self.records)
     }
 
+    /// Export all records as a ClickHouse batch SQL INSERT statement.
+    pub fn export_clickhouse_sql(&self) -> String {
+        crate::clickhouse::records_to_clickhouse_sql(&self.records)
+    }
+
+    /// Export all records in ClickHouse JSONEachRow format (NDJSON).
+    pub fn export_clickhouse_ndjson(&self) -> Result<String, serde_json::Error> {
+        crate::clickhouse::records_to_clickhouse_ndjson(&self.records)
+    }
+
     /// Read records from a JSONL reader.
     pub fn from_jsonl<R: std::io::BufRead>(reader: R) -> std::io::Result<Self> {
         let mut records = Vec::new();

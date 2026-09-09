@@ -3,9 +3,13 @@
 //! Pure computation + text exposition; no async scrape server yet.
 
 pub mod audit;
+pub mod clickhouse;
+pub mod compliance;
 pub mod reporting;
 
 pub use audit::*;
+pub use clickhouse::*;
+pub use compliance::*;
 pub use reporting::*;
 
 use serde::{Deserialize, Serialize};

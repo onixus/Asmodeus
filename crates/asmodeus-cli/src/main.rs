@@ -108,6 +108,57 @@ enum Cmd {
         #[command(subcommand)]
         action: CampaignsAction,
     },
+    /// Generate NIST CSF 2.0 & PCI-DSS v4.0 compliance & controls coverage report.
+    Compliance {
+        #[arg(long, default_value = "markdown")]
+        format: String,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Manage continuous automated BAS schedule catalog.
+    Schedules {
+        #[command(subcommand)]
+        action: SchedulesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchedulesAction {
+    /// List all scheduled BAS baseline exercises.
+    List {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Register a new scheduled BAS baseline exercise.
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        scenario: String,
+        #[arg(long, default_value_t = 120)]
+        interval: u64,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        baseline_mttd: Option<u64>,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Deregister a scheduled BAS baseline exercise by ID.
+    Delete {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -400,6 +451,57 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "resilience report",
             )?;
         }
+        Cmd::Compliance { format, role, url } => {
+            let endpoint = format!("{url}/api/v1/asmodeus/reports/compliance?format={format}");
+            let client = reqwest::blocking::Client::new();
+            call(
+                client.get(&endpoint).header("X-Apex-Role", &role),
+                "compliance report",
+            )?;
+        }
+        Cmd::Schedules { action } => match action {
+            SchedulesAction::List { role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/schedules");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "schedules list",
+                )?;
+            }
+            SchedulesAction::Add {
+                name,
+                scenario,
+                interval,
+                target,
+                baseline_mttd,
+                role,
+                url,
+            } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/schedules");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client
+                        .post(&endpoint)
+                        .header("X-Apex-Role", &role)
+                        .json(&json!({
+                            "name": name,
+                            "scenario_id": scenario,
+                            "interval_sec": interval,
+                            "target_override": target,
+                            "baseline_mttd_ms": baseline_mttd,
+                        })),
+                    "schedules add",
+                )?;
+            }
+            SchedulesAction::Delete { id, role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/schedules/{id}");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.delete(&endpoint).header("X-Apex-Role", &role),
+                    "schedules delete",
+                )?;
+            }
+        },
         Cmd::Runners { action } => match action {
             RunnersAction::List { role, url } => {
                 let endpoint = format!("{url}/api/v1/asmodeus/runners");
@@ -759,6 +861,46 @@ mod tests {
             .expect("parse report");
         match cli.cmd {
             Cmd::Report { format, .. } => assert_eq!(format, "markdown"),
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from(["asmodeus", "compliance", "--format", "json"])
+            .expect("parse compliance");
+        match cli.cmd {
+            Cmd::Compliance { format, .. } => assert_eq!(format, "json"),
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "schedules",
+            "add",
+            "--name",
+            "Daily Ransomware Baseline",
+            "--scenario",
+            "SCN-RT-001",
+            "--interval",
+            "300",
+            "--baseline-mttd",
+            "180",
+        ])
+        .expect("parse schedules add");
+        match cli.cmd {
+            Cmd::Schedules {
+                action:
+                    SchedulesAction::Add {
+                        name,
+                        scenario,
+                        interval,
+                        baseline_mttd,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "Daily Ransomware Baseline");
+                assert_eq!(scenario, "SCN-RT-001");
+                assert_eq!(interval, 300);
+                assert_eq!(baseline_mttd, Some(180));
+            }
             _ => panic!("unexpected command"),
         }
 

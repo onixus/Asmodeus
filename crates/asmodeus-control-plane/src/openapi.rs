@@ -101,6 +101,70 @@ pub fn generate_spec() -> Value {
                         }
                     },
                     "required": ["id", "name", "description", "steps"]
+                },
+                "ScheduledJob": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "scenario_id": { "type": "string" },
+                        "interval_sec": { "type": "integer" },
+                        "role": { "type": "string" },
+                        "target_override": { "type": "string", "nullable": true },
+                        "enabled": { "type": "boolean" },
+                        "created_at_utc": { "type": "string" },
+                        "last_run_utc": { "type": "string", "nullable": true },
+                        "last_status": { "type": "string", "nullable": true },
+                        "last_mttd_ms": { "type": "integer", "nullable": true },
+                        "baseline_mttd_ms": { "type": "integer", "nullable": true },
+                        "drift_detected": { "type": "boolean" },
+                        "drift_factor": { "type": "number", "nullable": true }
+                    },
+                    "required": ["id", "name", "scenario_id", "interval_sec", "role", "enabled", "created_at_utc", "drift_detected"]
+                },
+                "CreateScheduleRequest": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "scenario_id": { "type": "string" },
+                        "interval_sec": { "type": "integer" },
+                        "target_override": { "type": "string" },
+                        "baseline_mttd_ms": { "type": "integer" },
+                        "enabled": { "type": "boolean" }
+                    },
+                    "required": ["name", "scenario_id", "interval_sec"]
+                },
+                "ComplianceReport": {
+                    "type": "object",
+                    "properties": {
+                        "generated_at_utc": { "type": "string" },
+                        "total_controls": { "type": "integer" },
+                        "compliant_controls": { "type": "integer" },
+                        "partial_controls": { "type": "integer" },
+                        "non_compliant_controls": { "type": "integer" },
+                        "overall_compliance_score": { "type": "integer" },
+                        "controls": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "control_id": { "type": "string" },
+                                    "standard": { "type": "string" },
+                                    "title": { "type": "string" },
+                                    "description": { "type": "string" },
+                                    "mapped_techniques": { "type": "array", "items": { "type": "string" } },
+                                    "matching_scenarios": { "type": "array", "items": { "type": "string" } },
+                                    "total_runs": { "type": "integer" },
+                                    "detected_runs": { "type": "integer" },
+                                    "detection_rate_pct": { "type": "number" },
+                                    "status": { "type": "string" }
+                                },
+                                "required": ["control_id", "standard", "title", "total_runs", "detected_runs", "detection_rate_pct", "status"]
+                            }
+                        }
+                    },
+                    "required": ["generated_at_utc", "total_controls", "overall_compliance_score", "controls"]
                 }
             }
         },
@@ -314,6 +378,43 @@ pub fn generate_spec() -> Value {
                         "404": { "description": "Campaign not found" }
                     }
                 }
+            },
+            "/api/v1/asmodeus/reports/compliance": {
+                "get": {
+                    "summary": "Get NIST CSF 2.0 & PCI-DSS v4.0 regulatory compliance report in JSON or Markdown",
+                    "responses": {
+                        "200": { "description": "Compliance and control coverage report" },
+                        "403": { "description": "Role forbidden from viewing reports" }
+                    }
+                }
+            },
+            "/api/v1/asmodeus/schedules": {
+                "get": {
+                    "summary": "List all continuous automated BAS scheduled exercises",
+                    "responses": {
+                        "200": { "description": "Array of scheduled jobs" },
+                        "403": { "description": "Forbidden" }
+                    }
+                },
+                "post": {
+                    "summary": "Register a new continuous automated BAS scheduled exercise",
+                    "responses": {
+                        "201": { "description": "Schedule created" },
+                        "403": { "description": "Forbidden" },
+                        "404": { "description": "Scenario not found" },
+                        "422": { "description": "Validation error" }
+                    }
+                }
+            },
+            "/api/v1/asmodeus/schedules/{id}": {
+                "delete": {
+                    "summary": "Deregister a continuous automated BAS scheduled exercise",
+                    "responses": {
+                        "200": { "description": "Schedule removed" },
+                        "403": { "description": "Forbidden" },
+                        "404": { "description": "Schedule not found" }
+                    }
+                }
             }
         }
     })
@@ -332,6 +433,10 @@ mod tests {
         assert!(spec["paths"]["/api/v1/asmodeus/openapi.json"].is_object());
         assert!(spec["paths"]["/api/v1/asmodeus/audit/export"].is_object());
         assert!(spec["paths"]["/api/v1/asmodeus/campaigns"].is_object());
+        assert!(spec["paths"]["/api/v1/asmodeus/schedules"].is_object());
+        assert!(spec["paths"]["/api/v1/asmodeus/reports/compliance"].is_object());
         assert!(spec["components"]["schemas"]["AuditRecord"].is_object());
+        assert!(spec["components"]["schemas"]["ScheduledJob"].is_object());
+        assert!(spec["components"]["schemas"]["ComplianceReport"].is_object());
     }
 }

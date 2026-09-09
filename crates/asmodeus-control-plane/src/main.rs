@@ -8,10 +8,12 @@ mod campaign;
 mod catalog;
 mod dispatch;
 mod engine;
-mod http;
+pub(crate) mod http;
 mod openapi;
 mod registry;
+mod scheduler;
 mod watchdog;
+mod webhook;
 
 use std::net::SocketAddr;
 
@@ -28,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new(Catalog::seeded());
     let _watchdog = watchdog::spawn_watchdog(state.registry.clone(), 30);
+    let _scheduler = scheduler::spawn_scheduler(state.clone(), 30);
     let app = router(state);
 
     let addr: SocketAddr = std::env::var("ASMODEUS_LISTEN")
