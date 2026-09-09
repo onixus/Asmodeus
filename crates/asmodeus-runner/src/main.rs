@@ -9,6 +9,7 @@
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 mod aya_backend;
 mod canary;
+mod injectors;
 mod netchaos;
 mod service;
 

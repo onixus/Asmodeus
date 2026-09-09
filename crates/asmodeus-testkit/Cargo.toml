@@ -10,4 +10,7 @@ publish = false
 asmodeus-common = { workspace = true }
 asmodeus-crypto = { workspace = true }
 asmodeus-dsl = { workspace = true }
+asmodeus-proto = { workspace = true }
 ed25519-compact = { workspace = true }
+rcgen = { workspace = true }
+tonic = { workspace = true }

@@ -6,6 +6,10 @@
 //! a manifest whose action is operational/weaponizable is rejected here, before
 //! it can ever reach a runner.
 
+pub mod mitre;
+
+pub use mitre::{lookup_technique, MitreTechnique, ALL_TECHNIQUES};
+
 use asmodeus_common::{ActionNature, RunState};
 
 /// Canary filesystem sandbox: the only paths any runner action may touch.

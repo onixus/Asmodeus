@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_compact::KeyPair;
 
+pub mod tls;
+pub use tls::{TestMtls, TestMtlsPaths};
+
 /// A unique, self-cleaning canary directory under the INV-0 scope. Dropping a
 /// `Polygon` removes the directory tree — tests never leave residue.
 #[derive(Debug)]
