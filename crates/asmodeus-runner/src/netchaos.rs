@@ -174,6 +174,9 @@ pub struct SimBackend {
 }
 
 impl SimBackend {
+    /// Constructor kept for API symmetry; production paths build the backend
+    /// via `Default` in `select_backend`, so it is unused in the binary today.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
