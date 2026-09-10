@@ -41,6 +41,16 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
+    /// Rebuild a rolling aggregate from a slice of persisted audit records
+    /// (e.g. after loading the audit trail from disk on startup).
+    pub fn from_records(records: &[crate::audit::AuditRecord]) -> Self {
+        let mut agg = Self::default();
+        for r in records {
+            agg.record(r.measurements);
+        }
+        agg
+    }
+
     pub fn record(&mut self, m: Measurements) {
         self.scenarios_executed += 1;
         if m.blue_team_detected {

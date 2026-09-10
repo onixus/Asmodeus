@@ -82,10 +82,13 @@ impl AppState {
         } else {
             AuditTrail::new()
         };
+        // Rebuild rolling detection metrics from any persisted history so that
+        // reports and /metrics reflect loaded records after a restart.
+        let metrics = Aggregate::from_records(&audit_trail.list(None, None, None));
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
-            metrics: Arc::new(Mutex::new(Aggregate::default())),
+            metrics: Arc::new(Mutex::new(metrics)),
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint,
             registry,
@@ -119,10 +122,13 @@ impl AppState {
         } else {
             AuditTrail::new()
         };
+        // Rebuild rolling detection metrics from any persisted history so that
+        // reports and /metrics reflect loaded records after a restart.
+        let metrics = Aggregate::from_records(&audit_trail.list(None, None, None));
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
-            metrics: Arc::new(Mutex::new(Aggregate::default())),
+            metrics: Arc::new(Mutex::new(metrics)),
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint: None,
             registry,
