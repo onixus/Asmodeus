@@ -137,6 +137,16 @@ impl AuditTrail {
         self.records.iter().find(|r| r.run_id == run_id)
     }
 
+    /// Update an existing audit record (e.g. following closed-loop blue team feedback).
+    pub fn update(&mut self, run_id: &str, updated: AuditRecord) -> bool {
+        if let Some(pos) = self.records.iter().position(|r| r.run_id == run_id) {
+            self.records[pos] = updated;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Filter audit records with optional filters.
     pub fn list(
         &self,
@@ -170,6 +180,83 @@ impl AuditTrail {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Export all records as JSON Lines (JSONL).
+    pub fn export_jsonl(&self) -> String {
+        let mut out = String::new();
+        for rec in &self.records {
+            if let Ok(line) = serde_json::to_string(rec) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Export all records as a pretty-printed JSON string.
+    pub fn export_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.records)
+    }
+
+    /// Export all records as a ClickHouse batch SQL INSERT statement.
+    pub fn export_clickhouse_sql(&self) -> String {
+        crate::clickhouse::records_to_clickhouse_sql(&self.records)
+    }
+
+    /// Export all records in ClickHouse JSONEachRow format (NDJSON).
+    pub fn export_clickhouse_ndjson(&self) -> Result<String, serde_json::Error> {
+        crate::clickhouse::records_to_clickhouse_ndjson(&self.records)
+    }
+
+    /// Read records from a JSONL reader.
+    pub fn from_jsonl<R: std::io::BufRead>(reader: R) -> std::io::Result<Self> {
+        let mut records = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let rec = serde_json::from_str::<AuditRecord>(trimmed)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            records.push(rec);
+        }
+        Ok(Self { records })
+    }
+
+    /// Save all records to a file in JSONL format.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, self.export_jsonl())
+    }
+
+    /// Load audit trail from a JSONL file. If file does not exist, returns an empty trail.
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        Self::from_jsonl(reader)
+    }
+
+    /// Append a single record to a persistent JSONL file.
+    pub fn append_to_file(record: &AuditRecord, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let line = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        writeln!(file, "{line}")?;
+        Ok(())
     }
 }
 
@@ -378,5 +465,53 @@ mod tests {
         let ts = current_utc_iso8601();
         assert!(ts.contains('T') && ts.ends_with('Z'));
         assert!(ts.len() >= 20);
+    }
+
+    #[test]
+    fn test_audit_trail_jsonl_and_file_persistence() {
+        let mut trail = AuditTrail::new();
+        let (_, sk) = generate_keypair();
+        let r1 = sample_record().sign(&sk).unwrap();
+        let mut r2 = sample_record();
+        r2.run_id = "run-persist-02".to_string();
+        let r2 = r2.sign(&sk).unwrap();
+
+        trail.append(r1.clone());
+        trail.append(r2.clone());
+
+        let jsonl = trail.export_jsonl();
+        assert_eq!(jsonl.lines().count(), 2);
+
+        let recovered = AuditTrail::from_jsonl(jsonl.as_bytes()).unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered.get("run-test-01").unwrap().scenario_id,
+            "SCN-RT-001"
+        );
+        assert_eq!(
+            recovered.get("run-persist-02").unwrap().run_id,
+            "run-persist-02"
+        );
+
+        let temp_dir = std::env::temp_dir().join(format!("asmodeus-test-{}", std::process::id()));
+        let temp_file = temp_dir.join("audit.jsonl");
+
+        trail.save_to_file(&temp_file).unwrap();
+        let loaded = AuditTrail::load_from_file(&temp_file).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let mut r3 = sample_record();
+        r3.run_id = "run-persist-03".to_string();
+        let r3 = r3.sign(&sk).unwrap();
+        AuditTrail::append_to_file(&r3, &temp_file).unwrap();
+
+        let loaded2 = AuditTrail::load_from_file(&temp_file).unwrap();
+        assert_eq!(loaded2.len(), 3);
+        assert_eq!(
+            loaded2.get("run-persist-03").unwrap().run_id,
+            "run-persist-03"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

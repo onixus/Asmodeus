@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use asmodeus_common::{Category, Role, RunId, RunState, INV_0_SYNTHETIC_ONLY};
-use asmodeus_telemetry::{Aggregate, AuditRecord, AuditTrail, Measurements};
+use asmodeus_telemetry::{
+    Aggregate, AuditRecord, AuditTrail, EcosystemResilienceReport, Measurements, SingleRunReport,
+};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -22,6 +24,8 @@ use crate::campaign::CampaignCatalog;
 use crate::catalog::Catalog;
 use crate::engine::{self, EngineError};
 use crate::registry::{RunnerRecord, RunnerRegistry};
+use crate::scheduler::{CreateScheduleRequest, ScheduleCatalog, ScheduledJob};
+use crate::webhook::WebhookDispatcher;
 
 /// Shared, cheaply cloneable server state.
 #[derive(Clone)]
@@ -35,8 +39,11 @@ pub struct AppState {
     pub runner_endpoint: Option<String>,
     pub registry: RunnerRegistry,
     pub audit_trail: Arc<std::sync::RwLock<AuditTrail>>,
-    pub campaigns: Arc<CampaignCatalog>,
+    pub campaigns: Arc<std::sync::RwLock<CampaignCatalog>>,
+    pub schedules: Arc<std::sync::RwLock<ScheduleCatalog>>,
+    pub webhook: Arc<WebhookDispatcher>,
     pub signing_key: [u8; 64],
+    pub audit_file_path: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -67,16 +74,30 @@ impl AppState {
         } else {
             asmodeus_crypto::generate_keypair().1
         };
+        let audit_file_path = std::env::var("ASMODEUS_AUDIT_LOG")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let audit_trail = if let Some(ref path) = audit_file_path {
+            AuditTrail::load_from_file(path).unwrap_or_else(|_| AuditTrail::new())
+        } else {
+            AuditTrail::new()
+        };
+        // Rebuild rolling detection metrics from any persisted history so that
+        // reports and /metrics reflect loaded records after a restart.
+        let metrics = Aggregate::from_records(&audit_trail.list(None, None, None));
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
-            metrics: Arc::new(Mutex::new(Aggregate::default())),
+            metrics: Arc::new(Mutex::new(metrics)),
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint,
             registry,
-            audit_trail: Arc::new(std::sync::RwLock::new(AuditTrail::new())),
-            campaigns: Arc::new(CampaignCatalog::seeded()),
+            audit_trail: Arc::new(std::sync::RwLock::new(audit_trail)),
+            campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
+            schedules: Arc::new(std::sync::RwLock::new(ScheduleCatalog::seeded())),
+            webhook: Arc::new(WebhookDispatcher::from_env()),
             signing_key,
+            audit_file_path,
         }
     }
 
@@ -93,16 +114,30 @@ impl AppState {
         } else {
             asmodeus_crypto::generate_keypair().1
         };
+        let audit_file_path = std::env::var("ASMODEUS_AUDIT_LOG")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let audit_trail = if let Some(ref path) = audit_file_path {
+            AuditTrail::load_from_file(path).unwrap_or_else(|_| AuditTrail::new())
+        } else {
+            AuditTrail::new()
+        };
+        // Rebuild rolling detection metrics from any persisted history so that
+        // reports and /metrics reflect loaded records after a restart.
+        let metrics = Aggregate::from_records(&audit_trail.list(None, None, None));
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
-            metrics: Arc::new(Mutex::new(Aggregate::default())),
+            metrics: Arc::new(Mutex::new(metrics)),
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint: None,
             registry,
-            audit_trail: Arc::new(std::sync::RwLock::new(AuditTrail::new())),
-            campaigns: Arc::new(CampaignCatalog::seeded()),
+            audit_trail: Arc::new(std::sync::RwLock::new(audit_trail)),
+            campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
+            schedules: Arc::new(std::sync::RwLock::new(ScheduleCatalog::seeded())),
+            webhook: Arc::new(WebhookDispatcher::from_env()),
             signing_key,
+            audit_file_path,
         }
     }
 
@@ -119,6 +154,10 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics))
         .route("/api/v1/asmodeus/scenarios", get(list_scenarios))
         .route("/api/v1/asmodeus/scenarios/mitre", get(mitre_matrix))
+        .route(
+            "/api/v1/asmodeus/scenarios/validate",
+            post(validate_scenario_manifest),
+        )
         .route("/api/v1/asmodeus/scenarios/:id", get(get_scenario))
         .route("/api/v1/asmodeus/scenarios/:id/run", post(run_scenario))
         .route("/api/v1/asmodeus/scenarios/abort", post(abort_all))
@@ -135,14 +174,36 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/asmodeus/runs", get(list_runs))
         .route("/api/v1/asmodeus/runs/:id", get(get_run))
         .route("/api/v1/asmodeus/runs/:id/verify", get(verify_run))
-        .route("/api/v1/asmodeus/campaigns", get(list_campaigns))
+        .route("/api/v1/asmodeus/runs/:id/feedback", post(run_feedback))
+        .route("/api/v1/asmodeus/runs/:id/report", get(get_run_report))
+        .route(
+            "/api/v1/asmodeus/reports/resilience",
+            get(get_resilience_report),
+        )
+        .route(
+            "/api/v1/asmodeus/reports/compliance",
+            get(get_compliance_report),
+        )
+        .route("/api/v1/asmodeus/openapi.json", get(openapi_spec))
+        .route("/api/v1/asmodeus/audit/export", get(export_audit_trail))
+        .route(
+            "/api/v1/asmodeus/campaigns",
+            get(list_campaigns).post(register_campaign),
+        )
+        .route("/api/v1/asmodeus/campaigns/:id", delete(delete_campaign))
         .route("/api/v1/asmodeus/campaigns/:id/run", post(run_campaign))
+        .route(
+            "/api/v1/asmodeus/schedules",
+            get(list_schedules).post(create_schedule),
+        )
+        .route("/api/v1/asmodeus/schedules/:id", delete(delete_schedule))
         .with_state(state)
 }
 
 // --- error type -----------------------------------------------------------
 
-enum ApiError {
+#[derive(Debug)]
+pub(crate) enum ApiError {
     Unauthorized(&'static str),
     Forbidden(&'static str),
     NotFound(String),
@@ -150,6 +211,21 @@ enum ApiError {
     Internal(String),
     BadGateway(String),
 }
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Unauthorized(m) => write!(f, "Unauthorized: {m}"),
+            ApiError::Forbidden(m) => write!(f, "Forbidden: {m}"),
+            ApiError::NotFound(m) => write!(f, "Not Found: {m}"),
+            ApiError::Unprocessable(m) => write!(f, "Unprocessable: {m}"),
+            ApiError::Internal(m) => write!(f, "Internal: {m}"),
+            ApiError::BadGateway(m) => write!(f, "Bad Gateway: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -199,7 +275,7 @@ pub struct RunScenarioPayload {
     pub timeout_sec: Option<u32>,
 }
 
-async fn execute_single_scenario(
+pub(crate) async fn execute_single_scenario(
     state: &AppState,
     entry: &crate::catalog::ScenarioEntry,
     role: Role,
@@ -213,6 +289,24 @@ async fn execute_single_scenario(
     ) {
         return Err(ApiError::Unprocessable("scenario signature invalid".into()));
     }
+
+    state.webhook.dispatch(
+        crate::webhook::WebhookPayload {
+            event: "exercise_started".into(),
+            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+            exercise_id: String::new(),
+            scenario_id: entry.id.to_string(),
+            mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
+            target: target_override.unwrap_or("default").to_string(),
+            initiator: role.as_str().to_string(),
+            tag: entry.category.tag().to_string(),
+            data: json!({
+                "scenario_name": entry.name,
+                "category": entry.category.as_str(),
+            }),
+        },
+        Some(&state.signing_key),
+    );
 
     // Target resolution. An explicitly requested target must resolve to a
     // registered runner: we never silently fall back to the static default
@@ -347,6 +441,30 @@ async fn execute_single_scenario(
         .write()
         .unwrap()
         .append(signed_record.clone());
+
+    if let Some(ref path) = state.audit_file_path {
+        let _ = AuditTrail::append_to_file(&signed_record, path);
+    }
+
+    state.webhook.dispatch(
+        crate::webhook::WebhookPayload {
+            event: "exercise_completed".into(),
+            timestamp_utc: signed_record.timestamp_utc.clone(),
+            exercise_id: signed_record.run_id.clone(),
+            scenario_id: entry.id.to_string(),
+            mitre_technique: signed_record.mitre_technique.clone(),
+            target: target_override.unwrap_or("default").to_string(),
+            initiator: role.as_str().to_string(),
+            tag: entry.category.tag().to_string(),
+            data: json!({
+                "status": signed_record.status,
+                "mttd_ms": signed_record.measurements.mttd_ms,
+                "mttr_ms": signed_record.measurements.mttr_ms,
+                "runner_id": signed_record.runner_id,
+            }),
+        },
+        Some(&state.signing_key),
+    );
 
     Ok((run_id, execution, signed_record))
 }
@@ -543,6 +661,24 @@ async fn abort_all(
     let mut runs = state.runs.lock().unwrap();
     let aborted = runs.len();
     runs.clear();
+
+    state.webhook.dispatch(
+        crate::webhook::WebhookPayload {
+            event: "exercise_aborted".into(),
+            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+            exercise_id: "all".into(),
+            scenario_id: "all".into(),
+            mitre_technique: String::new(),
+            target: "all".into(),
+            initiator: role.as_str().to_string(),
+            tag: "🛑 [EMERGENCY ABORT]".into(),
+            data: json!({
+                "runs_cleared": aborted,
+            }),
+        },
+        Some(&state.signing_key),
+    );
+
     Ok(Json(
         json!({ "status": "ABORTED", "runs_cleared": aborted }),
     ))
@@ -757,6 +893,366 @@ async fn verify_run(
     })))
 }
 
+async fn validate_scenario_manifest(
+    State(_state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not validate scenarios"));
+    }
+    let body_str = std::str::from_utf8(&body)
+        .map_err(|e| ApiError::Unprocessable(format!("invalid UTF-8 body: {e}")))?;
+    match asmodeus_dsl::parse_and_validate_manifest(body_str) {
+        Ok(manifest) => Ok(Json(json!({
+            "valid": true,
+            "manifest_id": manifest.metadata.id,
+            "manifest_name": manifest.metadata.name,
+            "category": manifest.metadata.category,
+            "mitre_technique": manifest.metadata.mitre_technique,
+            "inv_0_compliant": true,
+        }))),
+        Err(e) => Err(ApiError::Unprocessable(e.to_string())),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunFeedbackPayload {
+    pub detected: bool,
+    #[serde(default)]
+    pub mttd_ms: Option<u64>,
+    #[serde(default)]
+    pub detection_source: Option<String>,
+    #[serde(default)]
+    pub contained: bool,
+    #[serde(default)]
+    pub mttr_ms: Option<u64>,
+    #[serde(default)]
+    pub containment_action: Option<String>,
+}
+
+async fn run_feedback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<RunFeedbackPayload>,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    // Admin, RedTeam, DevSecOps, SecOps can submit feedback. Auditor & CISO forbidden.
+    if matches!(role, Role::Ciso | Role::Auditor) {
+        return Err(ApiError::Forbidden("role may not submit feedback"));
+    }
+
+    let (old_record, updated_record) = {
+        let trail = state.audit_trail.read().unwrap();
+        let old = trail
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?
+            .clone();
+
+        let new_measurements = Measurements {
+            mttd_ms: payload.mttd_ms.unwrap_or(old.measurements.mttd_ms),
+            mttr_ms: payload.mttr_ms.unwrap_or(old.measurements.mttr_ms),
+            blue_team_detected: payload.detected,
+        };
+
+        let updated = AuditRecord {
+            run_id: old.run_id.clone(),
+            scenario_id: old.scenario_id.clone(),
+            scenario_name: old.scenario_name.clone(),
+            category: old.category.clone(),
+            mitre_technique: old.mitre_technique.clone(),
+            mitre_tactic: old.mitre_tactic.clone(),
+            severity: old.severity.clone(),
+            tag: old.tag.clone(),
+            initiator: old.initiator.clone(),
+            runner_id: old.runner_id.clone(),
+            status: if payload.contained {
+                "CONTAINED".to_string()
+            } else if payload.detected {
+                "DETECTED".to_string()
+            } else {
+                "UNCONTAINED".to_string()
+            },
+            measurements: new_measurements,
+            detection_source: payload
+                .detection_source
+                .unwrap_or_else(|| old.detection_source.clone()),
+            containment_action: payload
+                .containment_action
+                .unwrap_or_else(|| old.containment_action.clone()),
+            cleanup_status: old.cleanup_status.clone(),
+            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+            signature_hex: String::new(),
+            public_key_hex: String::new(),
+        };
+
+        (old, updated)
+    };
+
+    let signed = updated_record
+        .sign(&state.signing_key)
+        .map_err(|e| ApiError::Internal(format!("audit re-signing: {e}")))?;
+
+    state
+        .audit_trail
+        .write()
+        .unwrap()
+        .update(&id, signed.clone());
+
+    if let Some(ref path) = state.audit_file_path {
+        let trail = state.audit_trail.read().unwrap();
+        let _ = trail.save_to_file(path);
+    }
+
+    state
+        .metrics
+        .lock()
+        .unwrap()
+        .update_measurement(old_record.measurements, signed.measurements);
+
+    Ok(Json(json!({
+        "status": "UPDATED",
+        "run_id": signed.run_id,
+        "run_status": signed.status,
+        "measurements": signed.measurements,
+        "detection_source": signed.detection_source,
+        "containment_action": signed.containment_action,
+        "signature_hex": signed.signature_hex,
+        "timestamp_utc": signed.timestamp_utc,
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReportQuery {
+    pub format: Option<String>,
+}
+
+async fn get_resilience_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ReportQuery>,
+) -> Result<Response, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view resilience reports"));
+    }
+
+    let trail = state.audit_trail.read().unwrap();
+    let records = trail.list(None, None, None);
+    let agg = state.metrics.lock().unwrap().clone();
+    let report = EcosystemResilienceReport::build(&records, &agg);
+
+    if query.format.as_deref() == Some("markdown") {
+        Ok((
+            StatusCode::OK,
+            [("content-type", "text/markdown; charset=utf-8")],
+            report.to_markdown(),
+        )
+            .into_response())
+    } else {
+        Ok(Json(json!(report)).into_response())
+    }
+}
+
+async fn get_compliance_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ReportQuery>,
+) -> Result<Response, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view compliance reports"));
+    }
+
+    let trail = state.audit_trail.read().unwrap();
+    let records = trail.list(None, None, None);
+    let scenario_metas: Vec<asmodeus_telemetry::ScenarioMeta> = state
+        .catalog
+        .ids()
+        .filter_map(|id| state.catalog.get(id))
+        .map(|entry| asmodeus_telemetry::ScenarioMeta {
+            id: entry.id.to_string(),
+            name: entry.name.to_string(),
+            category: entry.category.as_str().to_string(),
+            mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
+        })
+        .collect();
+    let report = asmodeus_telemetry::ComplianceReport::generate(&scenario_metas, &records);
+
+    if query.format.as_deref() == Some("markdown") {
+        Ok((
+            StatusCode::OK,
+            [("content-type", "text/markdown; charset=utf-8")],
+            report.to_markdown(),
+        )
+            .into_response())
+    } else {
+        Ok(Json(json!(report)).into_response())
+    }
+}
+
+async fn get_run_report(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ReportQuery>,
+) -> Result<Response, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view run reports"));
+    }
+
+    let trail = state.audit_trail.read().unwrap();
+    let record = trail
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
+
+    let run_report = SingleRunReport::build(record, Some(state.catalog.public_key()));
+
+    if query.format.as_deref() == Some("markdown") {
+        Ok((
+            StatusCode::OK,
+            [("content-type", "text/markdown; charset=utf-8")],
+            run_report.to_markdown(),
+        )
+            .into_response())
+    } else {
+        Ok(Json(json!(run_report)).into_response())
+    }
+}
+
+async fn openapi_spec() -> Json<Value> {
+    Json(crate::openapi::generate_spec())
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ExportAuditParams {
+    pub format: Option<String>,
+}
+
+async fn export_audit_trail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<ExportAuditParams>,
+) -> Result<Response, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view audit trail"));
+    }
+
+    let trail = state.audit_trail.read().unwrap();
+    let fmt = params
+        .format
+        .as_deref()
+        .unwrap_or("jsonl")
+        .to_ascii_lowercase();
+
+    match fmt.as_str() {
+        "json" => {
+            let json_body = trail
+                .export_json()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/json; charset=utf-8")],
+                json_body,
+            )
+                .into_response())
+        }
+        "clickhouse" | "clickhouse_sql" | "sql" => {
+            let sql_body = trail.export_clickhouse_sql();
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/sql; charset=utf-8")],
+                sql_body,
+            )
+                .into_response())
+        }
+        "clickhouse_ndjson" => {
+            let ndjson_body = trail
+                .export_clickhouse_ndjson()
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/x-ndjson; charset=utf-8")],
+                ndjson_body,
+            )
+                .into_response())
+        }
+        _ => {
+            let jsonl_body = trail.export_jsonl();
+            Ok((
+                StatusCode::OK,
+                [("content-type", "application/x-ndjson; charset=utf-8")],
+                jsonl_body,
+            )
+                .into_response())
+        }
+    }
+}
+
+async fn register_campaign(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(campaign): Json<crate::campaign::Campaign>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ManageScenarios)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden(
+            "role may not register attack campaigns",
+        ));
+    }
+
+    if campaign.id.trim().is_empty() {
+        return Err(ApiError::Unprocessable(
+            "campaign id cannot be empty".to_string(),
+        ));
+    }
+    if campaign.steps.is_empty() {
+        return Err(ApiError::Unprocessable(
+            "campaign steps cannot be empty".to_string(),
+        ));
+    }
+
+    state.campaigns.write().unwrap().register(campaign.clone());
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "status": "registered",
+            "campaign": campaign,
+        })),
+    ))
+}
+
+async fn delete_campaign(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ManageScenarios)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not delete attack campaigns"));
+    }
+
+    if state.campaigns.write().unwrap().deregister(&id) {
+        Ok(Json(json!({
+            "status": "deleted",
+            "id": id,
+        })))
+    } else {
+        Err(ApiError::NotFound(format!("campaign not found: {id}")))
+    }
+}
+
 async fn list_campaigns(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -765,8 +1261,9 @@ async fn list_campaigns(
     if !role.can(asmodeus_common::Capability::ViewReports) {
         return Err(ApiError::Forbidden("role may not view campaigns"));
     }
+    let campaigns = state.campaigns.read().unwrap().list().to_vec();
     Ok(Json(json!({
-        "campaigns": state.campaigns.list(),
+        "campaigns": campaigns,
     })))
 }
 
@@ -791,6 +1288,8 @@ async fn run_campaign(
 
     let campaign = state
         .campaigns
+        .read()
+        .unwrap()
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("campaign not found: {id}")))?
         .clone();
@@ -902,6 +1401,112 @@ async fn run_campaign(
     };
 
     Ok(Json(json!(result)))
+}
+
+async fn list_schedules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not view schedules"));
+    }
+    let schedules = state.schedules.read().unwrap().list();
+    Ok(Json(json!({ "schedules": schedules })))
+}
+
+async fn create_schedule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateScheduleRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ManageScenarios)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not schedule exercises"));
+    }
+
+    if req.name.trim().is_empty() {
+        return Err(ApiError::Unprocessable(
+            "schedule name cannot be empty".into(),
+        ));
+    }
+    if req.interval_sec < 5 {
+        return Err(ApiError::Unprocessable(
+            "interval must be at least 5 seconds".into(),
+        ));
+    }
+    if !state.catalog.ids().any(|id| id == req.scenario_id) {
+        return Err(ApiError::NotFound(format!(
+            "scenario not found: {}",
+            req.scenario_id
+        )));
+    }
+
+    let id = req.id.unwrap_or_else(|| {
+        format!(
+            "SCHED-{}",
+            req.name
+                .to_ascii_uppercase()
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+        )
+    });
+
+    let job = ScheduledJob {
+        id,
+        name: req.name,
+        scenario_id: req.scenario_id,
+        interval_sec: req.interval_sec,
+        role: if role == Role::DevSecOps || role == Role::Admin {
+            Role::RedTeam
+        } else {
+            role
+        },
+        target_override: req.target_override,
+        enabled: req.enabled.unwrap_or(true),
+        created_at_utc: asmodeus_telemetry::current_utc_iso8601(),
+        last_run_utc: None,
+        last_run_epoch_secs: None,
+        last_status: None,
+        last_mttd_ms: None,
+        baseline_mttd_ms: req.baseline_mttd_ms,
+        drift_detected: false,
+        drift_factor: None,
+    };
+
+    state.schedules.write().unwrap().register(job.clone());
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "status": "created", "schedule": job })),
+    ))
+}
+
+async fn delete_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ManageScenarios)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not delete schedules"));
+    }
+
+    if state.schedules.write().unwrap().deregister(&id) {
+        Ok(Json(json!({ "status": "deleted", "id": id })))
+    } else {
+        Err(ApiError::NotFound(format!("schedule not found: {id}")))
+    }
 }
 
 #[cfg(test)]
@@ -1750,6 +2355,501 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // 404 (target not found) — crucially NOT a dispatch attempt to the
         // static endpoint (which would surface as 502 BadGateway).
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn validate_manifest_endpoint_checks_inv0() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. Valid YAML manifest
+        let valid_yaml = r#"
+apiVersion: asmodeus.io/v1alpha1
+kind: AttackScenario
+metadata:
+  id: "CUSTOM-CANARY"
+  name: "Custom Canary Probe"
+  category: "red_team"
+  mitre_technique: "T1486"
+  severity: "high"
+spec:
+  target_scope:
+    type: "k8s_workload"
+    target_path: "/var/tmp/asmodeus-canary/canary.docx"
+  safety:
+    max_duration_sec: 45
+    cpu_limit_percent: 20
+    canary_directory_only: "/var/tmp/asmodeus-canary"
+  action:
+    nature: "synthetic"
+    type: "synthetic_canary_encrypt"
+    parameters:
+      file_count: 20
+  expected_outcome:
+    detector: "ferrum_ebpf"
+"#;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/validate")
+            .header("x-apex-role", "auditor")
+            .body(Body::from(valid_yaml))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["valid"], true);
+        assert_eq!(body["inv_0_compliant"], true);
+
+        // 2. Operational action violating INV-0 -> 422
+        let invalid_yaml = valid_yaml.replace("nature: \"synthetic\"", "nature: \"operational\"");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/validate")
+            .header("x-apex-role", "red_team")
+            .body(Body::from(invalid_yaml))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. Run scenario as Red Team
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let run: Value = serde_json::from_slice(&bytes).unwrap();
+        let run_id = run["run_id"].as_str().unwrap();
+
+        // 2. Auditor / CISO is forbidden from submitting feedback (403)
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/asmodeus/runs/{run_id}/feedback"))
+            .header("x-apex-role", "ciso")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "detected": true }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 3. SecOps (Blue Team) submits real detection and containment feedback
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/asmodeus/runs/{run_id}/feedback"))
+            .header("x-apex-role", "secops")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "detected": true,
+                    "mttd_ms": 115,
+                    "detection_source": "ferrum_ebpf_kernel_probe",
+                    "contained": true,
+                    "mttr_ms": 210,
+                    "containment_action": "SIGKILL via Ferrum Policy"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let feedback_resp: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(feedback_resp["status"], "UPDATED");
+        assert_eq!(feedback_resp["run_status"], "CONTAINED");
+        assert_eq!(feedback_resp["measurements"]["mttd_ms"], 115);
+        assert_eq!(feedback_resp["measurements"]["mttr_ms"], 210);
+
+        // 4. Verify updated record cryptographic signature
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/asmodeus/runs/{run_id}/verify"))
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let verify_res: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(verify_res["verified"], true);
+
+        // 5. Check run report in JSON and Markdown formats
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/asmodeus/runs/{run_id}/report"))
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/v1/asmodeus/runs/{run_id}/report?format=markdown"
+            ))
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let md_report = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(md_report.contains("Отчёт по Прогону Учений"));
+        assert!(md_report.contains("115 мс"));
+
+        // 6. Check overall resilience report in JSON and Markdown
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/reports/resilience?format=markdown")
+            .header("x-apex-role", "ciso")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let md_resilience = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(md_resilience.contains("ASMODEUS — Отчёт об Устойчивости Инфраструктуры"));
+        assert!(md_resilience.contains("NIST CSF 2.0"));
+    }
+
+    #[tokio::test]
+    async fn openapi_endpoint_returns_valid_spec() {
+        let app = router(AppState::new(Catalog::seeded()));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/openapi.json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let spec: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert_eq!(spec["info"]["title"], "Asmodeus Control Plane API");
+        assert!(spec["paths"]["/api/v1/asmodeus/campaigns"].is_object());
+    }
+
+    #[tokio::test]
+    async fn audit_export_json_and_jsonl() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. Run a scenario to generate audit record
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 2. Export JSONL as auditor
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/audit/export?format=jsonl")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let jsonl = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(jsonl.lines().count() >= 1);
+        assert!(jsonl.contains("RANSOMWARE_CANARY_SPIKE"));
+
+        // 3. Export JSON as CISO
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/audit/export?format=json")
+            .header("x-apex-role", "ciso")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json_arr: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!json_arr.as_array().unwrap().is_empty());
+
+        // 4. Missing role -> 401
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/audit/export")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn campaigns_dynamic_crud_and_rbac() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        let custom_campaign = json!({
+            "id": "CAMP-DYNAMIC-001",
+            "name": "Dynamic APT Playbook",
+            "description": "Dynamic testing campaign",
+            "steps": [
+                { "order": 1, "scenario_id": "CREDENTIAL_ACCESS_CANARY" }
+            ]
+        });
+
+        // 1. Auditor cannot register campaign -> 403
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/campaigns")
+            .header("x-apex-role", "auditor")
+            .header("content-type", "application/json")
+            .body(Body::from(custom_campaign.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 2. RedTeam registers campaign -> 201 Created
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/campaigns")
+            .header("x-apex-role", "red_team")
+            .header("content-type", "application/json")
+            .body(Body::from(custom_campaign.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // 3. List campaigns shows the new campaign
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/campaigns")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let list: Value = serde_json::from_slice(&bytes).unwrap();
+        let camps = list["campaigns"].as_array().unwrap();
+        assert!(camps.iter().any(|c| c["id"] == "CAMP-DYNAMIC-001"));
+
+        // 4. CISO cannot delete campaign -> 403
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/campaigns/CAMP-DYNAMIC-001")
+            .header("x-apex-role", "ciso")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 5. Admin deletes campaign -> 200 OK
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/campaigns/CAMP-DYNAMIC-001")
+            .header("x-apex-role", "admin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 6. Delete again -> 404
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/campaigns/CAMP-DYNAMIC-001")
+            .header("x-apex-role", "admin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audit_export_clickhouse_formats() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // Run scenario to generate audit record
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Export ClickHouse SQL
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/audit/export?format=clickhouse_sql")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/sql; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let sql = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(sql.contains("INSERT INTO apex.asmodeus_runs"));
+        assert!(sql.contains("RANSOMWARE_CANARY_SPIKE"));
+
+        // Export ClickHouse NDJSON
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/audit/export?format=clickhouse_ndjson")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-ndjson; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let ndjson = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(ndjson.contains("RANSOMWARE_CANARY_SPIKE"));
+    }
+
+    #[tokio::test]
+    async fn compliance_report_json_and_markdown() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // Run scenario to seed some audit data
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+            .header("x-apex-role", "red_team")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 1. JSON report
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/reports/compliance")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(report["total_controls"].as_u64().unwrap() >= 6);
+        assert!(report["controls"].as_array().unwrap().len() >= 6);
+
+        // 2. Markdown report
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/reports/compliance?format=markdown")
+            .header("x-apex-role", "ciso")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/markdown; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let md = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(md.contains("NIST CSF 2.0 / PCI-DSS v4.0"));
+        assert!(md.contains("DE.CM-01"));
+
+        // 3. Missing role -> 401
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/reports/compliance")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn schedules_crud_and_rbac() {
+        let app = router(AppState::new(Catalog::seeded()));
+
+        // 1. List seeded schedules as auditor
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/asmodeus/schedules")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let list: Value = serde_json::from_slice(&bytes).unwrap();
+        let scheds = list["schedules"].as_array().unwrap();
+        assert!(scheds.iter().any(|s| s["id"] == "SCHED-BASE-RANSOMWARE"));
+
+        // 2. SecOps forbidden from creating schedule -> 403
+        let new_sched = json!({
+            "id": "SCHED-TEST-001",
+            "name": "Test Schedule",
+            "scenario_id": "RANSOMWARE_CANARY_SPIKE",
+            "interval_sec": 60
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/schedules")
+            .header("x-apex-role", "secops")
+            .header("content-type", "application/json")
+            .body(Body::from(new_sched.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 3. RedTeam creates schedule -> 201 Created
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/schedules")
+            .header("x-apex-role", "red_team")
+            .header("content-type", "application/json")
+            .body(Body::from(new_sched.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // 4. Auditor deletes schedule -> 403
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 5. Admin deletes schedule -> 200 OK
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
+            .header("x-apex-role", "admin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 6. Delete again -> 404
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
+            .header("x-apex-role", "admin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

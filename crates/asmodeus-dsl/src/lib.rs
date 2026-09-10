@@ -6,8 +6,10 @@
 //! a manifest whose action is operational/weaponizable is rejected here, before
 //! it can ever reach a runner.
 
+pub mod manifest;
 pub mod mitre;
 
+pub use manifest::*;
 pub use mitre::{lookup_technique, MitreTechnique, ALL_TECHNIQUES};
 
 use asmodeus_common::{ActionNature, RunState};
@@ -22,7 +24,10 @@ pub fn path_in_scope(path: &str) -> bool {
     if path.split('/').any(|component| component == "..") {
         return false;
     }
-    CANARY_PREFIXES.iter().any(|p| path.starts_with(p))
+    let trimmed = path.trim_end_matches('/');
+    trimmed == "/var/tmp/asmodeus-canary"
+        || trimmed == "/tmp/asmodeus-canary"
+        || CANARY_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
 /// Network blast radius: the only address blocks a chaos action may perturb.
