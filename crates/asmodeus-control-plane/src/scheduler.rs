@@ -39,7 +39,7 @@ pub struct ScheduledJob {
     /// Bounded, time-ordered outcome timeline (oldest first). Empty on
     /// deserialization of legacy state.
     #[serde(default)]
-    pub run_history: Vec<ScheduledRunSample>,
+    pub run_history: VecDeque<ScheduledRunSample>,
 }
 
 /// One recorded outcome of a scheduled run — the observable evidence of
@@ -53,7 +53,7 @@ pub struct ScheduledRunSample {
     pub drift_factor: Option<f32>,
 }
 
-/// A persisted detection-drift alert: baseline MTTD was exceeded by at least
+/// A retained detection-drift alert: baseline MTTD was exceeded by at least
 /// [`DRIFT_THRESHOLD`], signalling that the Blue Team's detection capability
 /// for this scenario has regressed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -123,7 +123,7 @@ impl ScheduleCatalog {
             baseline_mttd_ms: Some(200),
             drift_detected: false,
             drift_factor: None,
-            run_history: Vec::new(),
+            run_history: VecDeque::new(),
         });
 
         cat.register(ScheduledJob {
@@ -142,7 +142,7 @@ impl ScheduleCatalog {
             baseline_mttd_ms: Some(150),
             drift_detected: false,
             drift_factor: None,
-            run_history: Vec::new(),
+            run_history: VecDeque::new(),
         });
 
         cat
@@ -185,7 +185,9 @@ impl ScheduleCatalog {
     }
 
     /// Record outcome of a scheduled run and evaluate MTTD drift. Appends a
-    /// bounded history sample and, on drift, a persisted [`DriftAlert`].
+    /// bounded history sample and emits a retained [`DriftAlert`] only when
+    /// the job enters the degraded state. The returned bool is true only for
+    /// that healthy -> degraded transition.
     pub fn record_outcome(
         &mut self,
         id: &str,
@@ -196,8 +198,9 @@ impl ScheduleCatalog {
     ) -> Option<bool> {
         // Mutate the job under a scoped borrow so the alert push below can take
         // a second &mut on `self` (the alert ring is a sibling field).
-        let (scenario_id, baseline_mttd_ms, drift_detected, drift_factor) = {
+        let (scenario_id, baseline_mttd_ms, drift_detected, drift_factor, was_drifting) = {
             let job = self.jobs.get_mut(id)?;
+            let was_drifting = job.drift_detected;
             job.last_run_utc = Some(timestamp_utc.to_string());
             job.last_run_epoch_secs = Some(epoch_secs);
             job.last_status = Some(status.to_string());
@@ -208,6 +211,8 @@ impl ScheduleCatalog {
             }
 
             let mut factor = None;
+            job.drift_detected = false;
+            job.drift_factor = None;
             if let Some(base) = job.baseline_mttd_ms {
                 if base > 0 {
                     let f = (mttd_ms as f32) / (base as f32);
@@ -217,16 +222,15 @@ impl ScheduleCatalog {
                 }
             }
 
-            job.run_history.push(ScheduledRunSample {
+            job.run_history.push_back(ScheduledRunSample {
                 timestamp_utc: timestamp_utc.to_string(),
                 status: status.to_string(),
                 mttd_ms,
                 drift_detected: job.drift_detected,
                 drift_factor: factor,
             });
-            if job.run_history.len() > MAX_HISTORY_PER_JOB {
-                let overflow = job.run_history.len() - MAX_HISTORY_PER_JOB;
-                job.run_history.drain(0..overflow);
+            while job.run_history.len() > MAX_HISTORY_PER_JOB {
+                job.run_history.pop_front();
             }
 
             (
@@ -234,10 +238,15 @@ impl ScheduleCatalog {
                 job.baseline_mttd_ms,
                 job.drift_detected,
                 factor,
+                was_drifting,
             )
         };
 
-        if drift_detected {
+        // Emit one alert when the job ENTERS a degraded state. Repeated
+        // degraded samples update the timeline but do not create an alert
+        // storm. Once a healthy sample clears drift_detected, a later
+        // regression is a new transition and emits a fresh alert.
+        if drift_detected && !was_drifting {
             self.alert_seq += 1;
             self.alerts.push_back(DriftAlert {
                 seq: self.alert_seq,
@@ -253,7 +262,7 @@ impl ScheduleCatalog {
             }
         }
 
-        Some(drift_detected)
+        Some(drift_detected && !was_drifting)
     }
 }
 
@@ -386,7 +395,7 @@ mod tests {
             baseline_mttd_ms: Some(100),
             drift_detected: false,
             drift_factor: None,
-            run_history: Vec::new(),
+            run_history: VecDeque::new(),
         };
 
         cat.register(job);
@@ -441,7 +450,7 @@ mod tests {
             baseline_mttd_ms: Some(baseline),
             drift_detected: false,
             drift_factor: None,
-            run_history: Vec::new(),
+            run_history: VecDeque::new(),
         }
     }
 
@@ -459,13 +468,48 @@ mod tests {
         assert!(!job.run_history[0].drift_detected);
         assert!(job.run_history[1].drift_detected);
 
-        // Only the degraded run produces a persisted, queryable alert.
+        // Only the transition into degradation produces a retained, queryable alert.
         let alerts = cat.alerts();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].job_id, "SCHED-H");
         assert_eq!(alerts[0].observed_mttd_ms, 180);
         assert_eq!(alerts[0].baseline_mttd_ms, Some(100));
         assert!((alerts[0].drift_factor - 1.8).abs() < 0.001);
+    }
+
+
+    #[test]
+    fn drift_alert_emits_on_transition_not_every_sample() {
+        let mut cat = ScheduleCatalog::new();
+        cat.register(seeded_job("SCHED-EDGE", 100));
+
+        // Enter drift: one alert.
+        assert_eq!(
+            cat.record_outcome("SCHED-EDGE", "COMPLETED", 180, "2026-09-09T22:01:00Z", 1000),
+            Some(true)
+        );
+        assert_eq!(cat.alerts().len(), 1);
+
+        // Stay degraded: timeline grows, alert count stays flat.
+        assert_eq!(
+            cat.record_outcome("SCHED-EDGE", "COMPLETED", 190, "2026-09-09T22:02:00Z", 2000),
+            Some(false)
+        );
+        assert_eq!(cat.alerts().len(), 1);
+        assert_eq!(cat.get("SCHED-EDGE").unwrap().run_history.len(), 2);
+
+        // Recover, then regress again: a new transition creates a new alert.
+        assert_eq!(
+            cat.record_outcome("SCHED-EDGE", "COMPLETED", 120, "2026-09-09T22:03:00Z", 3000),
+            Some(false)
+        );
+        assert_eq!(
+            cat.record_outcome("SCHED-EDGE", "COMPLETED", 170, "2026-09-09T22:04:00Z", 4000),
+            Some(true)
+        );
+        let alerts = cat.alerts();
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts[0].seq > alerts[1].seq);
     }
 
     #[test]
@@ -489,16 +533,33 @@ mod tests {
     fn alerts_newest_first_and_bounded() {
         let mut cat = ScheduleCatalog::new();
         cat.register(seeded_job("SCHED-A", 100));
-        // Every run drifts (300 vs 100 baseline), so each pushes an alert.
+
+        // Generate more than MAX_ALERTS distinct healthy -> drift transitions.
+        // Staying degraded does not create duplicate alerts.
         for i in 0..(MAX_ALERTS + 5) {
-            cat.record_outcome(
-                "SCHED-A",
-                "COMPLETED",
-                300,
-                "2026-09-09T22:00:00Z",
-                i as u64,
+            let base_epoch = (i as u64) * 2;
+            assert_eq!(
+                cat.record_outcome(
+                    "SCHED-A",
+                    "COMPLETED",
+                    100,
+                    "2026-09-09T22:00:00Z",
+                    base_epoch,
+                ),
+                Some(false)
+            );
+            assert_eq!(
+                cat.record_outcome(
+                    "SCHED-A",
+                    "COMPLETED",
+                    300,
+                    "2026-09-09T22:00:01Z",
+                    base_epoch + 1,
+                ),
+                Some(true)
             );
         }
+
         let alerts = cat.alerts();
         assert_eq!(alerts.len(), MAX_ALERTS);
         // Newest first: the most recent seq comes out on top.
