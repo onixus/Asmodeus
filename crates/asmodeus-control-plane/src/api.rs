@@ -18,6 +18,24 @@ pub(crate) enum ApiError {
     BadGateway(String),
 }
 
+impl From<crate::execution::ExecutionError> for ApiError {
+    fn from(error: crate::execution::ExecutionError) -> Self {
+        let message = error.to_string();
+        match error {
+            crate::execution::ExecutionError::InvalidSignature
+            | crate::execution::ExecutionError::RunnerRejected(_)
+            | crate::execution::ExecutionError::EngineRejected(_) => {
+                ApiError::Unprocessable(message)
+            }
+            crate::execution::ExecutionError::TargetNotFound(_) => ApiError::NotFound(message),
+            crate::execution::ExecutionError::Dispatch(_) => ApiError::BadGateway(message),
+            crate::execution::ExecutionError::RunnerIncomplete(_)
+            | crate::execution::ExecutionError::EngineTransition(_)
+            | crate::execution::ExecutionError::AuditSigning(_) => ApiError::Internal(message),
+        }
+    }
+}
+
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
