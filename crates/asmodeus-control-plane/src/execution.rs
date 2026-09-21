@@ -10,7 +10,8 @@ use asmodeus_telemetry::{AuditRecord, Measurements};
 use serde_json::{json, Value};
 
 use crate::engine::{self, EngineError};
-use crate::http::{ApiError, AppState};
+use crate::api::ApiError;
+use crate::state::AppState;
 
 pub(crate) async fn execute_single_scenario(
     state: &AppState,

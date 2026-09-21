@@ -259,7 +259,7 @@ impl ScheduleCatalog {
 
 /// Spawn a background task periodically checking and executing scheduled BAS jobs.
 pub fn spawn_scheduler(
-    state: crate::http::AppState,
+    state: crate::state::AppState,
     poll_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
