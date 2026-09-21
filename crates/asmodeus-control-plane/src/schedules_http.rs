@@ -89,7 +89,7 @@ pub(crate) async fn create_schedule(
         baseline_mttd_ms: req.baseline_mttd_ms,
         drift_detected: false,
         drift_factor: None,
-        run_history: Vec::new(),
+        run_history: Default::default(),
     };
 
     state.schedules.write().unwrap().register(job.clone());
