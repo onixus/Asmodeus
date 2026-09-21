@@ -21,6 +21,7 @@ mod openapi;
 mod registry;
 mod reporting;
 mod runner_http;
+mod runs_http;
 mod scheduler;
 mod schedules_http;
 mod state;
