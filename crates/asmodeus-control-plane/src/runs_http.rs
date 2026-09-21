@@ -161,7 +161,7 @@ pub(crate) async fn run_feedback(
         .sign(&state.signing_key)
         .map_err(|e| ApiError::Internal(format!("audit re-signing: {e}")))?;
 
-    state.audit.update(&id, signed.clone());
+    state.audit.update(&id, signed.clone()).await;
 
     state
         .metrics
