@@ -186,7 +186,7 @@ pub(crate) async fn execute_single_scenario(
         .sign(&state.signing_key)
         .map_err(|e| ExecutionError::AuditSigning(e.to_string()))?;
 
-    state.audit.append(signed_record.clone());
+    state.audit.append(signed_record.clone()).await;
 
     state.webhook.dispatch(
         crate::webhook::WebhookPayload {

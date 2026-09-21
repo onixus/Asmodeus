@@ -54,23 +54,39 @@ impl AuditStore {
         self.trail.read().unwrap().len()
     }
 
-    pub fn append(&self, record: AuditRecord) {
+    pub async fn append(&self, record: AuditRecord) {
         self.trail.write().unwrap().append(record.clone());
-        if let Some(path) = self.path.as_ref() {
-            if let Err(err) = AuditTrail::append_to_file(&record, path) {
+
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let persist_path = path.clone();
+        match tokio::task::spawn_blocking(move || {
+            AuditTrail::append_to_file(&record, &persist_path)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
                 tracing::warn!(
                     error = %err,
                     path = %path.display(),
                     "failed to persist audit record"
                 );
             }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "audit append persistence task failed"
+                );
+            }
         }
     }
 
-    pub fn update(&self, run_id: &str, record: AuditRecord) -> bool {
+    pub async fn update(&self, run_id: &str, record: AuditRecord) -> bool {
         let updated = self.trail.write().unwrap().update(run_id, record);
         if updated {
-            self.persist_snapshot();
+            self.persist_snapshot().await;
         }
         updated
     }
@@ -91,16 +107,27 @@ impl AuditStore {
         self.trail.read().unwrap().export_clickhouse_ndjson()
     }
 
-    fn persist_snapshot(&self) {
-        let Some(path) = self.path.as_ref() else {
+    async fn persist_snapshot(&self) {
+        let Some(path) = self.path.clone() else {
             return;
         };
-        if let Err(err) = self.trail.read().unwrap().save_to_file(path) {
-            tracing::warn!(
-                error = %err,
-                path = %path.display(),
-                "failed to persist audit trail snapshot"
-            );
+        let snapshot = self.trail.read().unwrap().clone();
+        let persist_path = path.clone();
+        match tokio::task::spawn_blocking(move || snapshot.save_to_file(&persist_path)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to persist audit trail snapshot"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "audit snapshot persistence task failed"
+                );
+            }
         }
     }
 }
