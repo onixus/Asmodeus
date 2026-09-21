@@ -53,6 +53,11 @@ pub(crate) async fn create_schedule(
             "interval must be at least 5 seconds".into(),
         ));
     }
+    if req.baseline_mttd_ms == Some(0) {
+        return Err(ApiError::Unprocessable(
+            "baseline_mttd_ms must be greater than zero".into(),
+        ));
+    }
     if !state.catalog.ids().any(|id| id == req.scenario_id) {
         return Err(ApiError::NotFound(format!(
             "scenario not found: {}",

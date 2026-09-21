@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 const DEFAULT_LISTEN: &str = "127.0.0.1:8842";
 const DEFAULT_WATCHDOG_INTERVAL_SEC: u64 = 30;
 const DEFAULT_SCHEDULER_INTERVAL_SEC: u64 = 30;
+const MIN_SCHEDULER_INTERVAL_SEC: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneConfig {
@@ -24,6 +25,12 @@ pub enum ConfigError {
     InvalidInterval { name: &'static str, value: String },
     #[error("{name} must be greater than zero")]
     ZeroInterval { name: &'static str },
+    #[error("{name} must be at least {min} seconds, got: {value}")]
+    IntervalTooSmall {
+        name: &'static str,
+        min: u64,
+        value: u64,
+    },
 }
 
 impl ControlPlaneConfig {
@@ -44,11 +51,13 @@ impl ControlPlaneConfig {
             "ASMODEUS_WATCHDOG_INTERVAL_SEC",
             lookup("ASMODEUS_WATCHDOG_INTERVAL_SEC"),
             DEFAULT_WATCHDOG_INTERVAL_SEC,
+            1,
         )?;
         let scheduler_interval_sec = parse_interval(
             "ASMODEUS_SCHEDULER_INTERVAL_SEC",
             lookup("ASMODEUS_SCHEDULER_INTERVAL_SEC"),
             DEFAULT_SCHEDULER_INTERVAL_SEC,
+            MIN_SCHEDULER_INTERVAL_SEC,
         )?;
 
         Ok(Self {
@@ -63,6 +72,7 @@ fn parse_interval(
     name: &'static str,
     raw: Option<String>,
     default: u64,
+    min: u64,
 ) -> Result<u64, ConfigError> {
     let Some(value) = raw else {
         return Ok(default);
@@ -75,6 +85,13 @@ fn parse_interval(
         })?;
     if parsed == 0 {
         return Err(ConfigError::ZeroInterval { name });
+    }
+    if parsed < min {
+        return Err(ConfigError::IntervalTooSmall {
+            name,
+            min,
+            value: parsed,
+        });
     }
     Ok(parsed)
 }
@@ -107,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_and_malformed_intervals() {
+    fn rejects_zero_malformed_and_too_small_intervals() {
         let zero = ControlPlaneConfig::from_lookup(|name| {
             (name == "ASMODEUS_WATCHDOG_INTERVAL_SEC").then(|| "0".into())
         })
@@ -128,6 +145,19 @@ mod tests {
             ConfigError::InvalidInterval {
                 name: "ASMODEUS_SCHEDULER_INTERVAL_SEC",
                 value: "fast".into()
+            }
+        );
+
+        let too_small = ControlPlaneConfig::from_lookup(|name| {
+            (name == "ASMODEUS_SCHEDULER_INTERVAL_SEC").then(|| "4".into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            too_small,
+            ConfigError::IntervalTooSmall {
+                name: "ASMODEUS_SCHEDULER_INTERVAL_SEC",
+                min: MIN_SCHEDULER_INTERVAL_SEC,
+                value: 4,
             }
         );
     }
