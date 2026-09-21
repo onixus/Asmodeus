@@ -150,6 +150,34 @@ enum SchedulesAction {
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
     },
+    /// Show one schedule's detail and its MTTD drift history timeline.
+    Get {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// List persisted detection-drift alerts (MTTD regression), newest first.
+    Alerts {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Enable or disable a scheduled baseline without deleting it.
+    Toggle {
+        #[arg(long)]
+        id: String,
+        /// Set enabled=true; omit for enabled=false.
+        #[arg(long)]
+        enable: bool,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
     /// Deregister a scheduled BAS baseline exercise by ID.
     Delete {
         #[arg(long)]
@@ -491,6 +519,38 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             "baseline_mttd_ms": baseline_mttd,
                         })),
                     "schedules add",
+                )?;
+            }
+            SchedulesAction::Get { id, role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/schedules/{id}");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "schedules get",
+                )?;
+            }
+            SchedulesAction::Alerts { role, url } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/schedules/alerts");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client.get(&endpoint).header("X-Apex-Role", &role),
+                    "schedules alerts",
+                )?;
+            }
+            SchedulesAction::Toggle {
+                id,
+                enable,
+                role,
+                url,
+            } => {
+                let endpoint = format!("{url}/api/v1/asmodeus/schedules/{id}");
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client
+                        .patch(&endpoint)
+                        .header("X-Apex-Role", &role)
+                        .json(&json!({ "enabled": enable })),
+                    "schedules toggle",
                 )?;
             }
             SchedulesAction::Delete { id, role, url } => {
@@ -900,6 +960,34 @@ mod tests {
                 assert_eq!(scenario, "SCN-RT-001");
                 assert_eq!(interval, 300);
                 assert_eq!(baseline_mttd, Some(180));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from(["asmodeus", "schedules", "alerts"])
+            .expect("parse schedules alerts");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Schedules {
+                action: SchedulesAction::Alerts { .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "schedules",
+            "toggle",
+            "--id",
+            "SCHED-BASE-RANSOMWARE",
+            "--enable",
+        ])
+        .expect("parse schedules toggle");
+        match cli.cmd {
+            Cmd::Schedules {
+                action: SchedulesAction::Toggle { id, enable, .. },
+            } => {
+                assert_eq!(id, "SCHED-BASE-RANSOMWARE");
+                assert!(enable);
             }
             _ => panic!("unexpected command"),
         }

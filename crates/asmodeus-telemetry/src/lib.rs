@@ -50,6 +50,18 @@ impl Aggregate {
         self.sum_mttr_ms += m.mttr_ms;
     }
 
+    /// Rebuild a rolling aggregate from persisted audit records. Called at
+    /// startup so `/metrics`, `/telemetry/mttd` and the resilience report
+    /// reflect history loaded from `ASMODEUS_AUDIT_LOG` instead of resetting to
+    /// zero on every restart.
+    pub fn from_records(records: &[audit::AuditRecord]) -> Self {
+        let mut agg = Aggregate::default();
+        for r in records {
+            agg.record(r.measurements);
+        }
+        agg
+    }
+
     /// Update an existing measurement (e.g. from closed-loop feedback).
     pub fn update_measurement(&mut self, old: Measurements, new: Measurements) {
         if old.blue_team_detected != new.blue_team_detected {
@@ -148,6 +160,54 @@ mod tests {
         assert_eq!(agg.mean_mttd_ms(), 200);
         assert_eq!(agg.mean_mttr_ms(), 300);
         assert_eq!(agg.detection_rate_pct(), 50.0);
+    }
+
+    #[test]
+    fn from_records_rebuilds_aggregate() {
+        // A restart must not lose metrics: rebuilding from the persisted audit
+        // trail reproduces the same means and detection rate as live recording.
+        let mut live = Aggregate::default();
+        let mut trail = crate::AuditTrail::new();
+        for (mttd, mttr, detected) in [(100, 200, true), (300, 400, false)] {
+            let m = Measurements {
+                mttd_ms: mttd,
+                mttr_ms: mttr,
+                blue_team_detected: detected,
+            };
+            live.record(m);
+            let mut rec = sample_record();
+            rec.measurements = m;
+            trail.append(rec);
+        }
+        let rebuilt = Aggregate::from_records(trail.records());
+        assert_eq!(rebuilt.scenarios_executed, live.scenarios_executed);
+        assert_eq!(rebuilt.detected, live.detected);
+        assert_eq!(rebuilt.mean_mttd_ms(), live.mean_mttd_ms());
+        assert_eq!(rebuilt.mean_mttr_ms(), live.mean_mttr_ms());
+        assert_eq!(rebuilt.detection_rate_pct(), live.detection_rate_pct());
+    }
+
+    fn sample_record() -> crate::AuditRecord {
+        crate::AuditRecord {
+            run_id: "run_test".into(),
+            scenario_id: "SCN-RT-001".into(),
+            scenario_name: "Test".into(),
+            category: "red_team".into(),
+            mitre_technique: "T1486".into(),
+            mitre_tactic: "Impact".into(),
+            severity: "high".into(),
+            tag: "🔴 [RED TEAM EXERCISE]".into(),
+            initiator: "red_team".into(),
+            runner_id: "default-runner".into(),
+            status: "CONTAINED".into(),
+            measurements: Measurements::default(),
+            detection_source: String::new(),
+            containment_action: String::new(),
+            cleanup_status: "CLEAN".into(),
+            timestamp_utc: "2026-09-18T00:00:00Z".into(),
+            signature_hex: String::new(),
+            public_key_hex: String::new(),
+        }
     }
 
     #[test]

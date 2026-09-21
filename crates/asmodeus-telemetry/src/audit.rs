@@ -137,6 +137,12 @@ impl AuditTrail {
         self.records.iter().find(|r| r.run_id == run_id)
     }
 
+    /// Borrow the full journal in insertion order. Used at startup to rebuild
+    /// derived aggregates (e.g. the Prometheus `Aggregate`) from persisted state.
+    pub fn records(&self) -> &[AuditRecord] {
+        &self.records
+    }
+
     /// Update an existing audit record (e.g. following closed-loop blue team feedback).
     pub fn update(&mut self, run_id: &str, updated: AuditRecord) -> bool {
         if let Some(pos) = self.records.iter().position(|r| r.run_id == run_id) {
