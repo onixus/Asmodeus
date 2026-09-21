@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use asmodeus_common::{RunId, RunState};
-use asmodeus_telemetry::{Aggregate, AuditTrail};
+use asmodeus_telemetry::Aggregate;
 
+use crate::audit_store::AuditStore;
 use crate::campaign::CampaignCatalog;
 use crate::catalog::Catalog;
 use crate::registry::RunnerRegistry;
@@ -27,12 +28,11 @@ pub struct AppState {
     /// otherwise the in-process engine simulates the run.
     pub runner_endpoint: Option<String>,
     pub registry: RunnerRegistry,
-    pub audit_trail: Arc<std::sync::RwLock<AuditTrail>>,
     pub campaigns: Arc<std::sync::RwLock<CampaignCatalog>>,
     pub schedules: Arc<std::sync::RwLock<ScheduleCatalog>>,
     pub webhook: Arc<WebhookDispatcher>,
     pub signing_key: [u8; 64],
-    pub audit_file_path: Option<std::path::PathBuf>,
+    pub audit: AuditStore,
 }
 
 impl AppState {
@@ -76,17 +76,14 @@ impl AppState {
         } else {
             asmodeus_crypto::generate_keypair().1
         };
-        let audit_file_path = std::env::var("ASMODEUS_AUDIT_LOG")
+        let audit_path = std::env::var("ASMODEUS_AUDIT_LOG")
             .ok()
             .map(std::path::PathBuf::from);
-        let audit_trail = if let Some(ref path) = audit_file_path {
-            AuditTrail::load_from_file(path).unwrap_or_else(|_| AuditTrail::new())
-        } else {
-            AuditTrail::new()
-        };
+        let audit = AuditStore::load(audit_path);
         // Rebuild rolling detection metrics from the persisted audit trail so
         // reports and /metrics survive a restart instead of resetting to zero.
-        let metrics = Aggregate::from_records(audit_trail.records());
+        let restored_records = audit.records();
+        let metrics = Aggregate::from_records(&restored_records);
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
@@ -94,12 +91,11 @@ impl AppState {
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint,
             registry,
-            audit_trail: Arc::new(std::sync::RwLock::new(audit_trail)),
             campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
             schedules: Arc::new(std::sync::RwLock::new(ScheduleCatalog::seeded())),
             webhook: Arc::new(WebhookDispatcher::from_env()),
             signing_key,
-            audit_file_path,
+            audit,
         }
     }
 

@@ -28,8 +28,7 @@ pub(crate) async fn get_resilience_report(
         return Err(ApiError::Forbidden("role may not view resilience reports"));
     }
 
-    let trail = state.audit_trail.read().unwrap();
-    let records = trail.list(None, None, None);
+    let records = state.audit.list(None, None, None);
     let agg = state.metrics.lock().unwrap().clone();
     let report = EcosystemResilienceReport::build(&records, &agg);
 
@@ -55,8 +54,7 @@ pub(crate) async fn get_compliance_report(
         return Err(ApiError::Forbidden("role may not view compliance reports"));
     }
 
-    let trail = state.audit_trail.read().unwrap();
-    let records = trail.list(None, None, None);
+    let records = state.audit.list(None, None, None);
     let scenario_metas: Vec<asmodeus_telemetry::ScenarioMeta> = state
         .catalog
         .ids()
@@ -93,12 +91,12 @@ pub(crate) async fn get_run_report(
         return Err(ApiError::Forbidden("role may not view run reports"));
     }
 
-    let trail = state.audit_trail.read().unwrap();
-    let record = trail
+    let record = state
+        .audit
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
 
-    let run_report = SingleRunReport::build(record, Some(state.catalog.public_key()));
+    let run_report = SingleRunReport::build(&record, Some(state.catalog.public_key()));
 
     if query.format.as_deref() == Some("markdown") {
         Ok((
@@ -127,7 +125,6 @@ pub(crate) async fn export_audit_trail(
         return Err(ApiError::Forbidden("role may not view audit trail"));
     }
 
-    let trail = state.audit_trail.read().unwrap();
     let fmt = params
         .format
         .as_deref()
@@ -136,7 +133,7 @@ pub(crate) async fn export_audit_trail(
 
     match fmt.as_str() {
         "json" => {
-            let json_body = trail
+            let json_body = state.audit
                 .export_json()
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             Ok((
@@ -147,7 +144,7 @@ pub(crate) async fn export_audit_trail(
                 .into_response())
         }
         "clickhouse" | "clickhouse_sql" | "sql" => {
-            let sql_body = trail.export_clickhouse_sql();
+            let sql_body = state.audit.export_clickhouse_sql();
             Ok((
                 StatusCode::OK,
                 [("content-type", "application/sql; charset=utf-8")],
@@ -156,7 +153,7 @@ pub(crate) async fn export_audit_trail(
                 .into_response())
         }
         "clickhouse_ndjson" => {
-            let ndjson_body = trail
+            let ndjson_body = state.audit
                 .export_clickhouse_ndjson()
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             Ok((
@@ -167,7 +164,7 @@ pub(crate) async fn export_audit_trail(
                 .into_response())
         }
         _ => {
-            let jsonl_body = trail.export_jsonl();
+            let jsonl_body = state.audit.export_jsonl();
             Ok((
                 StatusCode::OK,
                 [("content-type", "application/x-ndjson; charset=utf-8")],

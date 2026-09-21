@@ -29,14 +29,13 @@ pub(crate) async fn list_runs(
     if !role.can(asmodeus_common::Capability::ViewReports) {
         return Err(ApiError::Forbidden("role may not view run history"));
     }
-    let trail = state.audit_trail.read().unwrap();
-    let records = trail.list(
+    let records = state.audit.list(
         query.limit,
         query.scenario_id.as_deref(),
         query.status.as_deref(),
     );
     Ok(Json(json!({
-        "total": trail.len(),
+        "total": state.audit.len(),
         "returned": records.len(),
         "runs": records,
     })))
@@ -51,8 +50,8 @@ pub(crate) async fn get_run(
     if !role.can(asmodeus_common::Capability::ViewReports) {
         return Err(ApiError::Forbidden("role may not view run details"));
     }
-    let trail = state.audit_trail.read().unwrap();
-    let record = trail
+    let record = state
+        .audit
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
     Ok(Json(json!(record)))
@@ -67,8 +66,8 @@ pub(crate) async fn verify_run(
     if !role.can(asmodeus_common::Capability::ViewReports) {
         return Err(ApiError::Forbidden("role may not verify runs"));
     }
-    let trail = state.audit_trail.read().unwrap();
-    let record = trail
+    let record = state
+        .audit
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
     // Pin verification to the control plane's trusted signing key rather than
@@ -113,11 +112,10 @@ pub(crate) async fn run_feedback(
     }
 
     let (old_record, updated_record) = {
-        let trail = state.audit_trail.read().unwrap();
-        let old = trail
+        let old = state
+            .audit
             .get(&id)
-            .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?
-            .clone();
+            .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
 
         let new_measurements = Measurements {
             mttd_ms: payload.mttd_ms.unwrap_or(old.measurements.mttd_ms),
@@ -163,16 +161,7 @@ pub(crate) async fn run_feedback(
         .sign(&state.signing_key)
         .map_err(|e| ApiError::Internal(format!("audit re-signing: {e}")))?;
 
-    state
-        .audit_trail
-        .write()
-        .unwrap()
-        .update(&id, signed.clone());
-
-    if let Some(ref path) = state.audit_file_path {
-        let trail = state.audit_trail.read().unwrap();
-        let _ = trail.save_to_file(path);
-    }
+    state.audit.update(&id, signed.clone());
 
     state
         .metrics

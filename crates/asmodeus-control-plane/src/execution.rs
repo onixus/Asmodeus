@@ -174,15 +174,7 @@ pub(crate) async fn execute_single_scenario(
         .sign(&state.signing_key)
         .map_err(|e| ApiError::Internal(format!("audit signing: {e}")))?;
 
-    state
-        .audit_trail
-        .write()
-        .unwrap()
-        .append(signed_record.clone());
-
-    if let Some(ref path) = state.audit_file_path {
-        let _ = AuditTrail::append_to_file(&signed_record, path);
-    }
+    state.audit.append(signed_record.clone());
 
     state.webhook.dispatch(
         crate::webhook::WebhookPayload {
