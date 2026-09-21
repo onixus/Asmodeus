@@ -8,21 +8,35 @@
 // nesting exceeds the default macro recursion limit.
 #![recursion_limit = "512"]
 
+mod api;
 mod campaign;
+mod campaign_http;
 mod catalog;
 mod dispatch;
+mod dto;
 mod engine;
+mod execution;
 pub(crate) mod http;
+#[cfg(test)]
+mod http_tests;
 mod openapi;
 mod registry;
+mod reporting;
+mod runner_http;
+mod runs_http;
 mod scheduler;
+mod schedules_http;
+mod scenario_http;
+mod state;
+mod system_http;
 mod watchdog;
 mod webhook;
 
 use std::net::SocketAddr;
 
 use catalog::Catalog;
-use http::{router, AppState};
+use http::router;
+use state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
