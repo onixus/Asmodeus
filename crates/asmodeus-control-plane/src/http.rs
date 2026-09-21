@@ -2,17 +2,10 @@
 //! enforced here from `asmodeus_common::rbac` — never delegated to the gateway
 //! (D5). Signature verification and the INV-0 gate run before any execution.
 
-use asmodeus_common::INV_0_SYNTHETIC_ONLY;
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
+    Router,
 };
-use serde_json::{json, Value};
-
-use crate::api::{caller_role, ApiError};
 use crate::campaign_http::{delete_campaign, list_campaigns, register_campaign, run_campaign};
 use crate::scenario_http::{
     abort_all, get_scenario, list_scenarios, mitre_matrix, run_scenario,
@@ -23,6 +16,7 @@ use crate::schedules_http::{
     toggle_schedule,
 };
 use crate::state::AppState;
+use crate::system_http::{healthz, metrics, openapi_spec, telemetry_mttd};
 use crate::runner_http::{deregister_runner, list_runners, ping_runner_handler, register_runner};
 use crate::runs_http::{get_run, list_runs, run_feedback, verify_run};
 use crate::reporting::{
@@ -86,50 +80,4 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_schedule),
         )
         .with_state(state)
-}
-
-// --- handlers -------------------------------------------------------------
-
-async fn healthz() -> Json<Value> {
-    Json(json!({ "status": "ok", "invariant": INV_0_SYNTHETIC_ONLY }))
-}
-
-/// Prometheus scrape endpoint (TT §4.3). Unauthenticated, like any exporter.
-async fn metrics(State(state): State<AppState>) -> Response {
-    let body = state.metrics.lock().unwrap().prometheus_text();
-    (
-        StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4")],
-        body,
-    )
-        .into_response()
-}
-
-async fn telemetry_mttd(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let role = caller_role(&headers)?;
-    if !role.can(asmodeus_common::Capability::ViewReports) {
-        return Err(ApiError::Forbidden("role may not view reports"));
-    }
-    let completed = state
-        .runs
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|s| s.is_terminal())
-        .count();
-    let agg = state.metrics.lock().unwrap();
-    Ok(Json(json!({
-        "runs_completed": completed,
-        "catalog_size": state.catalog.ids().count(),
-        "mean_mttd_ms": agg.mean_mttd_ms(),
-        "mean_mttr_ms": agg.mean_mttr_ms(),
-        "detection_rate_pct": agg.detection_rate_pct(),
-    })))
-}
-
-async fn openapi_spec() -> Json<Value> {
-    Json(crate::openapi::generate_spec())
 }
