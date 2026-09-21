@@ -9,6 +9,7 @@
 #![recursion_limit = "512"]
 
 mod api;
+mod audit_store;
 mod campaign;
 mod campaign_http;
 mod catalog;
