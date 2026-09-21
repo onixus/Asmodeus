@@ -6,7 +6,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Roles recognised by the system, carried in the `X-Apex-Role` header.
+/// Roles recognised by the system. At the HTTP boundary they come from a
+/// verified APEX v1 identity token; an unsigned role header is demo-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
