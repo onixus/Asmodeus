@@ -1309,7 +1309,25 @@ async fn schedules_crud_and_rbac() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // 3. RedTeam creates schedule -> 201 Created
+    // 3. Zero baseline is invalid: it would disable drift-factor computation.
+    let invalid_baseline = json!({
+        "id": "SCHED-BAD-BASELINE",
+        "name": "Invalid Baseline",
+        "scenario_id": "RANSOMWARE_CANARY_SPIKE",
+        "interval_sec": 60,
+        "baseline_mttd_ms": 0
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/asmodeus/schedules")
+        .header("x-apex-role", "red_team")
+        .header("content-type", "application/json")
+        .body(Body::from(invalid_baseline.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 4. RedTeam creates schedule -> 201 Created
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/schedules")
@@ -1320,7 +1338,7 @@ async fn schedules_crud_and_rbac() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // 4. Auditor deletes schedule -> 403
+    // 5. Auditor deletes schedule -> 403
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
@@ -1330,7 +1348,7 @@ async fn schedules_crud_and_rbac() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // 5. Admin deletes schedule -> 200 OK
+    // 6. Admin deletes schedule -> 200 OK
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
@@ -1340,7 +1358,7 @@ async fn schedules_crud_and_rbac() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 6. Delete again -> 404
+    // 7. Delete again -> 404
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
