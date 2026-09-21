@@ -41,7 +41,19 @@ pipeline {
     }
 
     stages {
-        // Первым: находка роняет билд за минуту, а не после полной сборки Rust.
+        stage('APEX contract') {
+            agent {
+                docker {
+                    image 'python:3.12-slim'
+                    reuseNode true
+                }
+            }
+            steps {
+                sh 'python apex-contract/validate.py'
+            }
+        }
+
+        // Первым из security-гейтов: находка роняет билд за минуту, а не после полной сборки Rust.
         // agent any — docker CLI живёт на ноде, а не внутри rust-образа.
         stage('SAST (semgrep)') {
             agent any
