@@ -17,6 +17,7 @@ mod execution;
 pub(crate) mod http;
 mod openapi;
 mod registry;
+mod reporting;
 mod scheduler;
 mod state;
 mod watchdog;
