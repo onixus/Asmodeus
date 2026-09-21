@@ -2,7 +2,7 @@
 //! enforced here from `asmodeus_common::rbac` — never delegated to the gateway
 //! (D5). Signature verification and the INV-0 gate run before any execution.
 
-use asmodeus_common::{Category, Role, INV_0_SYNTHETIC_ONLY};
+use asmodeus_common::{Category, INV_0_SYNTHETIC_ONLY};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -10,7 +10,6 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::{caller_role, ApiError};
