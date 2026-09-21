@@ -10,6 +10,7 @@
 
 mod campaign;
 mod catalog;
+mod config;
 mod dispatch;
 mod engine;
 pub(crate) mod http;
@@ -19,9 +20,8 @@ mod scheduler;
 mod watchdog;
 mod webhook;
 
-use std::net::SocketAddr;
-
 use catalog::Catalog;
+use config::ControlPlaneConfig;
 use http::{router, AppState};
 
 #[tokio::main]
