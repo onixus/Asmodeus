@@ -12,6 +12,7 @@ mod campaign;
 mod catalog;
 mod dispatch;
 mod engine;
+mod execution;
 pub(crate) mod http;
 mod openapi;
 mod registry;

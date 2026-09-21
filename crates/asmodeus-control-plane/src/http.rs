@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use asmodeus_common::{Category, Role, RunId, RunState, INV_0_SYNTHETIC_ONLY};
 use asmodeus_telemetry::{
-    Aggregate, AuditRecord, AuditTrail, EcosystemResilienceReport, Measurements, SingleRunReport,
+    Aggregate, AuditTrail, EcosystemResilienceReport, Measurements, SingleRunReport,
 };
 use axum::{
     extract::{Path, State},
@@ -21,8 +21,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::campaign::CampaignCatalog;
+use crate::execution::execute_single_scenario;
 use crate::catalog::Catalog;
-use crate::engine::{self, EngineError};
 use crate::registry::{RunnerRecord, RunnerRegistry};
 use crate::scheduler::{CreateScheduleRequest, ScheduleCatalog, ScheduledJob};
 use crate::webhook::WebhookDispatcher;
@@ -114,7 +114,7 @@ impl AppState {
         }
     }
 
-    fn next_run_id(&self) -> RunId {
+    pub(crate) fn next_run_id(&self) -> RunId {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         RunId::new(format!("run_{n:08x}"))
     }
@@ -252,200 +252,6 @@ pub struct RunScenarioPayload {
     pub target_override: Option<String>,
     #[allow(dead_code)]
     pub timeout_sec: Option<u32>,
-}
-
-pub(crate) async fn execute_single_scenario(
-    state: &AppState,
-    entry: &crate::catalog::ScenarioEntry,
-    role: Role,
-    target_override: Option<&str>,
-) -> Result<(RunId, Value, AuditRecord), ApiError> {
-    // Integrity (D6): the catalogued manifest must verify against the trusted key.
-    if !asmodeus_crypto::is_valid(
-        &entry.manifest,
-        &entry.signature,
-        state.catalog.public_key(),
-    ) {
-        return Err(ApiError::Unprocessable("scenario signature invalid".into()));
-    }
-
-    state.webhook.dispatch(
-        crate::webhook::WebhookPayload {
-            event: "exercise_started".into(),
-            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
-            exercise_id: String::new(),
-            scenario_id: entry.id.to_string(),
-            mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
-            target: target_override.unwrap_or("default").to_string(),
-            initiator: role.as_str().to_string(),
-            tag: entry.category.tag().to_string(),
-            data: json!({
-                "scenario_name": entry.name,
-                "category": entry.category.as_str(),
-            }),
-        },
-        Some(&state.signing_key),
-    );
-
-    // Target resolution. An explicitly requested target must resolve to a
-    // registered runner: we never silently fall back to the static default
-    // endpoint, otherwise a mistyped or unavailable target would fire the
-    // scenario against the wrong runner. The static endpoint is only used when
-    // no target was requested at all.
-    let explicit_target = target_override.map(str::trim).filter(|t| !t.is_empty());
-    let matched_runner = state.registry.find_for_target(target_override);
-    let target_endpoint = if let Some(target) = explicit_target {
-        match matched_runner.as_ref() {
-            Some(runner) => Some(runner.endpoint.clone()),
-            None => {
-                return Err(ApiError::NotFound(format!(
-                    "target runner not found: {target}"
-                )))
-            }
-        }
-    } else {
-        matched_runner
-            .as_ref()
-            .map(|r| r.endpoint.clone())
-            .or_else(|| state.runner_endpoint.clone())
-    };
-
-    // Execute: dispatch to a live runner over gRPC if one is configured,
-    // else drive the in-process engine. Detection metrics stay simulated
-    // (no live Blue Team wired); the runner reports the real injection stats.
-    let (final_state, execution, runner_id_str) = if let Some(endpoint) = target_endpoint {
-        let runner_id = matched_runner
-            .as_ref()
-            .map(|r| r.id.clone())
-            .unwrap_or_else(|| "default-runner".into());
-        let req = asmodeus_proto::ExecuteRequest {
-            scenario_id: entry.id.to_string(),
-            manifest: entry.manifest.clone(),
-            signature: entry.signature.clone(),
-            public_key: state.catalog.public_key().to_vec(),
-            target_dir: entry.target_path.clone(),
-            file_count: entry.file_count,
-            chunk_size_kb: entry.chunk_size_kb,
-        };
-        let out = crate::dispatch::dispatch(&endpoint, req)
-            .await
-            .map_err(|s| ApiError::BadGateway(format!("dispatch: {s}")))?;
-        if let Some(reason) = out.rejected {
-            return Err(ApiError::Unprocessable(format!(
-                "runner rejected: {reason}"
-            )));
-        }
-        if !out.completed {
-            // Stream ended without a terminal Completed event: the run did not
-            // finish. Never record it as a success.
-            return Err(ApiError::Internal(format!(
-                "runner ended without completing (last state: {})",
-                out.final_state
-            )));
-        }
-        (
-            RunState::Completed,
-            json!({
-                "mode": "dispatched",
-                "runner_id": runner_id,
-                "runner_endpoint": endpoint,
-                "runner_final_state": out.final_state,
-                "files_created": out.files_created,
-                "bytes_written": out.bytes_written,
-                "inject_ms": out.inject_ms,
-            }),
-            runner_id,
-        )
-    } else {
-        let outcome = engine::execute(entry).map_err(|e| match e {
-            EngineError::Rejected(_) => ApiError::Unprocessable(e.to_string()),
-            EngineError::Transition(_) => ApiError::Internal(e.to_string()),
-        })?;
-        (
-            outcome.final_state,
-            json!({ "mode": "simulated" }),
-            "in-process-sim".to_string(),
-        )
-    };
-
-    let run_id = state.next_run_id();
-    state
-        .runs
-        .lock()
-        .unwrap()
-        .insert(run_id.clone(), final_state);
-    state.metrics.lock().unwrap().record(Measurements {
-        mttd_ms: entry.sim_mttd_ms,
-        mttr_ms: entry.sim_mttr_ms,
-        blue_team_detected: true,
-    });
-
-    let raw_record = AuditRecord {
-        run_id: run_id.to_string(),
-        scenario_id: entry.id.to_string(),
-        scenario_name: entry.name.to_string(),
-        category: match entry.category {
-            Category::RedTeam => "red_team".to_string(),
-            Category::Chaos => "chaos".to_string(),
-        },
-        mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
-        mitre_tactic: entry
-            .mitre
-            .map(|m| m.tactic.to_string())
-            .unwrap_or_default(),
-        severity: entry.severity.to_string(),
-        tag: entry.category.tag().to_string(),
-        initiator: role.as_str().to_string(),
-        runner_id: runner_id_str,
-        status: "COMPLETED".to_string(),
-        measurements: Measurements {
-            mttd_ms: entry.sim_mttd_ms,
-            mttr_ms: entry.sim_mttr_ms,
-            blue_team_detected: true,
-        },
-        detection_source: entry.detector.to_string(),
-        containment_action: "SIGKILL via SOAR Policy".to_string(),
-        cleanup_status: "SUCCESS (canary removed, 0 host side-effects)".to_string(),
-        timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
-        signature_hex: String::new(),
-        public_key_hex: String::new(),
-    };
-
-    let signed_record = raw_record
-        .sign(&state.signing_key)
-        .map_err(|e| ApiError::Internal(format!("audit signing: {e}")))?;
-
-    state
-        .audit_trail
-        .write()
-        .unwrap()
-        .append(signed_record.clone());
-
-    if let Some(ref path) = state.audit_file_path {
-        let _ = AuditTrail::append_to_file(&signed_record, path);
-    }
-
-    state.webhook.dispatch(
-        crate::webhook::WebhookPayload {
-            event: "exercise_completed".into(),
-            timestamp_utc: signed_record.timestamp_utc.clone(),
-            exercise_id: signed_record.run_id.clone(),
-            scenario_id: entry.id.to_string(),
-            mitre_technique: signed_record.mitre_technique.clone(),
-            target: target_override.unwrap_or("default").to_string(),
-            initiator: role.as_str().to_string(),
-            tag: entry.category.tag().to_string(),
-            data: json!({
-                "status": signed_record.status,
-                "mttd_ms": signed_record.measurements.mttd_ms,
-                "mttr_ms": signed_record.measurements.mttr_ms,
-                "runner_id": signed_record.runner_id,
-            }),
-        },
-        Some(&state.signing_key),
-    );
-
-    Ok((run_id, execution, signed_record))
 }
 
 async fn run_scenario(

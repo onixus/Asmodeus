@@ -296,7 +296,7 @@ pub fn spawn_scheduler(
                         "Triggering scheduled BAS baseline execution"
                     );
 
-                    match crate::http::execute_single_scenario(
+                    match crate::execution::execute_single_scenario(
                         &state,
                         &entry,
                         job.role,
