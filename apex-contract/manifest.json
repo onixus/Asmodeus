@@ -1,0 +1,72 @@
+{
+  "apex_contract_version": "1.0",
+  "canonical": {
+    "repo": "onixus/unified-platform",
+    "commit": "878d138c560cd4106ab0d6cccde804ddc3e5ae1d",
+    "path": "contracts/v1/CONTRACT.md"
+  },
+  "system": "asmodeus",
+  "namespace": "asmodeus",
+  "identity": {
+    "mode": "apex-jwt-hs256",
+    "trust_unsigned_role_header": false
+  },
+  "boundaries": [
+    {
+      "name": "control-plane-v1",
+      "kind": "http",
+      "paths": [
+        "GET /api/v1/asmodeus/runs",
+        "POST /api/v1/asmodeus/scenarios/:id/run",
+        "GET /api/v1/asmodeus/telemetry/mttd"
+      ]
+    }
+  ],
+  "native_contracts": [
+    {
+      "path": "ARCHITECTURE.md",
+      "kind": "architecture"
+    },
+    {
+      "path": "crates/asmodeus-common/src/rbac.rs",
+      "kind": "rbac"
+    }
+  ],
+  "resources": {
+    "owns": [
+      "exercise",
+      "event",
+      "evidence"
+    ],
+    "references": [
+      "asset"
+    ]
+  },
+  "source_guards": [
+    {
+      "path": "crates/asmodeus-control-plane/src/api.rs",
+      "contains": [
+        "Authorization",
+        "apex_contract_version",
+        "ASMODEUS_JWT_SECRET"
+      ]
+    },
+    {
+      "path": "crates/asmodeus-common/src/rbac.rs",
+      "contains": [
+        "red_team",
+        "devsecops",
+        "secops",
+        "auditor"
+      ]
+    }
+  ],
+  "coverage": {
+    "identity": "enforced",
+    "api_versioning": "enforced",
+    "canonical_refs": "declared",
+    "event_envelope": "planned",
+    "observability": "partial",
+    "supply_chain": "partial"
+  }
+}
