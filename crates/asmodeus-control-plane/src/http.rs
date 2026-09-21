@@ -63,6 +63,19 @@ impl AppState {
         } else {
             RunnerRegistry::new()
         };
+        Self::build(catalog, runner_endpoint, registry)
+    }
+
+    #[allow(dead_code)]
+    pub fn with_registry(catalog: Catalog, registry: RunnerRegistry) -> Self {
+        Self::build(catalog, None, registry)
+    }
+
+    /// Shared constructor: derives the audit signing key, restores the
+    /// persistent audit trail from `ASMODEUS_AUDIT_LOG` (if set) and rebuilds
+    /// the Prometheus aggregate from it, so `/metrics` and the resilience report
+    /// survive a restart instead of resetting to zero.
+    fn build(catalog: Catalog, runner_endpoint: Option<String>, registry: RunnerRegistry) -> Self {
         let signing_key = if let Some(sk_bytes) = catalog.secret_key() {
             let mut k = [0u8; 64];
             if sk_bytes.len() == 64 {
@@ -82,55 +95,15 @@ impl AppState {
         } else {
             AuditTrail::new()
         };
-        // Rebuild rolling detection metrics from any persisted history so that
-        // reports and /metrics reflect loaded records after a restart.
-        let metrics = Aggregate::from_records(&audit_trail.list(None, None, None));
+        // Rebuild rolling detection metrics from the persisted audit trail so
+        // reports and /metrics survive a restart instead of resetting to zero.
+        let metrics = Aggregate::from_records(audit_trail.records());
         AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Mutex::new(metrics)),
             counter: Arc::new(AtomicU64::new(1)),
             runner_endpoint,
-            registry,
-            audit_trail: Arc::new(std::sync::RwLock::new(audit_trail)),
-            campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
-            schedules: Arc::new(std::sync::RwLock::new(ScheduleCatalog::seeded())),
-            webhook: Arc::new(WebhookDispatcher::from_env()),
-            signing_key,
-            audit_file_path,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_registry(catalog: Catalog, registry: RunnerRegistry) -> Self {
-        let signing_key = if let Some(sk_bytes) = catalog.secret_key() {
-            let mut k = [0u8; 64];
-            if sk_bytes.len() == 64 {
-                k.copy_from_slice(sk_bytes);
-                k
-            } else {
-                asmodeus_crypto::generate_keypair().1
-            }
-        } else {
-            asmodeus_crypto::generate_keypair().1
-        };
-        let audit_file_path = std::env::var("ASMODEUS_AUDIT_LOG")
-            .ok()
-            .map(std::path::PathBuf::from);
-        let audit_trail = if let Some(ref path) = audit_file_path {
-            AuditTrail::load_from_file(path).unwrap_or_else(|_| AuditTrail::new())
-        } else {
-            AuditTrail::new()
-        };
-        // Rebuild rolling detection metrics from any persisted history so that
-        // reports and /metrics reflect loaded records after a restart.
-        let metrics = Aggregate::from_records(&audit_trail.list(None, None, None));
-        AppState {
-            catalog: Arc::new(catalog),
-            runs: Arc::new(Mutex::new(HashMap::new())),
-            metrics: Arc::new(Mutex::new(metrics)),
-            counter: Arc::new(AtomicU64::new(1)),
-            runner_endpoint: None,
             registry,
             audit_trail: Arc::new(std::sync::RwLock::new(audit_trail)),
             campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
@@ -196,7 +169,13 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/asmodeus/schedules",
             get(list_schedules).post(create_schedule),
         )
-        .route("/api/v1/asmodeus/schedules/:id", delete(delete_schedule))
+        .route("/api/v1/asmodeus/schedules/alerts", get(list_drift_alerts))
+        .route(
+            "/api/v1/asmodeus/schedules/:id",
+            get(get_schedule)
+                .patch(toggle_schedule)
+                .delete(delete_schedule),
+        )
         .with_state(state)
 }
 
@@ -1479,6 +1458,7 @@ async fn create_schedule(
         baseline_mttd_ms: req.baseline_mttd_ms,
         drift_detected: false,
         drift_factor: None,
+        run_history: Vec::new(),
     };
 
     state.schedules.write().unwrap().register(job.clone());
@@ -1506,6 +1486,81 @@ async fn delete_schedule(
         Ok(Json(json!({ "status": "deleted", "id": id })))
     } else {
         Err(ApiError::NotFound(format!("schedule not found: {id}")))
+    }
+}
+
+/// Roles allowed to read schedules and their drift history: any read-only
+/// role (CISO/SecOps/Auditor via `ViewReports`) plus operators. Mirrors the
+/// gate on `list_schedules`.
+fn may_view_schedules(role: Role) -> bool {
+    role.can(asmodeus_common::Capability::ViewReports)
+        || role.can(asmodeus_common::Capability::RunRedTeam)
+        || role.can(asmodeus_common::Capability::InjectChaos)
+        || role == Role::Admin
+}
+
+/// Schedule detail including the bounded run-history timeline (drift over time).
+async fn get_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !may_view_schedules(role) {
+        return Err(ApiError::Forbidden("role may not view schedules"));
+    }
+    let cat = state.schedules.read().unwrap();
+    match cat.get(&id) {
+        Some(job) => Ok(Json(json!({ "schedule": job }))),
+        None => Err(ApiError::NotFound(format!("schedule not found: {id}"))),
+    }
+}
+
+/// Persisted detection-drift alerts across all scheduled baselines, newest
+/// first. This is the operator-facing surface for MTTD regression.
+async fn list_drift_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !may_view_schedules(role) {
+        return Err(ApiError::Forbidden("role may not view drift alerts"));
+    }
+    let alerts = state.schedules.read().unwrap().alerts();
+    Ok(Json(json!({ "alerts": alerts, "count": alerts.len() })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ToggleSchedulePayload {
+    enabled: bool,
+}
+
+/// Enable or disable a scheduled baseline without deleting it (pause a noisy
+/// job, or resume a paused one).
+async fn toggle_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<ToggleSchedulePayload>,
+) -> Result<Json<Value>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ManageScenarios)
+        && !role.can(asmodeus_common::Capability::RunRedTeam)
+        && !role.can(asmodeus_common::Capability::InjectChaos)
+        && role != Role::Admin
+    {
+        return Err(ApiError::Forbidden("role may not modify schedules"));
+    }
+    match state
+        .schedules
+        .write()
+        .unwrap()
+        .set_enabled(&id, payload.enabled)
+    {
+        Some(enabled) => Ok(Json(
+            json!({ "status": "updated", "id": id, "enabled": enabled }),
+        )),
+        None => Err(ApiError::NotFound(format!("schedule not found: {id}"))),
     }
 }
 
@@ -2851,5 +2906,74 @@ spec:
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn schedule_detail_toggle_and_alerts() {
+        // Detail of a seeded schedule includes the (initially empty) history.
+        let (status, body) = send(
+            "GET",
+            "/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE",
+            Some("auditor"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["schedule"]["id"], "SCHED-BASE-RANSOMWARE");
+        assert!(body["schedule"]["run_history"].is_array());
+
+        // Unknown schedule -> 404.
+        let (status, _) = send(
+            "GET",
+            "/api/v1/asmodeus/schedules/SCHED-NOPE",
+            Some("auditor"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Alerts endpoint is readable by read-only roles and starts empty.
+        let (status, body) = send("GET", "/api/v1/asmodeus/schedules/alerts", Some("ciso")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], 0);
+        assert!(body["alerts"].as_array().unwrap().is_empty());
+
+        // Toggle: read-only role is forbidden; admin succeeds.
+        let app = router(AppState::new(Catalog::seeded()));
+        let forbid = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE")
+            .header("x-apex-role", "auditor")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "enabled": false }).to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(forbid).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let toggle = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE")
+            .header("x-apex-role", "admin")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "enabled": false }).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(toggle).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["enabled"], false);
+
+        // Toggling an unknown schedule -> 404.
+        let missing = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/asmodeus/schedules/SCHED-NOPE")
+            .header("x-apex-role", "admin")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "enabled": true }).to_string()))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(missing).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

@@ -8,6 +8,20 @@
 ## [Unreleased]
 
 ### Добавлено
+- **Наблюдаемость дрейфа детекции планировщика Continuous BAS (`asmodeus-control-plane::scheduler`)**:
+  - **История прогонов (`run_history`)**: каждый scheduled-прогон добавляет ограниченный по объёму (`MAX_HISTORY_PER_JOB = 50`) семпл `ScheduledRunSample` (метка времени, статус, MTTD, факт и коэффициент дрейфа) — таймлайн деградации способности детектирования во времени.
+  - **Нефальсифицируемый журнал алертов дрейфа (`DriftAlert`)**: превышение базового MTTD в ≥ `DRIFT_THRESHOLD` (1.5×) фиксируется в ограниченном (`MAX_ALERTS = 200`) кольце алертов с монотонным `seq`, доступном операторам.
+  - **Эндпоинты REST API**:
+    - `GET /api/v1/asmodeus/schedules/:id` — детализация задания и таймлайн дрейфа (`ViewReports`);
+    - `GET /api/v1/asmodeus/schedules/alerts` — список алертов регрессии детекции, новейшие первыми (`ViewReports`);
+    - `PATCH /api/v1/asmodeus/schedules/:id` — пауза/возобновление задания без удаления (`RunRedTeam`/`InjectChaos`/`ManageScenarios`/`Admin`).
+  - **Расширение операторского CLI (`asmodeus-cli`)**:
+    - `asmodeus schedules get --id <ID>` — детализация задания с историей дрейфа;
+    - `asmodeus schedules alerts` — просмотр журнала алертов дрейфа MTTD;
+    - `asmodeus schedules toggle --id <ID> [--enable]` — включение/отключение задания.
+- **Восстановление метрик Prometheus после рестарта (`asmodeus-telemetry::Aggregate::from_records`)**:
+  - Скользящий агрегат `/metrics`, `/telemetry/mttd` и половина отчёта устойчивости теперь **восстанавливаются из персистентного журнала аудита** (`ASMODEUS_AUDIT_LOG`) при старте control-plane вместо обнуления. Устранено расхождение: исторические прогоны сохранялись в `/runs`, но их метрики молча терялись.
+  - Дедупликация конструкторов `AppState` (`with_runner`/`with_registry` → общий `AppState::build`).
 - **Спецификация OpenAPI 3.1.0 (`asmodeus-control-plane::openapi`)**:
   - Канонический генератор схемы OpenAPI 3.1.0 (`openapi.json`) для бесшовной интеграции с APEX Unified Gateway (FastAPI) и веб-консолью управления хаос-инженерией (`/chaos`).
   - Полное описание схем (`AuditRecord`, `Measurements`, `Campaign`, `Scenario`, `ResilienceReport`), эндпоинтов, схем аутентификации (`X-Apex-Role`) и кодов возврата (401, 403, 404, 422).

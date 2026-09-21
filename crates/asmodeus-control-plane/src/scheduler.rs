@@ -3,10 +3,19 @@
 //! Manages scheduled, recurring scenario executions to establish detection
 //! baselines and detect security posture degradation (MTTD drift).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use asmodeus_common::Role;
 use serde::{Deserialize, Serialize};
+
+/// Upper bound on samples kept per job. Old samples are evicted FIFO so a
+/// long-running baseline cannot grow the process heap without limit.
+const MAX_HISTORY_PER_JOB: usize = 50;
+/// Upper bound on retained drift alerts across all jobs.
+const MAX_ALERTS: usize = 200;
+/// MTTD ratio (observed / baseline) at or above which detection is considered
+/// degraded. Kept in one place so history samples and alerts agree.
+const DRIFT_THRESHOLD: f32 = 1.5;
 
 /// Scheduled BAS exercise job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +36,35 @@ pub struct ScheduledJob {
     pub baseline_mttd_ms: Option<u64>,
     pub drift_detected: bool,
     pub drift_factor: Option<f32>,
+    /// Bounded, time-ordered outcome timeline (oldest first). Empty on
+    /// deserialization of legacy state.
+    #[serde(default)]
+    pub run_history: Vec<ScheduledRunSample>,
+}
+
+/// One recorded outcome of a scheduled run — the observable evidence of
+/// detection-capability drift over time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScheduledRunSample {
+    pub timestamp_utc: String,
+    pub status: String,
+    pub mttd_ms: u64,
+    pub drift_detected: bool,
+    pub drift_factor: Option<f32>,
+}
+
+/// A persisted detection-drift alert: baseline MTTD was exceeded by at least
+/// [`DRIFT_THRESHOLD`], signalling that the Blue Team's detection capability
+/// for this scenario has regressed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DriftAlert {
+    pub seq: u64,
+    pub job_id: String,
+    pub scenario_id: String,
+    pub baseline_mttd_ms: Option<u64>,
+    pub observed_mttd_ms: u64,
+    pub drift_factor: f32,
+    pub timestamp_utc: String,
 }
 
 /// DTO for creating a new scheduled job.
@@ -41,10 +79,13 @@ pub struct CreateScheduleRequest {
     pub enabled: Option<bool>,
 }
 
-/// In-memory catalog of scheduled BAS jobs.
+/// In-memory catalog of scheduled BAS jobs plus a bounded detection-drift
+/// alert ring.
 #[derive(Debug, Clone)]
 pub struct ScheduleCatalog {
     jobs: HashMap<String, ScheduledJob>,
+    alerts: VecDeque<DriftAlert>,
+    alert_seq: u64,
 }
 
 impl Default for ScheduleCatalog {
@@ -57,6 +98,8 @@ impl ScheduleCatalog {
     pub fn new() -> Self {
         Self {
             jobs: HashMap::new(),
+            alerts: VecDeque::new(),
+            alert_seq: 0,
         }
     }
 
@@ -80,6 +123,7 @@ impl ScheduleCatalog {
             baseline_mttd_ms: Some(200),
             drift_detected: false,
             drift_factor: None,
+            run_history: Vec::new(),
         });
 
         cat.register(ScheduledJob {
@@ -98,6 +142,7 @@ impl ScheduleCatalog {
             baseline_mttd_ms: Some(150),
             drift_detected: false,
             drift_factor: None,
+            run_history: Vec::new(),
         });
 
         cat
@@ -117,7 +162,6 @@ impl ScheduleCatalog {
         list
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, id: &str) -> Option<&ScheduledJob> {
         self.jobs.get(id)
     }
@@ -127,7 +171,21 @@ impl ScheduleCatalog {
         self.jobs.get_mut(id)
     }
 
-    /// Record outcome of a scheduled run and evaluate MTTD drift.
+    /// Enable or disable a job. Returns the new `enabled` state, or `None` if
+    /// no such job exists.
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Option<bool> {
+        let job = self.jobs.get_mut(id)?;
+        job.enabled = enabled;
+        Some(job.enabled)
+    }
+
+    /// Retained detection-drift alerts, newest first.
+    pub fn alerts(&self) -> Vec<DriftAlert> {
+        self.alerts.iter().rev().cloned().collect()
+    }
+
+    /// Record outcome of a scheduled run and evaluate MTTD drift. Appends a
+    /// bounded history sample and, on drift, a persisted [`DriftAlert`].
     pub fn record_outcome(
         &mut self,
         id: &str,
@@ -136,25 +194,66 @@ impl ScheduleCatalog {
         timestamp_utc: &str,
         epoch_secs: u64,
     ) -> Option<bool> {
-        let job = self.jobs.get_mut(id)?;
-        job.last_run_utc = Some(timestamp_utc.to_string());
-        job.last_run_epoch_secs = Some(epoch_secs);
-        job.last_status = Some(status.to_string());
-        job.last_mttd_ms = Some(mttd_ms);
+        // Mutate the job under a scoped borrow so the alert push below can take
+        // a second &mut on `self` (the alert ring is a sibling field).
+        let (scenario_id, baseline_mttd_ms, drift_detected, drift_factor) = {
+            let job = self.jobs.get_mut(id)?;
+            job.last_run_utc = Some(timestamp_utc.to_string());
+            job.last_run_epoch_secs = Some(epoch_secs);
+            job.last_status = Some(status.to_string());
+            job.last_mttd_ms = Some(mttd_ms);
 
-        if job.baseline_mttd_ms.is_none() && mttd_ms > 0 {
-            job.baseline_mttd_ms = Some(mttd_ms);
-        }
+            if job.baseline_mttd_ms.is_none() && mttd_ms > 0 {
+                job.baseline_mttd_ms = Some(mttd_ms);
+            }
 
-        if let Some(base) = job.baseline_mttd_ms {
-            if base > 0 {
-                let factor = (mttd_ms as f32) / (base as f32);
-                job.drift_factor = Some(factor);
-                job.drift_detected = factor >= 1.5;
+            let mut factor = None;
+            if let Some(base) = job.baseline_mttd_ms {
+                if base > 0 {
+                    let f = (mttd_ms as f32) / (base as f32);
+                    factor = Some(f);
+                    job.drift_factor = Some(f);
+                    job.drift_detected = f >= DRIFT_THRESHOLD;
+                }
+            }
+
+            job.run_history.push(ScheduledRunSample {
+                timestamp_utc: timestamp_utc.to_string(),
+                status: status.to_string(),
+                mttd_ms,
+                drift_detected: job.drift_detected,
+                drift_factor: factor,
+            });
+            if job.run_history.len() > MAX_HISTORY_PER_JOB {
+                let overflow = job.run_history.len() - MAX_HISTORY_PER_JOB;
+                job.run_history.drain(0..overflow);
+            }
+
+            (
+                job.scenario_id.clone(),
+                job.baseline_mttd_ms,
+                job.drift_detected,
+                factor,
+            )
+        };
+
+        if drift_detected {
+            self.alert_seq += 1;
+            self.alerts.push_back(DriftAlert {
+                seq: self.alert_seq,
+                job_id: id.to_string(),
+                scenario_id,
+                baseline_mttd_ms,
+                observed_mttd_ms: mttd_ms,
+                drift_factor: drift_factor.unwrap_or_default(),
+                timestamp_utc: timestamp_utc.to_string(),
+            });
+            while self.alerts.len() > MAX_ALERTS {
+                self.alerts.pop_front();
             }
         }
 
-        Some(job.drift_detected)
+        Some(drift_detected)
     }
 }
 
@@ -287,6 +386,7 @@ mod tests {
             baseline_mttd_ms: Some(100),
             drift_detected: false,
             drift_factor: None,
+            run_history: Vec::new(),
         };
 
         cat.register(job);
@@ -322,5 +422,97 @@ mod tests {
 
         assert!(cat.deregister("SCHED-TEST-1"));
         assert_eq!(cat.list().len(), 0);
+    }
+
+    fn seeded_job(id: &str, baseline: u64) -> ScheduledJob {
+        ScheduledJob {
+            id: id.into(),
+            name: "Test Job".into(),
+            scenario_id: "SCN-RT-001".into(),
+            interval_sec: 60,
+            role: Role::RedTeam,
+            target_override: None,
+            enabled: true,
+            created_at_utc: "2026-09-09T22:00:00Z".into(),
+            last_run_utc: None,
+            last_run_epoch_secs: None,
+            last_status: None,
+            last_mttd_ms: None,
+            baseline_mttd_ms: Some(baseline),
+            drift_detected: false,
+            drift_factor: None,
+            run_history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_outcome_builds_history_and_alerts() {
+        let mut cat = ScheduleCatalog::new();
+        cat.register(seeded_job("SCHED-H", 100));
+        assert!(cat.alerts().is_empty());
+
+        cat.record_outcome("SCHED-H", "COMPLETED", 110, "2026-09-09T22:01:00Z", 1000);
+        cat.record_outcome("SCHED-H", "COMPLETED", 180, "2026-09-09T22:02:00Z", 2000);
+
+        let job = cat.get("SCHED-H").unwrap();
+        assert_eq!(job.run_history.len(), 2, "both runs are on the timeline");
+        assert!(!job.run_history[0].drift_detected);
+        assert!(job.run_history[1].drift_detected);
+
+        // Only the degraded run produces a persisted, queryable alert.
+        let alerts = cat.alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].job_id, "SCHED-H");
+        assert_eq!(alerts[0].observed_mttd_ms, 180);
+        assert_eq!(alerts[0].baseline_mttd_ms, Some(100));
+        assert!((alerts[0].drift_factor - 1.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut cat = ScheduleCatalog::new();
+        cat.register(seeded_job("SCHED-B", 100));
+        for i in 0..(MAX_HISTORY_PER_JOB + 10) {
+            cat.record_outcome(
+                "SCHED-B",
+                "COMPLETED",
+                100,
+                "2026-09-09T22:00:00Z",
+                i as u64,
+            );
+        }
+        let job = cat.get("SCHED-B").unwrap();
+        assert_eq!(job.run_history.len(), MAX_HISTORY_PER_JOB);
+    }
+
+    #[test]
+    fn alerts_newest_first_and_bounded() {
+        let mut cat = ScheduleCatalog::new();
+        cat.register(seeded_job("SCHED-A", 100));
+        // Every run drifts (300 vs 100 baseline), so each pushes an alert.
+        for i in 0..(MAX_ALERTS + 5) {
+            cat.record_outcome(
+                "SCHED-A",
+                "COMPLETED",
+                300,
+                "2026-09-09T22:00:00Z",
+                i as u64,
+            );
+        }
+        let alerts = cat.alerts();
+        assert_eq!(alerts.len(), MAX_ALERTS);
+        // Newest first: the most recent seq comes out on top.
+        assert!(alerts[0].seq > alerts[1].seq);
+    }
+
+    #[test]
+    fn set_enabled_toggles_job() {
+        let mut cat = ScheduleCatalog::new();
+        cat.register(seeded_job("SCHED-T", 100));
+        assert_eq!(cat.set_enabled("SCHED-T", false), Some(false));
+        assert!(!cat.get("SCHED-T").unwrap().enabled);
+        assert_eq!(cat.set_enabled("SCHED-T", true), Some(true));
+        assert!(cat.get("SCHED-T").unwrap().enabled);
+        assert_eq!(cat.set_enabled("SCHED-MISSING", true), None);
     }
 }

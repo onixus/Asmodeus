@@ -4,6 +4,10 @@
 //! runners over gRPC when `ASMODEUS_RUNNER_ENDPOINT` is set, else simulates
 //! in-process. Budget: <= 10% CPU / <= 128 MB RAM (ARCHITECTURE.md §6).
 
+// The hand-written OpenAPI 3.1 spec is a single large `json!` literal; its
+// nesting exceeds the default macro recursion limit.
+#![recursion_limit = "512"]
+
 mod campaign;
 mod catalog;
 mod dispatch;

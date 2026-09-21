@@ -406,7 +406,32 @@ pub fn generate_spec() -> Value {
                     }
                 }
             },
+            "/api/v1/asmodeus/schedules/alerts": {
+                "get": {
+                    "summary": "List persisted detection-drift alerts (MTTD regression), newest first",
+                    "responses": {
+                        "200": { "description": "Array of drift alerts" },
+                        "403": { "description": "Forbidden" }
+                    }
+                }
+            },
             "/api/v1/asmodeus/schedules/{id}": {
+                "get": {
+                    "summary": "Schedule detail including the run-history drift timeline",
+                    "responses": {
+                        "200": { "description": "Scheduled job with run history" },
+                        "403": { "description": "Forbidden" },
+                        "404": { "description": "Schedule not found" }
+                    }
+                },
+                "patch": {
+                    "summary": "Enable or disable a scheduled exercise (pause / resume)",
+                    "responses": {
+                        "200": { "description": "Schedule updated" },
+                        "403": { "description": "Forbidden" },
+                        "404": { "description": "Schedule not found" }
+                    }
+                },
                 "delete": {
                     "summary": "Deregister a continuous automated BAS scheduled exercise",
                     "responses": {
@@ -434,6 +459,9 @@ mod tests {
         assert!(spec["paths"]["/api/v1/asmodeus/audit/export"].is_object());
         assert!(spec["paths"]["/api/v1/asmodeus/campaigns"].is_object());
         assert!(spec["paths"]["/api/v1/asmodeus/schedules"].is_object());
+        assert!(spec["paths"]["/api/v1/asmodeus/schedules/alerts"].is_object());
+        assert!(spec["paths"]["/api/v1/asmodeus/schedules/{id}"]["get"].is_object());
+        assert!(spec["paths"]["/api/v1/asmodeus/schedules/{id}"]["patch"].is_object());
         assert!(spec["paths"]["/api/v1/asmodeus/reports/compliance"].is_object());
         assert!(spec["components"]["schemas"]["AuditRecord"].is_object());
         assert!(spec["components"]["schemas"]["ScheduledJob"].is_object());
