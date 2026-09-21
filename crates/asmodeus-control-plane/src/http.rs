@@ -666,6 +666,8 @@ async fn openapi_spec() -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Catalog;
+    use crate::registry::RunnerRegistry;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use tower::ServiceExt; // for `oneshot`
