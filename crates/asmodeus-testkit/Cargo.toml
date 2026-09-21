@@ -14,3 +14,5 @@ asmodeus-proto = { workspace = true }
 ed25519-compact = { workspace = true }
 rcgen = { workspace = true }
 tonic = { workspace = true }
+[dev-dependencies]
+serde_json = { workspace = true }
