@@ -10,22 +10,41 @@ use asmodeus_telemetry::{AuditRecord, Measurements};
 use serde_json::{json, Value};
 
 use crate::engine::{self, EngineError};
-use crate::api::ApiError;
 use crate::state::AppState;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExecutionError {
+    #[error("scenario signature invalid")]
+    InvalidSignature,
+    #[error("target runner not found: {0}")]
+    TargetNotFound(String),
+    #[error("dispatch: {0}")]
+    Dispatch(String),
+    #[error("runner rejected: {0}")]
+    RunnerRejected(String),
+    #[error("runner ended without completing (last state: {0})")]
+    RunnerIncomplete(String),
+    #[error("{0}")]
+    EngineRejected(String),
+    #[error("{0}")]
+    EngineTransition(String),
+    #[error("audit signing: {0}")]
+    AuditSigning(String),
+}
 
 pub(crate) async fn execute_single_scenario(
     state: &AppState,
     entry: &crate::catalog::ScenarioEntry,
     role: Role,
     target_override: Option<&str>,
-) -> Result<(RunId, Value, AuditRecord), ApiError> {
+) -> Result<(RunId, Value, AuditRecord), ExecutionError> {
     // Integrity (D6): the catalogued manifest must verify against the trusted key.
     if !asmodeus_crypto::is_valid(
         &entry.manifest,
         &entry.signature,
         state.catalog.public_key(),
     ) {
-        return Err(ApiError::Unprocessable("scenario signature invalid".into()));
+        return Err(ExecutionError::InvalidSignature);
     }
 
     state.webhook.dispatch(
@@ -57,9 +76,7 @@ pub(crate) async fn execute_single_scenario(
         match matched_runner.as_ref() {
             Some(runner) => Some(runner.endpoint.clone()),
             None => {
-                return Err(ApiError::NotFound(format!(
-                    "target runner not found: {target}"
-                )))
+                return Err(ExecutionError::TargetNotFound(target.to_string()))
             }
         }
     } else {
@@ -88,19 +105,14 @@ pub(crate) async fn execute_single_scenario(
         };
         let out = crate::dispatch::dispatch(&endpoint, req)
             .await
-            .map_err(|s| ApiError::BadGateway(format!("dispatch: {s}")))?;
+            .map_err(|s| ExecutionError::Dispatch(s.to_string()))?;
         if let Some(reason) = out.rejected {
-            return Err(ApiError::Unprocessable(format!(
-                "runner rejected: {reason}"
-            )));
+            return Err(ExecutionError::RunnerRejected(reason));
         }
         if !out.completed {
             // Stream ended without a terminal Completed event: the run did not
             // finish. Never record it as a success.
-            return Err(ApiError::Internal(format!(
-                "runner ended without completing (last state: {})",
-                out.final_state
-            )));
+            return Err(ExecutionError::RunnerIncomplete(out.final_state));
         }
         (
             RunState::Completed,
@@ -117,8 +129,8 @@ pub(crate) async fn execute_single_scenario(
         )
     } else {
         let outcome = engine::execute(entry).map_err(|e| match e {
-            EngineError::Rejected(_) => ApiError::Unprocessable(e.to_string()),
-            EngineError::Transition(_) => ApiError::Internal(e.to_string()),
+            EngineError::Rejected(_) => ExecutionError::EngineRejected(e.to_string()),
+            EngineError::Transition(_) => ExecutionError::EngineTransition(e.to_string()),
         })?;
         (
             outcome.final_state,
@@ -172,7 +184,7 @@ pub(crate) async fn execute_single_scenario(
 
     let signed_record = raw_record
         .sign(&state.signing_key)
-        .map_err(|e| ApiError::Internal(format!("audit signing: {e}")))?;
+        .map_err(|e| ExecutionError::AuditSigning(e.to_string()))?;
 
     state.audit.append(signed_record.clone());
 
