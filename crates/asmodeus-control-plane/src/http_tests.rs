@@ -10,9 +10,43 @@ use crate::state::AppState;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use serde_json::Value;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ring::hmac;
+use serde_json::{json, Value};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
+const TEST_APEX_SECRET: &str = "asmodeus-apex-test-secret-32-bytes-minimum";
+
+fn bearer(role: &str) -> String {
+    std::env::set_var("ASMODEUS_JWT_SECRET", TEST_APEX_SECRET);
+    std::env::remove_var("ASMODEUS_ALLOW_ROLE_HEADER");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let header = json!({"alg": "HS256", "typ": "JWT"});
+    let claims = json!({
+        "iss": "https://identity.apex.local",
+        "aud": "apex",
+        "sub": format!("test-{role}"),
+        "actor_type": "user",
+        "role": role,
+        "tenant_id": "global",
+        "permissions": ["read:*"],
+        "iat": now,
+        "nbf": now,
+        "exp": now + 300,
+        "jti": format!("test-{role}-{now}"),
+        "apex_contract_version": "1.0"
+    });
+    let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+    let input = format!("{header}.{payload}");
+    let key = hmac::Key::new(hmac::HMAC_SHA256, TEST_APEX_SECRET.as_bytes());
+    let sig = URL_SAFE_NO_PAD.encode(hmac::sign(&key, input.as_bytes()).as_ref());
+    format!("Bearer {input}.{sig}")
+}
 
 fn app() -> Router {
     router(AppState::new(Catalog::seeded()))
@@ -21,7 +55,7 @@ fn app() -> Router {
 async fn send(method: &str, uri: &str, role: Option<&str>) -> (StatusCode, Value) {
     let mut req = Request::builder().method(method).uri(uri);
     if let Some(r) = role {
-        req = req.header("x-apex-role", r);
+        req = req.header("authorization", bearer(r));
     }
     let resp = app()
         .oneshot(req.body(Body::empty()).unwrap())
@@ -111,7 +145,7 @@ async fn metrics_reflect_a_run() {
     let run = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     assert_eq!(
@@ -293,7 +327,7 @@ async fn dispatches_to_live_runner() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -319,7 +353,7 @@ async fn partial_runner_is_not_reported_completed() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -403,7 +437,7 @@ async fn dispatches_to_live_runner_over_mtls() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -447,7 +481,7 @@ async fn dispatch_over_mtls_rejects_untrusted_client() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -463,7 +497,7 @@ async fn list_scenarios_returns_all_entries_with_mitre_metadata() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/scenarios")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -495,7 +529,7 @@ async fn get_scenario_returns_single_scenario_details() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/scenarios/CREDENTIAL_ACCESS_CANARY")
-        .header("x-apex-role", "devsecops")
+        .header("authorization", bearer("devsecops"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -515,7 +549,7 @@ async fn mitre_matrix_returns_coverage_report() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/scenarios/mitre")
-        .header("x-apex-role", "ciso")
+        .header("authorization", bearer("ciso"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -543,7 +577,7 @@ async fn run_scenario_includes_mitre_and_scenario_name() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/C2_BEACONING_SIMULATION/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -568,7 +602,7 @@ async fn runners_lifecycle_and_rbac() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/runners")
-        .header("x-apex-role", "ciso")
+        .header("authorization", bearer("ciso"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -585,7 +619,7 @@ async fn runners_lifecycle_and_rbac() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/runners")
-        .header("x-apex-role", "admin")
+        .header("authorization", bearer("admin"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -608,7 +642,7 @@ async fn runners_lifecycle_and_rbac() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/runners")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -621,7 +655,7 @@ async fn runners_lifecycle_and_rbac() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/runners/probe-k8s")
-        .header("x-apex-role", "devsecops")
+        .header("authorization", bearer("devsecops"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -648,7 +682,7 @@ async fn dispatch_with_target_override_and_ping() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/runners/k8s-probe-01/ping")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -662,7 +696,7 @@ async fn dispatch_with_target_override_and_ping() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -683,7 +717,7 @@ async fn dispatch_with_target_override_and_ping() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -704,7 +738,7 @@ async fn runs_history_and_crypto_verification() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/runs")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -717,7 +751,7 @@ async fn runs_history_and_crypto_verification() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/CREDENTIAL_ACCESS_CANARY/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -731,7 +765,7 @@ async fn runs_history_and_crypto_verification() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/runs")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -745,7 +779,7 @@ async fn runs_history_and_crypto_verification() {
     let req = Request::builder()
         .method("GET")
         .uri(format!("/api/v1/asmodeus/runs/{run_id}"))
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -759,7 +793,7 @@ async fn runs_history_and_crypto_verification() {
     let req = Request::builder()
         .method("GET")
         .uri(format!("/api/v1/asmodeus/runs/{run_id}/verify"))
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -778,7 +812,7 @@ async fn campaigns_execution_and_rbac() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/campaigns")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -793,7 +827,7 @@ async fn campaigns_execution_and_rbac() {
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/asmodeus/campaigns/CAMP-RANSOMWARE-CHAIN/run")
-            .header("x-apex-role", *forbidden_role)
+            .header("authorization", bearer(*forbidden_role))
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -804,7 +838,7 @@ async fn campaigns_execution_and_rbac() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/campaigns/CAMP-RANSOMWARE-CHAIN/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -821,7 +855,7 @@ async fn campaigns_execution_and_rbac() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/runs")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -844,7 +878,7 @@ async fn explicit_target_never_falls_back_to_static_endpoint() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({ "target_override": "no_such_tag" }).to_string(),
@@ -890,7 +924,7 @@ detector: "ferrum_ebpf"
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/validate")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::from(valid_yaml))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -905,7 +939,7 @@ detector: "ferrum_ebpf"
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/validate")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::from(invalid_yaml))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -920,7 +954,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -933,7 +967,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/asmodeus/runs/{run_id}/feedback"))
-        .header("x-apex-role", "ciso")
+        .header("authorization", bearer("ciso"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "detected": true }).to_string()))
         .unwrap();
@@ -944,7 +978,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/asmodeus/runs/{run_id}/feedback"))
-        .header("x-apex-role", "secops")
+        .header("authorization", bearer("secops"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -971,7 +1005,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
     let req = Request::builder()
         .method("GET")
         .uri(format!("/api/v1/asmodeus/runs/{run_id}/verify"))
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -984,7 +1018,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
     let req = Request::builder()
         .method("GET")
         .uri(format!("/api/v1/asmodeus/runs/{run_id}/report"))
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -995,7 +1029,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
         .uri(format!(
             "/api/v1/asmodeus/runs/{run_id}/report?format=markdown"
         ))
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1009,7 +1043,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/reports/resilience?format=markdown")
-        .header("x-apex-role", "ciso")
+        .header("authorization", bearer("ciso"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1045,7 +1079,7 @@ async fn audit_export_json_and_jsonl() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1055,7 +1089,7 @@ async fn audit_export_json_and_jsonl() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/audit/export?format=jsonl")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1069,7 +1103,7 @@ async fn audit_export_json_and_jsonl() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/audit/export?format=json")
-        .header("x-apex-role", "ciso")
+        .header("authorization", bearer("ciso"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1105,7 +1139,7 @@ async fn campaigns_dynamic_crud_and_rbac() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/campaigns")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .header("content-type", "application/json")
         .body(Body::from(custom_campaign.to_string()))
         .unwrap();
@@ -1116,7 +1150,7 @@ async fn campaigns_dynamic_crud_and_rbac() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/campaigns")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .header("content-type", "application/json")
         .body(Body::from(custom_campaign.to_string()))
         .unwrap();
@@ -1127,7 +1161,7 @@ async fn campaigns_dynamic_crud_and_rbac() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/campaigns")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1141,7 +1175,7 @@ async fn campaigns_dynamic_crud_and_rbac() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/campaigns/CAMP-DYNAMIC-001")
-        .header("x-apex-role", "ciso")
+        .header("authorization", bearer("ciso"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1151,7 +1185,7 @@ async fn campaigns_dynamic_crud_and_rbac() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/campaigns/CAMP-DYNAMIC-001")
-        .header("x-apex-role", "admin")
+        .header("authorization", bearer("admin"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1161,7 +1195,7 @@ async fn campaigns_dynamic_crud_and_rbac() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/campaigns/CAMP-DYNAMIC-001")
-        .header("x-apex-role", "admin")
+        .header("authorization", bearer("admin"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1176,7 +1210,7 @@ async fn audit_export_clickhouse_formats() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1186,7 +1220,7 @@ async fn audit_export_clickhouse_formats() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/audit/export?format=clickhouse_sql")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1204,7 +1238,7 @@ async fn audit_export_clickhouse_formats() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/audit/export?format=clickhouse_ndjson")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1226,7 +1260,7 @@ async fn compliance_report_json_and_markdown() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1236,7 +1270,7 @@ async fn compliance_report_json_and_markdown() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/reports/compliance")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1250,7 +1284,7 @@ async fn compliance_report_json_and_markdown() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/reports/compliance?format=markdown")
-        .header("x-apex-role", "ciso")
+        .header("authorization", bearer("ciso"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1282,7 +1316,7 @@ async fn schedules_crud_and_rbac() {
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/schedules")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1302,7 +1336,7 @@ async fn schedules_crud_and_rbac() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/schedules")
-        .header("x-apex-role", "secops")
+        .header("authorization", bearer("secops"))
         .header("content-type", "application/json")
         .body(Body::from(new_sched.to_string()))
         .unwrap();
@@ -1313,7 +1347,7 @@ async fn schedules_crud_and_rbac() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/schedules")
-        .header("x-apex-role", "red_team")
+        .header("authorization", bearer("red_team"))
         .header("content-type", "application/json")
         .body(Body::from(new_sched.to_string()))
         .unwrap();
@@ -1324,7 +1358,7 @@ async fn schedules_crud_and_rbac() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1334,7 +1368,7 @@ async fn schedules_crud_and_rbac() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
-        .header("x-apex-role", "admin")
+        .header("authorization", bearer("admin"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1344,7 +1378,7 @@ async fn schedules_crud_and_rbac() {
     let req = Request::builder()
         .method("DELETE")
         .uri("/api/v1/asmodeus/schedules/SCHED-TEST-001")
-        .header("x-apex-role", "admin")
+        .header("authorization", bearer("admin"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1384,7 +1418,7 @@ async fn schedule_detail_toggle_and_alerts() {
     let forbid = Request::builder()
         .method("PATCH")
         .uri("/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE")
-        .header("x-apex-role", "auditor")
+        .header("authorization", bearer("auditor"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "enabled": false }).to_string()))
         .unwrap();
@@ -1396,7 +1430,7 @@ async fn schedule_detail_toggle_and_alerts() {
     let toggle = Request::builder()
         .method("PATCH")
         .uri("/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE")
-        .header("x-apex-role", "admin")
+        .header("authorization", bearer("admin"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "enabled": false }).to_string()))
         .unwrap();
@@ -1410,7 +1444,7 @@ async fn schedule_detail_toggle_and_alerts() {
     let missing = Request::builder()
         .method("PATCH")
         .uri("/api/v1/asmodeus/schedules/SCHED-NOPE")
-        .header("x-apex-role", "admin")
+        .header("authorization", bearer("admin"))
         .header("content-type", "application/json")
         .body(Body::from(json!({ "enabled": true }).to_string()))
         .unwrap();
