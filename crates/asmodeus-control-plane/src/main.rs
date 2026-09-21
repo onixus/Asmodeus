@@ -24,6 +24,7 @@ mod runner_http;
 mod runs_http;
 mod scheduler;
 mod schedules_http;
+mod scenario_http;
 mod state;
 mod watchdog;
 mod webhook;
