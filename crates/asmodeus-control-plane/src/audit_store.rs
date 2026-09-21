@@ -18,7 +18,11 @@ impl AuditStore {
     pub fn load(path: Option<PathBuf>) -> Self {
         let trail = match path.as_ref() {
             Some(path) => AuditTrail::load_from_file(path).unwrap_or_else(|err| {
-                tracing::warn!(error = %err, path = %path.display(), "failed to load audit trail; starting empty");
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to load audit trail; starting empty"
+                );
                 AuditTrail::new()
             }),
             None => AuditTrail::new(),
@@ -54,7 +58,11 @@ impl AuditStore {
         self.trail.write().unwrap().append(record.clone());
         if let Some(path) = self.path.as_ref() {
             if let Err(err) = AuditTrail::append_to_file(&record, path) {
-                tracing::warn!(error = %err, path = %path.display(), "failed to persist audit record");
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to persist audit record"
+                );
             }
         }
     }
@@ -88,7 +96,11 @@ impl AuditStore {
             return;
         };
         if let Err(err) = self.trail.read().unwrap().save_to_file(path) {
-            tracing::warn!(error = %err, path = %path.display(), "failed to persist audit trail snapshot");
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "failed to persist audit trail snapshot"
+            );
         }
     }
 }
