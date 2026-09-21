@@ -10,8 +10,10 @@
 
 mod api;
 mod campaign;
+mod campaign_http;
 mod catalog;
 mod dispatch;
+mod dto;
 mod engine;
 mod execution;
 pub(crate) mod http;
