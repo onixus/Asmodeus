@@ -32,17 +32,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    let config = ControlPlaneConfig::from_env()?;
     let state = AppState::new(Catalog::seeded());
-    let _watchdog = watchdog::spawn_watchdog(state.registry.clone(), 30);
-    let _scheduler = scheduler::spawn_scheduler(state.clone(), 30);
+    let _watchdog =
+        watchdog::spawn_watchdog(state.registry.clone(), config.watchdog_interval_sec);
+    let _scheduler = scheduler::spawn_scheduler(state.clone(), config.scheduler_interval_sec);
     let app = router(state);
 
-    let addr: SocketAddr = std::env::var("ASMODEUS_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:8842".into())
-        .parse()?;
-
-    tracing::info!(%addr, "asmodeus-control-plane listening (synthetic-only, INV-0)");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(
+        addr = %config.listen_addr,
+        watchdog_interval_sec = config.watchdog_interval_sec,
+        scheduler_interval_sec = config.scheduler_interval_sec,
+        "asmodeus-control-plane listening (synthetic-only, INV-0)"
+    );
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
