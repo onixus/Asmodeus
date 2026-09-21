@@ -19,6 +19,7 @@ mod openapi;
 mod registry;
 mod reporting;
 mod scheduler;
+mod schedules_http;
 mod state;
 mod watchdog;
 mod webhook;
