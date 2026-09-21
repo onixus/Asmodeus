@@ -17,6 +17,8 @@ mod dto;
 mod engine;
 mod execution;
 pub(crate) mod http;
+#[cfg(test)]
+mod http_tests;
 mod openapi;
 mod registry;
 mod reporting;
