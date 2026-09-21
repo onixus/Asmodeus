@@ -94,9 +94,15 @@ fn required_text<'a>(claims: &'a Value, key: &str) -> Result<&'a str, ApiError> 
 
 fn verified_apex_claims(token: &str) -> Result<Value, ApiError> {
     let mut parts = token.split('.');
-    let header_part = parts.next().ok_or(ApiError::Unauthorized("malformed bearer token"))?;
-    let payload_part = parts.next().ok_or(ApiError::Unauthorized("malformed bearer token"))?;
-    let signature_part = parts.next().ok_or(ApiError::Unauthorized("malformed bearer token"))?;
+    let header_part = parts
+        .next()
+        .ok_or(ApiError::Unauthorized("malformed bearer token"))?;
+    let payload_part = parts
+        .next()
+        .ok_or(ApiError::Unauthorized("malformed bearer token"))?;
+    let signature_part = parts
+        .next()
+        .ok_or(ApiError::Unauthorized("malformed bearer token"))?;
     if parts.next().is_some() {
         return Err(ApiError::Unauthorized("malformed bearer token"));
     }
@@ -134,7 +140,6 @@ fn verified_apex_claims(token: &str) -> Result<Value, ApiError> {
     if required_text(&claims, "iss")? != issuer {
         return Err(ApiError::Unauthorized("unexpected bearer token issuer"));
     }
-
     let audience = env_or("ASMODEUS_JWT_AUDIENCE", DEFAULT_APEX_AUDIENCE);
     if !audience_matches(
         claims
@@ -220,9 +225,10 @@ fn allow_unsigned_role_header() -> bool {
 
 /// Resolve the caller role from a signed APEX v1 bearer token.
 ///
-/// `X-Apex-Role` is ignored by production builds unless
-/// `ASMODEUS_ALLOW_ROLE_HEADER=1` is explicitly enabled for an isolated
-/// local/demo stand. Authorization still remains inside Asmodeus.
+/// `X-Apex-Role` is deliberately ignored by default. It is available only
+/// when `ASMODEUS_ALLOW_ROLE_HEADER=1` for an isolated local/demo stand. This
+/// keeps authorization inside the owning service instead of trusting a role
+/// asserted by the upstream Gateway.
 pub(crate) fn caller_role(headers: &HeaderMap) -> Result<Role, ApiError> {
     if let Some(role) = role_from_bearer(headers)? {
         return Ok(role);
@@ -242,7 +248,7 @@ pub(crate) fn caller_role(headers: &HeaderMap) -> Result<Role, ApiError> {
 }
 
 #[cfg(test)]
-mod apex_identity_tests {
+mod tests {
     use super::*;
     use serde_json::json;
 
@@ -250,6 +256,8 @@ mod apex_identity_tests {
 
     fn token(role: &str, patch: impl FnOnce(&mut Value)) -> String {
         std::env::set_var("ASMODEUS_JWT_SECRET", TEST_SECRET);
+        std::env::remove_var("ASMODEUS_ALLOW_ROLE_HEADER");
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
