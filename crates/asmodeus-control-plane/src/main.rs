@@ -20,6 +20,7 @@ pub(crate) mod http;
 mod openapi;
 mod registry;
 mod reporting;
+mod runner_http;
 mod scheduler;
 mod schedules_http;
 mod state;
