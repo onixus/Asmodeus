@@ -95,6 +95,8 @@ impl AppState {
         } else {
             AuditTrail::new()
         };
+        // Rebuild rolling detection metrics from the persisted audit trail so
+        // reports and /metrics survive a restart instead of resetting to zero.
         let metrics = Aggregate::from_records(audit_trail.records());
         AppState {
             catalog: Arc::new(catalog),

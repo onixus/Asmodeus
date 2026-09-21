@@ -120,7 +120,7 @@ impl WebhookDispatcher {
             }
 
             if let Some(sk) = key {
-                if let Ok(sig) = sign_message(&sk, json_body.as_bytes()) {
+                if let Ok(sig) = sign_message(json_body.as_bytes(), &sk) {
                     let sig_hex = hex_encode(&sig);
                     req = req.header("X-Asmodeus-Signature", sig_hex);
                 }

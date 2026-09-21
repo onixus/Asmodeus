@@ -41,6 +41,16 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
+    /// Rebuild a rolling aggregate from a slice of persisted audit records
+    /// (e.g. after loading the audit trail from disk on startup).
+    pub fn from_records(records: &[crate::audit::AuditRecord]) -> Self {
+        let mut agg = Self::default();
+        for r in records {
+            agg.record(r.measurements);
+        }
+        agg
+    }
+
     pub fn record(&mut self, m: Measurements) {
         self.scenarios_executed += 1;
         if m.blue_team_detected {
@@ -48,18 +58,6 @@ impl Aggregate {
         }
         self.sum_mttd_ms += m.mttd_ms;
         self.sum_mttr_ms += m.mttr_ms;
-    }
-
-    /// Rebuild a rolling aggregate from persisted audit records. Called at
-    /// startup so `/metrics`, `/telemetry/mttd` and the resilience report
-    /// reflect history loaded from `ASMODEUS_AUDIT_LOG` instead of resetting to
-    /// zero on every restart.
-    pub fn from_records(records: &[audit::AuditRecord]) -> Self {
-        let mut agg = Aggregate::default();
-        for r in records {
-            agg.record(r.measurements);
-        }
-        agg
     }
 
     /// Update an existing measurement (e.g. from closed-loop feedback).

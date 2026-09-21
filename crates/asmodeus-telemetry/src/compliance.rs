@@ -161,8 +161,10 @@ impl ComplianceReport {
             match status {
                 "COMPLIANT" => compliant_count += 1,
                 "PARTIAL" => partial_count += 1,
-                "NON_COMPLIANT" | "NO_EVIDENCE" => non_compliant_count += 1,
-                _ => {}
+                // NOT_TESTED and NO_EVIDENCE both mean "no passing evidence"; group
+                // them with NON_COMPLIANT so the summary buckets always sum to
+                // total_controls (matching the "not fulfilled / no data" label).
+                _ => non_compliant_count += 1,
             }
 
             evaluated_controls.push(ComplianceControl {
