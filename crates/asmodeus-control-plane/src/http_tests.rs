@@ -5,7 +5,7 @@
 
 use super::http::*;
 use crate::catalog::Catalog;
-use crate::registry::RunnerRegistry;
+use crate::registry::{RunnerRecord, RunnerRegistry};
 use crate::state::AppState;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -13,7 +13,6 @@ use axum::Router;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use super::*;
 
 fn app() -> Router {
     router(AppState::new(Catalog::seeded()))
