@@ -43,6 +43,11 @@ pub struct EcosystemResilienceReport {
     pub title: String,
     pub generated_at_utc: String,
     pub total_runs: usize,
+    pub confirmed_feedback_runs: u64,
+    pub simulated_runs: u64,
+    pub pending_feedback_runs: u64,
+    pub detected_runs: u64,
+    pub contained_runs: u64,
     pub resilience_score: u8,
     pub detection_rate_pct: f32,
     pub mean_mttd_ms: u64,
@@ -58,16 +63,16 @@ pub struct EcosystemResilienceReport {
 impl EcosystemResilienceReport {
     /// Build an executive report from the audit trail records and current rolling aggregate.
     pub fn build(records: &[AuditRecord], aggregate: &Aggregate) -> Self {
-        let total_runs = records.len();
+        let total_runs = aggregate.scenarios_executed as usize;
         let detection_rate = aggregate.detection_rate_pct();
         let recovery_speed = aggregate.recovery_speed_pct();
         let score = resilience_score(detection_rate, recovery_speed);
         let mean_mttd = aggregate.mean_mttd_ms();
         let mean_mttr = aggregate.mean_mttr_ms();
 
-        let mttr_sla_status = if mean_mttr <= TARGET_MTTR_MS && total_runs > 0 {
+        let mttr_sla_status = if mean_mttr <= TARGET_MTTR_MS && aggregate.contained > 0 {
             "COMPLIANT (≤ 300 ms)".to_string()
-        } else if total_runs == 0 {
+        } else if aggregate.contained == 0 {
             "NO DATA".to_string()
         } else {
             "DEGRADED (> 300 ms)".to_string()
@@ -83,11 +88,13 @@ impl EcosystemResilienceReport {
         let mut rc_total = 0;
         let mut rc_cleaned = 0;
 
-        let mut tactics_map: HashMap<String, (usize, usize, u64, u64)> = HashMap::new();
+        let mut tactics_map: HashMap<String, Aggregate> = HashMap::new();
 
-        for r in records {
+        for r in records
+            .iter()
+            .filter(|r| r.is_terminal() && r.has_confirmed_feedback())
+        {
             let detected = r.measurements.blue_team_detected;
-            let mttd = r.measurements.mttd_ms;
             let mttr = r.measurements.mttr_ms;
 
             // Tactic stats
@@ -96,13 +103,7 @@ impl EcosystemResilienceReport {
             } else {
                 "Infrastructure Chaos".to_string()
             };
-            let entry = tactics_map.entry(tactic_key).or_insert((0, 0, 0, 0));
-            entry.0 += 1;
-            if detected {
-                entry.1 += 1;
-            }
-            entry.2 += mttd;
-            entry.3 += mttr;
+            tactics_map.entry(tactic_key).or_default().record_run(r);
 
             // Mapping to NIST functions:
             // Detect (DE): all attack simulations
@@ -127,7 +128,7 @@ impl EcosystemResilienceReport {
             // Respond (RS): containment speed and SOAR action
             if detected {
                 rs_total += 1;
-                if mttr <= TARGET_MTTR_MS * 2 {
+                if r.evidence.as_ref().is_some_and(|e| e.contained) && mttr <= TARGET_MTTR_MS * 2 {
                     rs_contained += 1;
                 }
             }
@@ -141,7 +142,7 @@ impl EcosystemResilienceReport {
 
         let calc_pct = |num: usize, den: usize| -> f32 {
             if den == 0 {
-                100.0
+                0.0
             } else {
                 100.0 * num as f32 / den as f32
             }
@@ -149,28 +150,25 @@ impl EcosystemResilienceReport {
 
         let nist_functions = vec![
             NistFunctionAssessment {
-                function_name: "Govern".to_string(),
-                code: "GV".to_string(),
-                scenarios_evaluated: total_runs,
-                successful_detections: total_runs,
-                score_pct: 100.0,
-                status: "OPTIMAL".to_string(),
+                function_name: "Govern".into(),
+                code: "GV".into(),
+                scenarios_evaluated: 0,
+                successful_detections: 0,
+                score_pct: 0.0,
+                status: "NOT_ASSESSED".into(),
                 details: vec![
-                    "Strict RBAC matrix enforced for Red Team, DevSecOps, CISO, and Auditor roles".to_string(),
-                    "100% of audit records cryptographically signed with Ed25519 digital signatures".to_string(),
-                    "INV-0 Root invariant enforced: all exercises strictly synthetic".to_string(),
+                    "Execution feedback does not assess organizational governance.".into(),
                 ],
             },
             NistFunctionAssessment {
-                function_name: "Identify".to_string(),
-                code: "ID".to_string(),
-                scenarios_evaluated: total_runs,
-                successful_detections: if total_runs > 0 { total_runs } else { 0 },
-                score_pct: if total_runs > 0 { 100.0 } else { 0.0 },
-                status: if total_runs > 0 { "OPTIMAL".to_string() } else { "INACTIVE".to_string() },
+                function_name: "Identify".into(),
+                code: "ID".into(),
+                scenarios_evaluated: 0,
+                successful_detections: 0,
+                score_pct: 0.0,
+                status: "NOT_ASSESSED".into(),
                 details: vec![
-                    "Dynamic runner discovery with capability tagging (k8s_workload, endpoint_agent, network_gateway)".to_string(),
-                    "Deterministic MITRE ATT&CK enterprise technique mapping across 7 attack tactics".to_string(),
+                    "Runner inventory is not evidence of asset-discovery coverage.".into(),
                 ],
             },
             NistFunctionAssessment {
@@ -179,11 +177,22 @@ impl EcosystemResilienceReport {
                 scenarios_evaluated: pr_total,
                 successful_detections: pr_detected,
                 score_pct: calc_pct(pr_detected, pr_total),
-                status: if calc_pct(pr_detected, pr_total) >= 80.0 { "STRONG".to_string() } else { "ATTENTION_REQUIRED".to_string() },
+                status: if pr_total == 0 {
+                    "NO DATA".to_string()
+                } else if calc_pct(pr_detected, pr_total) >= 80.0 {
+                    "STRONG".to_string()
+                } else {
+                    "ATTENTION_REQUIRED".to_string()
+                },
                 details: vec![
-                    "Canary filesystem sandbox strictly whitelisted to /var/tmp and /tmp (INV-0)".to_string(),
-                    "End-to-end mutual TLS (mTLS) with fail-closed cryptographic channels".to_string(),
-                    format!("Host hardening and credential protection effectiveness: {:.1}%", calc_pct(pr_detected, pr_total)),
+                    "Canary filesystem sandbox strictly whitelisted to /var/tmp and /tmp (INV-0)"
+                        .to_string(),
+                    "Scores describe submitted exercise feedback, not a compliance certification"
+                        .to_string(),
+                    format!(
+                        "Host hardening and credential protection effectiveness: {:.1}%",
+                        calc_pct(pr_detected, pr_total)
+                    ),
                 ],
             },
             NistFunctionAssessment {
@@ -192,11 +201,23 @@ impl EcosystemResilienceReport {
                 scenarios_evaluated: de_total,
                 successful_detections: de_detected,
                 score_pct: calc_pct(de_detected, de_total),
-                status: if calc_pct(de_detected, de_total) >= 90.0 { "OPTIMAL".to_string() } else { "IMPROVEMENT_NEEDED".to_string() },
+                status: if de_total == 0 {
+                    "NO DATA".to_string()
+                } else if calc_pct(de_detected, de_total) >= 90.0 {
+                    "OPTIMAL".to_string()
+                } else {
+                    "IMPROVEMENT_NEEDED".to_string()
+                },
                 details: vec![
-                    format!("Mean Time To Detect (MTTD): {} ms across evaluated attack techniques", mean_mttd),
-                    "Kernel-level monitoring through Ferrum eBPF probes and Lariska endpoint agents".to_string(),
-                    format!("Overall detection efficiency: {:.1}%", calc_pct(de_detected, de_total)),
+                    format!(
+                        "Mean Time To Detect (MTTD): {} ms across evaluated attack techniques",
+                        mean_mttd
+                    ),
+                    "Only explicit feedback for runner executions is evaluated".to_string(),
+                    format!(
+                        "Overall detection efficiency: {:.1}%",
+                        calc_pct(de_detected, de_total)
+                    ),
                 ],
             },
             NistFunctionAssessment {
@@ -205,10 +226,20 @@ impl EcosystemResilienceReport {
                 scenarios_evaluated: rs_total,
                 successful_detections: rs_contained,
                 score_pct: calc_pct(rs_contained, rs_total),
-                status: if calc_pct(rs_contained, rs_total) >= 80.0 { "AGILE".to_string() } else { "LATENCY_RISK".to_string() },
+                status: if rs_total == 0 {
+                    "NO DATA".to_string()
+                } else if calc_pct(rs_contained, rs_total) >= 80.0 {
+                    "AGILE".to_string()
+                } else {
+                    "LATENCY_RISK".to_string()
+                },
                 details: vec![
-                    format!("Mean Time To Remediate (MTTR): {} ms (target: {} ms)", mean_mttr, TARGET_MTTR_MS),
-                    "Automated SOAR policy containment (SIGKILL, Pod Isolation, DNS RPZ Sinkhole)".to_string(),
+                    format!(
+                        "Mean Time To Remediate (MTTR): {} ms (target: {} ms)",
+                        mean_mttr, TARGET_MTTR_MS
+                    ),
+                    "Containment must be explicitly confirmed by the feedback submitter"
+                        .to_string(),
                 ],
             },
             NistFunctionAssessment {
@@ -217,22 +248,32 @@ impl EcosystemResilienceReport {
                 scenarios_evaluated: rc_total,
                 successful_detections: rc_cleaned,
                 score_pct: calc_pct(rc_cleaned, rc_total),
-                status: "VERIFIED".to_string(),
+                status: if rc_total == 0 {
+                    "NO DATA"
+                } else if rc_total == rc_cleaned {
+                    "VERIFIED"
+                } else {
+                    "CLEANUP_UNCONFIRMED"
+                }
+                .into(),
                 details: vec![
-                    format!("Self-cleaning rollback success: {:.1}% (zero residual artifacts)", calc_pct(rc_cleaned, rc_total)),
-                    "Circuit Breaker and Dead-Man switch active on all distributed execution runners".to_string(),
+                    format!(
+                        "Self-cleaning rollback success: {:.1}% (zero residual artifacts)",
+                        calc_pct(rc_cleaned, rc_total)
+                    ),
+                    "Cleanup requires a terminal runner confirmation".to_string(),
                 ],
             },
         ];
 
         let mut tactics_breakdown: Vec<TacticStat> = tactics_map
             .into_iter()
-            .map(|(name, (tot, det, mttd_sum, mttr_sum))| TacticStat {
+            .map(|(name, agg)| TacticStat {
                 tactic_name: name,
-                total_runs: tot,
-                detected_runs: det,
-                mean_mttd_ms: if tot > 0 { mttd_sum / tot as u64 } else { 0 },
-                mean_mttr_ms: if tot > 0 { mttr_sum / tot as u64 } else { 0 },
+                total_runs: agg.scenarios_executed as usize,
+                detected_runs: agg.detected as usize,
+                mean_mttd_ms: agg.mean_mttd_ms(),
+                mean_mttr_ms: agg.mean_mttr_ms(),
             })
             .collect();
         tactics_breakdown.sort_by(|a, b| a.tactic_name.cmp(&b.tactic_name));
@@ -244,10 +285,13 @@ impl EcosystemResilienceReport {
                 mean_mttr, TARGET_MTTR_MS
             ));
         }
-        if detection_rate < 90.0 && total_runs > 0 {
+        if detection_rate < 90.0 && aggregate.feedback_received > 0 {
             recommendations.push(
                 "Enhance eBPF sensor heuristic rules for low-visibility TTPs (e.g. credential honeytokens).".to_string(),
             );
+        }
+        if aggregate.feedback_received == 0 {
+            recommendations.push("Collect Blue Team feedback for live runner executions before assessing defense effectiveness.".into());
         }
         if recommendations.is_empty() {
             recommendations.push(
@@ -256,18 +300,27 @@ impl EcosystemResilienceReport {
             );
         }
 
-        let executive_summary = format!(
+        let executive_summary = if aggregate.feedback_received == 0 {
+            format!("Завершено {total_runs} прогонов. Подтверждённых результатов Blue Team нет; MTTD, MTTR и оценка защиты не определены.")
+        } else {
+            format!(
             "Платформа Asmodeus провела {} контрольных упражнений кибер-учений и стресс-тестов. \
              Интегральный индекс устойчивости инфраструктуры составляет {}/100 при показателе детекции {:.1}%. \
              Среднее время обнаружения (MTTD) зафиксировано на уровне {} мс, среднее время сдерживания (MTTR) — {} мс.",
-            total_runs, score, detection_rate, mean_mttd, mean_mttr
-        );
+            aggregate.feedback_received, score, detection_rate, mean_mttd, mean_mttr
+        )
+        };
 
         EcosystemResilienceReport {
             title: "ASMODEUS — Отчёт об Устойчивости Инфраструктуры (NIST CSF 2.0 & BAS)"
                 .to_string(),
             generated_at_utc: crate::current_utc_iso8601(),
             total_runs,
+            confirmed_feedback_runs: aggregate.feedback_received,
+            simulated_runs: aggregate.simulated_runs,
+            pending_feedback_runs: aggregate.pending_feedback,
+            detected_runs: aggregate.detected,
+            contained_runs: aggregate.contained,
             resilience_score: score,
             detection_rate_pct: detection_rate,
             mean_mttd_ms: mean_mttd,
@@ -304,7 +357,9 @@ impl EcosystemResilienceReport {
         md.push_str(&format!(
             "| **Resilience Score** | **{}/100** | ≥ 80/100 | {} |\n",
             self.resilience_score,
-            if self.resilience_score >= 80 {
+            if self.confirmed_feedback_runs == 0 {
+                "Нет данных"
+            } else if self.resilience_score >= 80 {
                 "✅ В норме"
             } else {
                 "⚠️ Требует внимания"
@@ -313,7 +368,9 @@ impl EcosystemResilienceReport {
         md.push_str(&format!(
             "| **Detection Rate** | **{:.1}%** | ≥ 95.0% | {} |\n",
             self.detection_rate_pct,
-            if self.detection_rate_pct >= 95.0 {
+            if self.confirmed_feedback_runs == 0 {
+                "Нет данных"
+            } else if self.detection_rate_pct >= 95.0 {
                 "✅ В норме"
             } else {
                 "⚠️ Ниже порога"
@@ -322,7 +379,9 @@ impl EcosystemResilienceReport {
         md.push_str(&format!(
             "| **Mean MTTD (Обнаружение)** | **{} мс** | ≤ 300 мс | {} |\n",
             self.mean_mttd_ms,
-            if self.mean_mttd_ms <= 300 {
+            if self.detected_runs == 0 {
+                "Нет данных"
+            } else if self.mean_mttd_ms <= 300 {
                 "✅ В норме"
             } else {
                 "⚠️ Замедленно"
@@ -395,6 +454,7 @@ pub struct SingleRunReport {
     pub cleanup_status: String,
     pub timestamp_utc: String,
     pub signature_verified: bool,
+    pub evidence: Option<crate::RunEvidence>,
 }
 
 impl SingleRunReport {
@@ -422,6 +482,7 @@ impl SingleRunReport {
             cleanup_status: record.cleanup_status.clone(),
             timestamp_utc: record.timestamp_utc.clone(),
             signature_verified,
+            evidence: record.evidence.clone(),
         }
     }
 
@@ -459,7 +520,13 @@ impl SingleRunReport {
             self.initiator,
             self.runner_id,
             self.status,
-            if self.blue_team_detected {
+            if !self
+                .evidence
+                .as_ref()
+                .is_some_and(|e| e.execution_mode == "runner" && e.feedback_received)
+            {
+                "ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ (симуляция не является измерением)"
+            } else if self.blue_team_detected {
                 "✅ ОБНАРУЖЕНО"
             } else {
                 "❌ НЕ ОБНАРУЖЕНО"
@@ -513,6 +580,13 @@ mod tests {
             timestamp_utc: "2026-09-09T18:00:00Z".to_string(),
             signature_hex: String::new(),
             public_key_hex: String::new(),
+            evidence: Some(crate::RunEvidence {
+                execution_mode: "runner".into(),
+                feedback_received: true,
+                contained: true,
+                cleanup_confirmed: true,
+                failure_reason: None,
+            }),
         };
 
         let report = EcosystemResilienceReport::build(&[record], &agg);

@@ -10,12 +10,11 @@ use crate::state::AppState;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
-
 fn app() -> Router {
-    router(AppState::new(Catalog::seeded()))
+    router(AppState::new(Catalog::seeded()).unwrap())
 }
 
 async fn send(method: &str, uri: &str, role: Option<&str>) -> (StatusCode, Value) {
@@ -50,7 +49,7 @@ async fn red_team_runs_red_team_scenario() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "COMPLETED");
-    assert_eq!(body["measurements"]["blue_team_detected"], true);
+    assert_eq!(body["measurements"]["blue_team_detected"], false);
 }
 
 #[tokio::test]
@@ -107,7 +106,7 @@ async fn unknown_scenario_is_not_found() {
 #[tokio::test]
 async fn metrics_reflect_a_run() {
     // Drive one run then scrape /metrics on the SAME app instance.
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
     let run = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
@@ -129,7 +128,7 @@ async fn metrics_reflect_a_run() {
     let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("asmodeus_scenarios_executed_total 1"));
-    assert!(text.contains("asmodeus_mttd_seconds 0.142"));
+    assert!(text.contains("asmodeus_mttd_seconds 0.000"));
 }
 
 #[tokio::test]
@@ -144,8 +143,7 @@ async fn auditor_can_view_but_not_abort() {
 
 use asmodeus_proto::{
     EventKind as PbEvent, ExecuteRequest as PbExecute, HeartbeatReply as PbHbReply,
-    HeartbeatRequest as PbHbReq, RunnerControl, RunnerControlServer,
-    RunnerEvent as PbRunnerEvent,
+    HeartbeatRequest as PbHbReq, RunnerControl, RunnerControlServer, RunnerEvent as PbRunnerEvent,
 };
 use std::pin::Pin;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -174,21 +172,34 @@ impl RunnerControl for MockRunner {
         ] {
             evs.push(PbRunnerEvent {
                 kind: PbEvent::StateChanged as i32,
+                run_id: _req.get_ref().run_id.clone(),
                 state: s.into(),
                 ..Default::default()
             });
         }
         evs.push(PbRunnerEvent {
             kind: PbEvent::Completed as i32,
+            run_id: _req.get_ref().run_id.clone(),
             state: "Completed".into(),
             files_created: 20,
             bytes_written: 40960,
             inject_ms: 7,
             detail: String::new(),
+            cleanup_confirmed: true,
+            ..Default::default()
         });
         Ok(tonic::Response::new(Box::pin(tokio_stream::iter(
             evs.into_iter().map(Ok),
         ))))
+    }
+
+    async fn cancel(
+        &self,
+        _: tonic::Request<asmodeus_proto::CancelRequest>,
+    ) -> Result<tonic::Response<asmodeus_proto::CancelReply>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "cancel not used by this test double",
+        ))
     }
 
     async fn heartbeat(
@@ -234,12 +245,22 @@ impl RunnerControl for PartialRunner {
     ) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
         let evs = ["Validated", "Armed", "Injecting"].map(|s| PbRunnerEvent {
             kind: PbEvent::StateChanged as i32,
+            run_id: _req.get_ref().run_id.clone(),
             state: s.into(),
             ..Default::default()
         });
         Ok(tonic::Response::new(Box::pin(tokio_stream::iter(
             evs.into_iter().map(Ok),
         ))))
+    }
+
+    async fn cancel(
+        &self,
+        _: tonic::Request<asmodeus_proto::CancelRequest>,
+    ) -> Result<tonic::Response<asmodeus_proto::CancelReply>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "cancel not used by this test double",
+        ))
     }
 
     async fn heartbeat(
@@ -288,7 +309,7 @@ async fn dispatches_to_live_runner() {
     let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
 
     let url = start_mock_runner().await;
-    let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())));
+    let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())).unwrap());
 
     let req = Request::builder()
         .method("POST")
@@ -302,8 +323,8 @@ async fn dispatches_to_live_runner() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(body["status"], "COMPLETED");
-    assert_eq!(body["execution"]["mode"], "dispatched");
-    assert_eq!(body["execution"]["runner_final_state"], "Completed");
+    assert_eq!(body["execution"]["mode"], "runner");
+    assert_eq!(body["execution"]["runner_final_state"], "COMPLETED");
     assert_eq!(body["execution"]["files_created"], 20);
     assert_eq!(body["execution"]["runner_endpoint"], url);
 }
@@ -314,7 +335,7 @@ async fn partial_runner_is_not_reported_completed() {
     let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
 
     let url = start_partial_runner().await;
-    let app = router(AppState::with_runner(Catalog::seeded(), Some(url)));
+    let app = router(AppState::with_runner(Catalog::seeded(), Some(url)).unwrap());
 
     let req = Request::builder()
         .method("POST")
@@ -398,7 +419,7 @@ async fn dispatches_to_live_runner_over_mtls() {
     ]);
 
     let url = start_mock_mtls_runner(mtls.server_tls_config()).await;
-    let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())));
+    let app = router(AppState::with_runner(Catalog::seeded(), Some(url.clone())).unwrap());
 
     let req = Request::builder()
         .method("POST")
@@ -412,8 +433,8 @@ async fn dispatches_to_live_runner_over_mtls() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(body["status"], "COMPLETED");
-    assert_eq!(body["execution"]["mode"], "dispatched");
-    assert_eq!(body["execution"]["runner_final_state"], "Completed");
+    assert_eq!(body["execution"]["mode"], "runner");
+    assert_eq!(body["execution"]["runner_final_state"], "COMPLETED");
     assert_eq!(body["execution"]["files_created"], 20);
     assert_eq!(body["execution"]["runner_endpoint"], url);
 
@@ -442,7 +463,7 @@ async fn dispatch_over_mtls_rejects_untrusted_client() {
     ]);
 
     let url = start_mock_mtls_runner(mtls.server_tls_config()).await;
-    let app = router(AppState::with_runner(Catalog::seeded(), Some(url)));
+    let app = router(AppState::with_runner(Catalog::seeded(), Some(url)).unwrap());
 
     let req = Request::builder()
         .method("POST")
@@ -459,7 +480,7 @@ async fn dispatch_over_mtls_rejects_untrusted_client() {
 
 #[tokio::test]
 async fn list_scenarios_returns_all_entries_with_mitre_metadata() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/scenarios")
@@ -491,7 +512,7 @@ async fn list_scenarios_returns_all_entries_with_mitre_metadata() {
 
 #[tokio::test]
 async fn get_scenario_returns_single_scenario_details() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/scenarios/CREDENTIAL_ACCESS_CANARY")
@@ -511,7 +532,7 @@ async fn get_scenario_returns_single_scenario_details() {
 
 #[tokio::test]
 async fn mitre_matrix_returns_coverage_report() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/scenarios/mitre")
@@ -539,7 +560,7 @@ async fn mitre_matrix_returns_coverage_report() {
 
 #[tokio::test]
 async fn run_scenario_includes_mitre_and_scenario_name() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/asmodeus/scenarios/C2_BEACONING_SIMULATION/run")
@@ -562,7 +583,7 @@ async fn run_scenario_includes_mitre_and_scenario_name() {
 
 #[tokio::test]
 async fn runners_lifecycle_and_rbac() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // 1. CISO cannot register runner (403)
     let req = Request::builder()
@@ -642,7 +663,7 @@ async fn dispatch_with_target_override_and_ping() {
         vec!["k8s_workload".into()],
     ));
 
-    let app = router(AppState::with_registry(Catalog::seeded(), reg));
+    let app = router(AppState::with_registry(Catalog::seeded(), reg).unwrap());
 
     // 1. Ping runner over gRPC
     let req = Request::builder()
@@ -676,7 +697,7 @@ async fn dispatch_with_target_override_and_ping() {
     let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["status"], "COMPLETED");
-    assert_eq!(body["execution"]["mode"], "dispatched");
+    assert_eq!(body["execution"]["mode"], "runner");
     assert_eq!(body["execution"]["runner_id"], "k8s-probe-01");
 
     // 3. Run with unknown target returns 404
@@ -698,7 +719,7 @@ async fn dispatch_with_target_override_and_ping() {
 
 #[tokio::test]
 async fn runs_history_and_crypto_verification() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // 1. Initially no runs
     let req = Request::builder()
@@ -772,7 +793,7 @@ async fn runs_history_and_crypto_verification() {
 
 #[tokio::test]
 async fn campaigns_execution_and_rbac() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // 1. List campaigns
     let req = Request::builder()
@@ -815,7 +836,9 @@ async fn campaigns_execution_and_rbac() {
     assert_eq!(res["total_steps"], 4);
     assert_eq!(res["successful_steps"], 4);
     assert_eq!(res["step_results"].as_array().unwrap().len(), 4);
-    assert!(res["resilience_score"].as_u64().unwrap() > 0);
+    assert_eq!(res["resilience_score"], 0);
+    assert_eq!(res["confirmed_feedback_runs"], 0);
+    assert_eq!(res["simulated_runs"], 4);
 
     // 4. All 4 steps are recorded in audit trail
     let req = Request::builder()
@@ -836,10 +859,13 @@ async fn explicit_target_never_falls_back_to_static_endpoint() {
     // A static default runner endpoint is configured, but the requested
     // target matches no registered runner. The request must be rejected
     // with 404 rather than silently dispatched to the default runner.
-    let app = router(AppState::with_runner(
-        Catalog::seeded(),
-        Some("http://127.0.0.1:59999".to_string()),
-    ));
+    let app = router(
+        AppState::with_runner(
+            Catalog::seeded(),
+            Some("http://127.0.0.1:59999".to_string()),
+        )
+        .unwrap(),
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -858,7 +884,7 @@ async fn explicit_target_never_falls_back_to_static_endpoint() {
 
 #[tokio::test]
 async fn validate_manifest_endpoint_checks_inv0() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // 1. Valid YAML manifest
     let valid_yaml = r#"
@@ -872,19 +898,19 @@ metadata:
   severity: "high"
 spec:
   target_scope:
-type: "k8s_workload"
-target_path: "/var/tmp/asmodeus-canary/canary.docx"
+    type: "k8s_workload"
+    target_path: "/var/tmp/asmodeus-canary/canary.docx"
   safety:
-max_duration_sec: 45
-cpu_limit_percent: 20
-canary_directory_only: "/var/tmp/asmodeus-canary"
+    max_duration_sec: 45
+    cpu_limit_percent: 20
+    canary_directory_only: "/var/tmp/asmodeus-canary"
   action:
-nature: "synthetic"
-type: "synthetic_canary_encrypt"
-parameters:
-  file_count: 20
+    nature: "synthetic"
+    type: "synthetic_canary_encrypt"
+    parameters:
+      file_count: 20
   expected_outcome:
-detector: "ferrum_ebpf"
+    detector: "ferrum_ebpf"
 "#;
 
     let req = Request::builder()
@@ -914,7 +940,7 @@ detector: "ferrum_ebpf"
 
 #[tokio::test]
 async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // 1. Run scenario as Red Team
     let req = Request::builder()
@@ -963,7 +989,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
     let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let feedback_resp: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(feedback_resp["status"], "UPDATED");
-    assert_eq!(feedback_resp["run_status"], "CONTAINED");
+    assert_eq!(feedback_resp["run_status"], "COMPLETED");
     assert_eq!(feedback_resp["measurements"]["mttd_ms"], 115);
     assert_eq!(feedback_resp["measurements"]["mttr_ms"], 210);
 
@@ -1022,7 +1048,7 @@ async fn closed_loop_feedback_updates_and_re_signs_audit_record() {
 
 #[tokio::test]
 async fn openapi_endpoint_returns_valid_spec() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/asmodeus/openapi.json")
@@ -1039,7 +1065,7 @@ async fn openapi_endpoint_returns_valid_spec() {
 
 #[tokio::test]
 async fn audit_export_json_and_jsonl() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // 1. Run a scenario to generate audit record
     let req = Request::builder()
@@ -1090,7 +1116,7 @@ async fn audit_export_json_and_jsonl() {
 
 #[tokio::test]
 async fn campaigns_dynamic_crud_and_rbac() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     let custom_campaign = json!({
         "id": "CAMP-DYNAMIC-001",
@@ -1170,7 +1196,7 @@ async fn campaigns_dynamic_crud_and_rbac() {
 
 #[tokio::test]
 async fn audit_export_clickhouse_formats() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // Run scenario to generate audit record
     let req = Request::builder()
@@ -1220,7 +1246,7 @@ async fn audit_export_clickhouse_formats() {
 
 #[tokio::test]
 async fn compliance_report_json_and_markdown() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // Run scenario to seed some audit data
     let req = Request::builder()
@@ -1276,7 +1302,7 @@ async fn compliance_report_json_and_markdown() {
 
 #[tokio::test]
 async fn schedules_crud_and_rbac() {
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
 
     // 1. List seeded schedules as auditor
     let req = Request::builder()
@@ -1398,7 +1424,7 @@ async fn schedule_detail_toggle_and_alerts() {
     assert!(body["alerts"].as_array().unwrap().is_empty());
 
     // Toggle: read-only role is forbidden; admin succeeds.
-    let app = router(AppState::new(Catalog::seeded()));
+    let app = router(AppState::new(Catalog::seeded()).unwrap());
     let forbid = Request::builder()
         .method("PATCH")
         .uri("/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE")
@@ -1436,4 +1462,168 @@ async fn schedule_detail_toggle_and_alerts() {
         app.oneshot(missing).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn unavailable_registry_does_not_fall_back_to_simulation_or_static_runner() {
+    for endpoint in [None, Some("http://127.0.0.1:1".into())] {
+        let state = AppState::with_runner(Catalog::seeded(), endpoint).unwrap();
+        state.registry.register(RunnerRecord::new(
+            "unavailable",
+            "Test",
+            "http://127.0.0.1:1",
+            vec![],
+        ));
+        for runner in state.registry.list() {
+            state.registry.mark_unresponsive(&runner.id);
+        }
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+                    .header("x-apex-role", "admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(state.audit.len(), 0);
+    }
+}
+
+async fn feature_request(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    role: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-apex-role", role)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn background_cancel_rbac_and_feedback_do_not_invent_cleanup_or_metrics() {
+    let polygon = asmodeus_testkit::Polygon::new("background-http");
+    std::fs::create_dir_all(polygon.dir()).unwrap();
+    let mut manifest =
+        asmodeus_dsl::synthetic_manifest("RANSOMWARE_CANARY_SPIKE", &polygon.path(), 2, 1);
+    manifest
+        .spec
+        .action
+        .parameters
+        .insert("duration_ms".into(), 5000.into());
+    std::fs::write(
+        polygon.dir().join("long.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let mut catalog = Catalog::seeded();
+    catalog.load_from_dir(polygon.dir()).unwrap();
+    let state = AppState::new(catalog).unwrap();
+    let app = router(state.clone());
+    let (status, run) = feature_request(
+        &app,
+        "POST",
+        "/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run",
+        "red_team",
+        json!({"background":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let id = run["run_id"].as_str().unwrap();
+    assert!(state.audit.get(id).is_some());
+    let cancel_uri = format!("/api/v1/asmodeus/runs/{id}/cancel");
+    assert_eq!(
+        feature_request(&app, "POST", &cancel_uri, "devsecops", json!({}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, cancelled) =
+        feature_request(&app, "POST", &cancel_uri, "red_team", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(cancelled["cleanup_confirmed"], false);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !state.audit.get(id).unwrap().is_terminal() || !state.runs.lock().unwrap().is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let terminal = state.audit.get(id).unwrap();
+    assert_eq!(terminal.status, "CANCELLED");
+    assert_eq!(terminal.cleanup_status, "NOT_APPLICABLE");
+    assert!(terminal.verify_with_key(&state.audit_public_key));
+    assert!(state.runs.lock().unwrap().is_empty());
+    let feedback_uri = format!("/api/v1/asmodeus/runs/{id}/feedback");
+    assert_eq!(
+        feature_request(
+            &app,
+            "POST",
+            &feedback_uri,
+            "secops",
+            json!({"detected":true})
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        feature_request(
+            &app,
+            "POST",
+            &feedback_uri,
+            "secops",
+            json!({"detected":true,"contained":true,"mttd_ms":5,"mttr_ms":10})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let record = state.audit.get(id).unwrap();
+    assert!(!record.evidence.as_ref().unwrap().cleanup_confirmed);
+    assert_eq!(record.status, "CANCELLED");
+    assert_eq!(state.audit.aggregate().feedback_received, 0);
+    assert_eq!(state.audit.aggregate().simulated_runs, 1);
+    assert_eq!(state.audit.aggregate().mean_mttr_ms(), 0);
+}
+
+#[tokio::test]
+async fn devsecops_cannot_enable_stored_red_team_schedule() {
+    let app = app();
+    assert_eq!(
+        feature_request(
+            &app,
+            "PATCH",
+            "/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE",
+            "devsecops",
+            json!({"enabled":true})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, response) = feature_request(
+        &app,
+        "GET",
+        "/api/v1/asmodeus/schedules/SCHED-BASE-RANSOMWARE",
+        "auditor",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["schedule"]["enabled"], false);
 }

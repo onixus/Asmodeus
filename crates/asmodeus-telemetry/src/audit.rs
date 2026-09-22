@@ -5,6 +5,18 @@ use std::time::SystemTime;
 
 use crate::Measurements;
 
+/// Evidence is explicitly separate from scenario execution. Legacy records
+/// without this field remain verifiable but cannot prove Blue Team outcomes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvidence {
+    pub execution_mode: String,
+    pub feedback_received: bool,
+    pub contained: bool,
+    pub cleanup_confirmed: bool,
+    pub failure_reason: Option<String>,
+}
+
 /// Single immutable audit log record of a red team / chaos run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
@@ -26,6 +38,8 @@ pub struct AuditRecord {
     pub timestamp_utc: String,
     pub signature_hex: String,
     pub public_key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<RunEvidence>,
 }
 
 impl AuditRecord {
@@ -63,7 +77,26 @@ impl AuditRecord {
         field(&mut buf, &self.containment_action);
         field(&mut buf, &self.cleanup_status);
         field(&mut buf, &self.timestamp_utc);
+        // Preserve canonical bytes for historical records; evidence-bearing
+        // revisions use a tagged extension whose contents are also signed.
+        if let Some(evidence) = &self.evidence {
+            field(&mut buf, "evidence-v1");
+            field(
+                &mut buf,
+                &serde_json::to_string(evidence).expect("evidence serialization"),
+            );
+        }
         buf
+    }
+
+    pub fn has_confirmed_feedback(&self) -> bool {
+        self.evidence
+            .as_ref()
+            .is_some_and(|e| e.execution_mode == "runner" && e.feedback_received)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self.status.as_str(), "QUEUED" | "RUNNING" | "CANCELLING")
     }
 
     /// Sign this audit record using the operator's Ed25519 private key.
@@ -215,9 +248,11 @@ impl AuditTrail {
         crate::clickhouse::records_to_clickhouse_ndjson(&self.records)
     }
 
-    /// Read records from a JSONL reader.
+    /// Replay JSONL revisions. The last revision of each run wins; its original
+    /// insertion position is preserved. Old one-record-per-run logs still load.
     pub fn from_jsonl<R: std::io::BufRead>(reader: R) -> std::io::Result<Self> {
         let mut records = Vec::new();
+        let mut positions = std::collections::HashMap::new();
         for line in reader.lines() {
             let line = line?;
             let trimmed = line.trim();
@@ -226,7 +261,12 @@ impl AuditTrail {
             }
             let rec = serde_json::from_str::<AuditRecord>(trimmed)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            records.push(rec);
+            if let Some(&pos) = positions.get(&rec.run_id) {
+                records[pos] = rec;
+            } else {
+                positions.insert(rec.run_id.clone(), records.len());
+                records.push(rec);
+            }
         }
         Ok(Self { records })
     }
@@ -241,27 +281,35 @@ impl AuditTrail {
 
     /// Load audit trail from a JSONL file. If file does not exist, returns an empty trail.
     pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
-        if !path.exists() {
-            return Ok(Self::new());
-        }
-        let file = std::fs::File::open(path)?;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(err) => return Err(err),
+        };
         let reader = std::io::BufReader::new(file);
         Self::from_jsonl(reader)
     }
 
-    /// Append a single record to a persistent JSONL file.
+    /// Durably append a revision. Callers must serialize writers to this path.
     pub fn append_to_file(record: &AuditRecord, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut line = serde_json::to_vec(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
-        let line = serde_json::to_string(record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{line}")?;
+        let original_len = file.metadata()?.len();
+        if let Err(err) = file.write_all(&line).and_then(|()| file.sync_all()) {
+            // Do not leave a partial revision behind on a recoverable I/O error.
+            file.set_len(original_len)?;
+            file.sync_all()?;
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -310,7 +358,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(hex_str: &str) -> Option<Vec<u8>> {
-    if !hex_str.len().is_multiple_of(2) {
+    if !hex_str.is_ascii() || !hex_str.len().is_multiple_of(2) {
         return None;
     }
     (0..hex_str.len())
@@ -348,6 +396,7 @@ mod tests {
             timestamp_utc: "2026-09-09T12:00:00.000Z".to_string(),
             signature_hex: String::new(),
             public_key_hex: String::new(),
+            evidence: None,
         }
     }
 
@@ -359,6 +408,30 @@ mod tests {
         assert!(!record.signature_hex.is_empty());
         assert!(!record.public_key_hex.is_empty());
         assert!(record.verify(), "Record signature must verify successfully");
+    }
+
+    #[test]
+    fn legacy_signatures_and_signed_evidence_are_not_interchangeable() {
+        let (pk, sk) = generate_keypair();
+        let legacy = sample_record().sign(&sk).unwrap();
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("evidence"));
+        let restored: AuditRecord = serde_json::from_str(&json).unwrap();
+        assert!(restored.verify_with_key(&pk));
+        assert!(!restored.has_confirmed_feedback());
+        let mut record = legacy;
+        record.evidence = Some(RunEvidence {
+            execution_mode: "runner".into(),
+            feedback_received: true,
+            contained: true,
+            cleanup_confirmed: true,
+            failure_reason: None,
+        });
+        assert!(!record.verify_with_key(&pk));
+        let mut record = record.sign(&sk).unwrap();
+        assert!(record.verify_with_key(&pk));
+        record.evidence.as_mut().unwrap().cleanup_confirmed = false;
+        assert!(!record.verify_with_key(&pk));
     }
 
     #[test]
@@ -471,6 +544,16 @@ mod tests {
         let ts = current_utc_iso8601();
         assert!(ts.contains('T') && ts.ends_with('Z'));
         assert!(ts.len() >= 20);
+    }
+
+    #[test]
+    fn malformed_unicode_hex_is_rejected_without_panicking() {
+        let (pk, sk) = generate_keypair();
+        let mut record = sample_record().sign(&sk).unwrap();
+        record.signature_hex = "aéa".into();
+        assert!(!record.verify_with_key(&pk));
+        record.public_key_hex = "aéa".into();
+        assert!(!record.verify());
     }
 
     #[test]

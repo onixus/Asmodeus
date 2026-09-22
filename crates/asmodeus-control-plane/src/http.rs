@@ -2,14 +2,14 @@
 //! enforced here from `asmodeus_common::rbac` — never delegated to the gateway
 //! (D5). Signature verification and the INV-0 gate run before any execution.
 
-use axum::{
-    routing::{delete, get, post},
-    Router,
-};
 use crate::campaign_http::{delete_campaign, list_campaigns, register_campaign, run_campaign};
+use crate::reporting::{
+    export_audit_trail, get_compliance_report, get_resilience_report, get_run_report,
+};
+use crate::runner_http::{deregister_runner, list_runners, ping_runner_handler, register_runner};
+use crate::runs_http::{cancel_run, get_run, list_runs, run_feedback, verify_run};
 use crate::scenario_http::{
-    abort_all, get_scenario, list_scenarios, mitre_matrix, run_scenario,
-    validate_scenario_manifest,
+    abort_all, get_scenario, list_scenarios, mitre_matrix, run_scenario, validate_scenario_manifest,
 };
 use crate::schedules_http::{
     create_schedule, delete_schedule, get_schedule, list_drift_alerts, list_schedules,
@@ -17,10 +17,9 @@ use crate::schedules_http::{
 };
 use crate::state::AppState;
 use crate::system_http::{healthz, metrics, openapi_spec, telemetry_mttd};
-use crate::runner_http::{deregister_runner, list_runners, ping_runner_handler, register_runner};
-use crate::runs_http::{get_run, list_runs, run_feedback, verify_run};
-use crate::reporting::{
-    export_audit_trail, get_compliance_report, get_resilience_report, get_run_report,
+use axum::{
+    routing::{delete, get, post},
+    Router,
 };
 
 /// Build the router with all endpoints mounted.
@@ -50,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/asmodeus/runs", get(list_runs))
         .route("/api/v1/asmodeus/runs/:id", get(get_run))
         .route("/api/v1/asmodeus/runs/:id/verify", get(verify_run))
+        .route("/api/v1/asmodeus/runs/:id/cancel", post(cancel_run))
         .route("/api/v1/asmodeus/runs/:id/feedback", post(run_feedback))
         .route("/api/v1/asmodeus/runs/:id/report", get(get_run_report))
         .route(

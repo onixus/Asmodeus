@@ -29,7 +29,7 @@ pub(crate) async fn get_resilience_report(
     }
 
     let records = state.audit.list(None, None, None);
-    let agg = state.metrics.lock().unwrap().clone();
+    let agg = asmodeus_telemetry::Aggregate::from_records(&records);
     let report = EcosystemResilienceReport::build(&records, &agg);
 
     if query.format.as_deref() == Some("markdown") {
@@ -96,7 +96,7 @@ pub(crate) async fn get_run_report(
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
 
-    let run_report = SingleRunReport::build(&record, Some(state.catalog.public_key()));
+    let run_report = SingleRunReport::build(&record, Some(&state.audit_public_key));
 
     if query.format.as_deref() == Some("markdown") {
         Ok((
@@ -133,7 +133,8 @@ pub(crate) async fn export_audit_trail(
 
     match fmt.as_str() {
         "json" => {
-            let json_body = state.audit
+            let json_body = state
+                .audit
                 .export_json()
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             Ok((
@@ -153,7 +154,8 @@ pub(crate) async fn export_audit_trail(
                 .into_response())
         }
         "clickhouse_ndjson" => {
-            let ndjson_body = state.audit
+            let ndjson_body = state
+                .audit
                 .export_clickhouse_ndjson()
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             Ok((

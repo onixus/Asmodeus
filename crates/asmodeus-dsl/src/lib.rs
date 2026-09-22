@@ -6,6 +6,8 @@
 //! a manifest whose action is operational/weaponizable is rejected here, before
 //! it can ever reach a runner.
 
+pub mod execution;
+pub use execution::*;
 pub mod manifest;
 pub mod mitre;
 

@@ -65,6 +65,16 @@ pub(crate) async fn create_schedule(
         )));
     }
 
+    let entry = state
+        .catalog
+        .get(&req.scenario_id)
+        .expect("catalog validated above");
+    if !role.can(entry.category.required_capability()) {
+        return Err(ApiError::Forbidden(
+            "role may not schedule this scenario category",
+        ));
+    }
+
     let id = req.id.unwrap_or_else(|| {
         format!(
             "SCHED-{}",
@@ -74,30 +84,50 @@ pub(crate) async fn create_schedule(
         )
     });
 
+    if id.trim().is_empty() {
+        return Err(ApiError::Unprocessable(
+            "schedule id cannot be empty".into(),
+        ));
+    }
     let job = ScheduledJob {
+        generation: state.next_run_id().to_string(),
         id,
         name: req.name,
         scenario_id: req.scenario_id,
         interval_sec: req.interval_sec,
-        role: if role == Role::DevSecOps || role == Role::Admin {
-            Role::RedTeam
-        } else {
-            role
-        },
+        role,
         target_override: req.target_override,
         enabled: req.enabled.unwrap_or(true),
         created_at_utc: asmodeus_telemetry::current_utc_iso8601(),
         last_run_utc: None,
         last_run_epoch_secs: None,
         last_status: None,
+        last_run_id: None,
         last_mttd_ms: None,
         baseline_mttd_ms: req.baseline_mttd_ms,
         drift_detected: false,
+        detection_missed: false,
         drift_factor: None,
         run_history: Default::default(),
     };
 
-    state.schedules.write().unwrap().register(job.clone());
+    let saved = job.clone();
+    let created = state
+        .schedules
+        .update(move |catalog| {
+            if catalog.get(&saved.id).is_some() {
+                return Ok(false);
+            }
+            catalog.register(saved);
+            Ok(true)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("schedule persistence: {e}")))?;
+    if !created {
+        return Err(ApiError::Unprocessable(
+            "schedule id already exists; delete it before replacement".into(),
+        ));
+    }
     Ok((
         StatusCode::CREATED,
         Json(json!({ "status": "created", "schedule": job })),
@@ -118,7 +148,13 @@ pub(crate) async fn delete_schedule(
         return Err(ApiError::Forbidden("role may not delete schedules"));
     }
 
-    if state.schedules.write().unwrap().deregister(&id) {
+    let delete_id = id.clone();
+    if state
+        .schedules
+        .update(move |catalog| Ok(catalog.deregister(&delete_id)))
+        .await
+        .map_err(|e| ApiError::Internal(format!("schedule persistence: {e}")))?
+    {
         Ok(Json(json!({ "status": "deleted", "id": id })))
     } else {
         Err(ApiError::NotFound(format!("schedule not found: {id}")))
@@ -167,7 +203,7 @@ pub(crate) async fn list_drift_alerts(
 }
 
 #[derive(Debug, Deserialize)]
-struct ToggleSchedulePayload {
+pub(crate) struct ToggleSchedulePayload {
     enabled: bool,
 }
 
@@ -187,12 +223,32 @@ pub(crate) async fn toggle_schedule(
     {
         return Err(ApiError::Forbidden("role may not modify schedules"));
     }
+    let catalog = state.catalog.clone();
+    let update_id = id.clone();
     match state
         .schedules
-        .write()
-        .unwrap()
-        .set_enabled(&id, payload.enabled)
-    {
+        .update(move |schedules| {
+            if let Some(job) = schedules.get(&update_id) {
+                let allowed = catalog
+                    .get(&job.scenario_id)
+                    .is_some_and(|entry| role.can(entry.category.required_capability()));
+                if !allowed {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "role may not enable this scenario category",
+                    ));
+                }
+            }
+            Ok(schedules.set_enabled(&update_id, payload.enabled))
+        })
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                ApiError::Forbidden("role may not modify this scenario category")
+            } else {
+                ApiError::Internal(format!("schedule persistence: {e}"))
+            }
+        })? {
         Some(enabled) => Ok(Json(
             json!({ "status": "updated", "id": id, "enabled": enabled }),
         )),

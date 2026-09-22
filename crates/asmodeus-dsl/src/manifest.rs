@@ -24,6 +24,7 @@ fn default_severity() -> String {
 
 /// Metadata section of the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestMetadata {
     pub id: String,
     pub name: String,
@@ -40,6 +41,7 @@ pub struct ManifestMetadata {
 
 /// Target scope specifying where the synthetic action applies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TargetScope {
     #[serde(rename = "type", default)]
     pub target_type: String,
@@ -65,6 +67,7 @@ fn default_true() -> bool {
 
 /// Safety constraints and limits enforced by the circuit breaker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SafetySpec {
     #[serde(default = "default_max_duration_sec")]
     pub max_duration_sec: u32,
@@ -89,6 +92,7 @@ impl Default for SafetySpec {
 
 /// Action specification defining the synthetic injection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ActionSpec {
     pub nature: ActionNature,
     #[serde(rename = "type")]
@@ -99,6 +103,7 @@ pub struct ActionSpec {
 
 /// Expected outcome and detection metrics for Blue Team verification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectedOutcome {
     #[serde(default)]
     pub detector: String,
@@ -110,6 +115,7 @@ pub struct ExpectedOutcome {
 
 /// Manifest specification payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestSpec {
     #[serde(default)]
     pub author: Option<String>,
@@ -123,6 +129,7 @@ pub struct ManifestSpec {
 
 /// Complete declarative scenario manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioManifest {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
@@ -229,36 +236,7 @@ pub fn validate_manifest(manifest: &ScenarioManifest) -> Result<(), ManifestVali
         }
     }
 
-    // 6. Action parameter budgets
-    let params = &manifest.spec.action.parameters;
-    if let Some(v) = params.get("file_count").and_then(|v| v.as_u64()) {
-        if v > 200 {
-            return Err(ManifestValidationError::BudgetLimitExceeded(format!(
-                "file_count {v} exceeds budget of 200"
-            )));
-        }
-    }
-    if let Some(v) = params.get("chunk_size_kb").and_then(|v| v.as_u64()) {
-        if v > 1024 {
-            return Err(ManifestValidationError::BudgetLimitExceeded(format!(
-                "chunk_size_kb {v} exceeds budget of 1024 KB"
-            )));
-        }
-    }
-    if let Some(v) = params.get("latency_ms").and_then(|v| v.as_u64()) {
-        if v > 5000 {
-            return Err(ManifestValidationError::BudgetLimitExceeded(format!(
-                "latency_ms {v} exceeds budget of 5000 ms"
-            )));
-        }
-    }
-    if let Some(v) = params.get("loss_percent").and_then(|v| v.as_u64()) {
-        if v > 50 {
-            return Err(ManifestValidationError::BudgetLimitExceeded(format!(
-                "loss_percent {v}% exceeds budget of 50%"
-            )));
-        }
-    }
+    crate::ExecutionPlan::from_manifest(manifest)?;
 
     Ok(())
 }
@@ -348,7 +326,11 @@ fn parse_yaml_map(
             parse_scalar_value(val_trimmed)
         };
 
-        map.insert(key, value);
+        if map.insert(key.clone(), value).is_some() {
+            return Err(ManifestValidationError::ParseError(format!(
+                "duplicate key: {key}"
+            )));
+        }
     }
 
     Ok(serde_json::Value::Object(map))

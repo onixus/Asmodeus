@@ -1,44 +1,63 @@
-//! Scenario execution application service.
-//!
-//! Owns the transport-independent critical path shared by REST, campaigns and
-//! the background scheduler: signature verification, runner selection,
-//! dispatch/simulation, telemetry, signed audit persistence and lifecycle
-//! webhooks.
-
-use asmodeus_common::{Category, Role, RunId, RunState};
-use asmodeus_telemetry::{AuditRecord, Measurements};
+//! Durable admission followed by detached execution and terminal audit commit.
+use crate::{catalog::ScenarioEntry, run_control::ActiveRun, state::AppState};
+use asmodeus_common::{Role, RunId};
+use asmodeus_telemetry::{AuditRecord, Measurements, RunEvidence};
 use serde_json::{json, Value};
-
-use crate::engine::{self, EngineError};
-use crate::state::AppState;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ExecutionError {
     #[error("scenario signature invalid")]
     InvalidSignature,
-    #[error("target runner not found: {0}")]
+    #[error("target runner not found or inactive: {0}")]
     TargetNotFound(String),
+    #[error("no active runner available")]
+    NoActiveRunner,
+    #[error("role may not execute this scenario category")]
+    Forbidden,
+    #[error("invalid execution parameters: {0}")]
+    InvalidManifest(String),
     #[error("dispatch: {0}")]
     Dispatch(String),
     #[error("runner rejected: {0}")]
     RunnerRejected(String),
-    #[error("runner ended without completing (last state: {0})")]
+    #[error("runner ended without a confirmed terminal result: {0}")]
     RunnerIncomplete(String),
-    #[error("{0}")]
-    EngineRejected(String),
-    #[error("{0}")]
-    EngineTransition(String),
     #[error("audit signing: {0}")]
     AuditSigning(String),
+    #[error("audit persistence: {0}")]
+    AuditPersistence(String),
 }
 
+type Outcome = Result<(RunId, Value, AuditRecord), ExecutionError>;
+pub struct StartedRun {
+    pub id: RunId,
+    pub completion: tokio::task::JoinHandle<Outcome>,
+}
+
+#[cfg(test)]
 pub(crate) async fn execute_single_scenario(
     state: &AppState,
-    entry: &crate::catalog::ScenarioEntry,
+    entry: &ScenarioEntry,
     role: Role,
-    target_override: Option<&str>,
-) -> Result<(RunId, Value, AuditRecord), ExecutionError> {
-    // Integrity (D6): the catalogued manifest must verify against the trusted key.
+    target: Option<&str>,
+) -> Outcome {
+    let started = start_scenario(state, entry, role, target, None).await?;
+    started
+        .completion
+        .await
+        .map_err(|e| ExecutionError::Dispatch(e.to_string()))?
+}
+
+pub(crate) async fn start_scenario(
+    state: &AppState,
+    entry: &ScenarioEntry,
+    role: Role,
+    target: Option<&str>,
+    timeout_sec: Option<u32>,
+) -> Result<StartedRun, ExecutionError> {
+    if !role.can(entry.category.required_capability()) {
+        return Err(ExecutionError::Forbidden);
+    }
     if !asmodeus_crypto::is_valid(
         &entry.manifest,
         &entry.signature,
@@ -46,167 +65,248 @@ pub(crate) async fn execute_single_scenario(
     ) {
         return Err(ExecutionError::InvalidSignature);
     }
-
-    state.webhook.dispatch(
-        crate::webhook::WebhookPayload {
-            event: "exercise_started".into(),
-            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
-            exercise_id: String::new(),
-            scenario_id: entry.id.to_string(),
-            mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
-            target: target_override.unwrap_or("default").to_string(),
-            initiator: role.as_str().to_string(),
-            tag: entry.category.tag().to_string(),
-            data: json!({
-                "scenario_name": entry.name,
-                "category": entry.category.as_str(),
-            }),
-        },
-        Some(&state.signing_key),
-    );
-
-    // Target resolution. An explicitly requested target must resolve to a
-    // registered runner: we never silently fall back to the static default
-    // endpoint, otherwise a mistyped or unavailable target would fire the
-    // scenario against the wrong runner. The static endpoint is only used when
-    // no target was requested at all.
-    let explicit_target = target_override.map(str::trim).filter(|t| !t.is_empty());
-    let matched_runner = state.registry.find_for_target(target_override);
-    let target_endpoint = if let Some(target) = explicit_target {
-        match matched_runner.as_ref() {
-            Some(runner) => Some(runner.endpoint.clone()),
-            None => {
-                return Err(ExecutionError::TargetNotFound(target.to_string()))
-            }
+    let manifest = std::str::from_utf8(&entry.manifest)
+        .map_err(|e| ExecutionError::InvalidManifest(e.to_string()))?;
+    let manifest = asmodeus_dsl::parse_and_validate_manifest(manifest)
+        .map_err(|e| ExecutionError::InvalidManifest(e.to_string()))?;
+    let plan = asmodeus_dsl::ExecutionPlan::from_manifest(&manifest)
+        .map_err(|e| ExecutionError::InvalidManifest(e.to_string()))?;
+    let timeout = timeout_sec.unwrap_or(plan.max_duration_sec);
+    if timeout == 0 || timeout > plan.max_duration_sec {
+        return Err(ExecutionError::InvalidManifest(
+            "timeout_sec must be positive and cannot extend the signed deadline".into(),
+        ));
+    }
+    let selected = state.registry.find_for_target(target);
+    let explicit = target.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(target) = explicit {
+        if selected.is_none() {
+            return Err(ExecutionError::TargetNotFound(target.into()));
         }
+    }
+    if selected.is_none() && !state.registry.is_empty() {
+        return Err(ExecutionError::NoActiveRunner);
+    }
+    let endpoint = selected
+        .as_ref()
+        .map(|r| r.endpoint.clone())
+        .or_else(|| state.runner_endpoint.clone());
+    let mode = if endpoint.is_some() {
+        "runner"
     } else {
-        matched_runner
-            .as_ref()
-            .map(|r| r.endpoint.clone())
-            .or_else(|| state.runner_endpoint.clone())
+        "simulated"
     };
-
-    // Execute: dispatch to a live runner over gRPC if one is configured,
-    // else drive the in-process engine. Detection metrics stay simulated
-    // (no live Blue Team wired); the runner reports the real injection stats.
-    let (final_state, execution, runner_id_str) = if let Some(endpoint) = target_endpoint {
-        let runner_id = matched_runner
-            .as_ref()
-            .map(|r| r.id.clone())
-            .unwrap_or_else(|| "default-runner".into());
-        let req = asmodeus_proto::ExecuteRequest {
-            scenario_id: entry.id.to_string(),
-            manifest: entry.manifest.clone(),
-            signature: entry.signature.clone(),
-            public_key: state.catalog.public_key().to_vec(),
-            target_dir: entry.target_path.clone(),
-            file_count: entry.file_count,
-            chunk_size_kb: entry.chunk_size_kb,
-        };
-        let out = crate::dispatch::dispatch(&endpoint, req)
-            .await
-            .map_err(|s| ExecutionError::Dispatch(s.to_string()))?;
-        if let Some(reason) = out.rejected {
-            return Err(ExecutionError::RunnerRejected(reason));
+    let runner_id = selected.map(|r| r.id).unwrap_or_else(|| {
+        if endpoint.is_some() {
+            "default-runner".into()
+        } else {
+            "in-process-sim".into()
         }
-        if !out.completed {
-            // Stream ended without a terminal Completed event: the run did not
-            // finish. Never record it as a success.
-            return Err(ExecutionError::RunnerIncomplete(out.final_state));
-        }
-        (
-            RunState::Completed,
-            json!({
-                "mode": "dispatched",
-                "runner_id": runner_id,
-                "runner_endpoint": endpoint,
-                "runner_final_state": out.final_state,
-                "files_created": out.files_created,
-                "bytes_written": out.bytes_written,
-                "inject_ms": out.inject_ms,
-            }),
-            runner_id,
-        )
-    } else {
-        let outcome = engine::execute(entry).map_err(|e| match e {
-            EngineError::Rejected(_) => ExecutionError::EngineRejected(e.to_string()),
-            EngineError::Transition(_) => ExecutionError::EngineTransition(e.to_string()),
-        })?;
-        (
-            outcome.final_state,
-            json!({ "mode": "simulated" }),
-            "in-process-sim".to_string(),
-        )
-    };
-
-    let run_id = state.next_run_id();
-    state
-        .runs
-        .lock()
-        .unwrap()
-        .insert(run_id.clone(), final_state);
-    state.metrics.lock().unwrap().record(Measurements {
-        mttd_ms: entry.sim_mttd_ms,
-        mttr_ms: entry.sim_mttr_ms,
-        blue_team_detected: true,
     });
-
-    let raw_record = AuditRecord {
-        run_id: run_id.to_string(),
-        scenario_id: entry.id.to_string(),
-        scenario_name: entry.name.to_string(),
-        category: match entry.category {
-            Category::RedTeam => "red_team".to_string(),
-            Category::Chaos => "chaos".to_string(),
-        },
-        mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
-        mitre_tactic: entry
-            .mitre
-            .map(|m| m.tactic.to_string())
-            .unwrap_or_default(),
-        severity: entry.severity.to_string(),
-        tag: entry.category.tag().to_string(),
-        initiator: role.as_str().to_string(),
-        runner_id: runner_id_str,
-        status: "COMPLETED".to_string(),
-        measurements: Measurements {
-            mttd_ms: entry.sim_mttd_ms,
-            mttr_ms: entry.sim_mttr_ms,
-            blue_team_detected: true,
-        },
-        detection_source: entry.detector.to_string(),
-        containment_action: "SIGKILL via SOAR Policy".to_string(),
-        cleanup_status: "SUCCESS (canary removed, 0 host side-effects)".to_string(),
+    let id = state.next_run_id();
+    let record = AuditRecord {
+        run_id: id.to_string(),
+        scenario_id: entry.id.clone(),
+        scenario_name: entry.name.clone(),
+        category: entry.category.as_str().into(),
+        mitre_technique: entry.mitre.map(|m| m.id.into()).unwrap_or_default(),
+        mitre_tactic: entry.mitre.map(|m| m.tactic.into()).unwrap_or_default(),
+        severity: entry.severity.clone(),
+        tag: entry.category.tag().into(),
+        initiator: role.as_str().into(),
+        runner_id,
+        status: "QUEUED".into(),
+        measurements: Measurements::default(),
+        detection_source: "PENDING_FEEDBACK".into(),
+        containment_action: "UNCONFIRMED".into(),
+        cleanup_status: "PENDING".into(),
         timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
         signature_hex: String::new(),
         public_key_hex: String::new(),
-    };
+        evidence: Some(RunEvidence {
+            execution_mode: mode.into(),
+            ..RunEvidence::default()
+        }),
+    }
+    .sign(&state.signing_key)
+    .map_err(|e| ExecutionError::AuditSigning(e.to_string()))?;
+    let state = state.clone();
+    let entry = entry.clone();
+    let active = ActiveRun::new(entry.category);
+    let worker_id = id.clone();
+    let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+    let completion = tokio::spawn(async move {
+        // The worker owns admission too: a dropped HTTP request cannot orphan
+        // a queued durable record between append and spawning execution.
+        state
+            .audit
+            .append(record.clone())
+            .await
+            .map_err(|e| ExecutionError::AuditPersistence(e.to_string()))?;
+        state
+            .runs
+            .lock()
+            .unwrap()
+            .insert(worker_id.clone(), active.clone());
+        let _ = admitted_tx.send(());
+        lifecycle(&state, "exercise_started", &record);
+        let result = if let Some(ref endpoint) = endpoint {
+            let request = asmodeus_proto::ExecuteRequest {
+                scenario_id: entry.id.clone(),
+                manifest: entry.manifest.clone(),
+                signature: entry.signature.clone(),
+                public_key: state.catalog.public_key().to_vec(),
+                target_dir: plan.target_dir,
+                file_count: plan.file_count,
+                chunk_size_kb: plan.chunk_size_kb,
+                run_id: worker_id.to_string(),
+                timeout_sec: timeout,
+            };
+            let tls = asmodeus_proto::tls::client_from_env("asmodeus-runner")
+                .map_err(|e| tonic::Status::internal(e.to_string()));
+            match tls {
+                Ok(tls) => {
+                    crate::dispatch::dispatch_controlled(
+                        endpoint,
+                        request,
+                        tls,
+                        std::time::Duration::from_secs(u64::from(timeout) + 10),
+                        active.clone(),
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            *active.status.lock().unwrap() = "INJECTING".into();
+            let start = tokio::time::Instant::now();
+            let duration = std::time::Duration::from_millis(plan.duration_ms.into());
+            let mut status = "COMPLETED";
+            loop {
+                if active.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    status = "CANCELLED";
+                    break;
+                }
+                if start.elapsed() >= std::time::Duration::from_secs(timeout.into()) {
+                    status = "TIMED_OUT";
+                    break;
+                }
+                if start.elapsed() >= duration {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Ok(crate::dispatch::DispatchOutcome {
+                terminal: true,
+                completed: status == "COMPLETED",
+                final_state: status.into(),
+                ..Default::default()
+            })
+        };
+        let (status, cleaned, detail, execution, error, simulated) = match result {
+            Ok(out) => {
+                let error = if let Some(reason) = out.rejected.clone() {
+                    Some(ExecutionError::RunnerRejected(reason))
+                } else if !out.terminal
+                    || (mode == "runner" && out.completed && !out.cleanup_confirmed)
+                {
+                    Some(ExecutionError::RunnerIncomplete(out.final_state.clone()))
+                } else {
+                    None
+                };
+                let status = if error.is_some() {
+                    "FAILED".into()
+                } else {
+                    out.final_state.clone()
+                };
+                (
+                    status,
+                    out.cleanup_confirmed,
+                    out.detail,
+                    json!({"mode":mode,"runner_endpoint":endpoint,"runner_id":record.runner_id,"files_created":out.files_created,"bytes_written":out.bytes_written,"inject_ms":out.inject_ms,"runner_final_state":out.final_state,"backend_simulated":out.simulated}),
+                    error,
+                    out.simulated,
+                )
+            }
+            Err(error) => (
+                "FAILED".into(),
+                false,
+                error.to_string(),
+                json!({"mode":mode}),
+                Some(ExecutionError::Dispatch(error.to_string())),
+                mode == "simulated",
+            ),
+        };
+        let key = state.signing_key;
+        let saved = state
+            .audit
+            .update(worker_id.to_string(), move |mut record| {
+                record.status = status;
+                record.cleanup_status = if mode == "simulated" {
+                    "NOT_APPLICABLE"
+                } else if cleaned {
+                    "SUCCESS"
+                } else {
+                    "UNCONFIRMED"
+                }
+                .into();
+                if let Some(evidence) = &mut record.evidence {
+                    if simulated {
+                        evidence.execution_mode = "simulated".into();
+                    }
+                    evidence.cleanup_confirmed = cleaned;
+                    evidence.failure_reason = (!detail.is_empty()).then_some(detail);
+                }
+                record.timestamp_utc = asmodeus_telemetry::current_utc_iso8601();
+                record.sign(&key).map_err(std::io::Error::other)
+            })
+            .await;
+        if saved.is_ok() {
+            state.runs.lock().unwrap().remove(&worker_id);
+        } else {
+            *active.status.lock().unwrap() = "AUDIT_PERSISTENCE_FAILED".into();
+        }
+        let record = saved
+            .map_err(|e| ExecutionError::AuditPersistence(e.to_string()))?
+            .ok_or_else(|| ExecutionError::AuditPersistence("admitted run disappeared".into()))?;
+        lifecycle(
+            &state,
+            if record.status == "COMPLETED" {
+                "exercise_completed"
+            } else {
+                "exercise_finished"
+            },
+            &record,
+        );
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok((worker_id, execution, record))
+    });
+    if admitted_rx.await.is_err() {
+        return match completion.await {
+            Ok(Err(error)) => Err(error),
+            _ => Err(ExecutionError::AuditPersistence(
+                "run admission failed".into(),
+            )),
+        };
+    }
+    Ok(StartedRun { id, completion })
+}
 
-    let signed_record = raw_record
-        .sign(&state.signing_key)
-        .map_err(|e| ExecutionError::AuditSigning(e.to_string()))?;
-
-    state.audit.append(signed_record.clone()).await;
-
+fn lifecycle(state: &AppState, event: &str, record: &AuditRecord) {
     state.webhook.dispatch(
         crate::webhook::WebhookPayload {
-            event: "exercise_completed".into(),
-            timestamp_utc: signed_record.timestamp_utc.clone(),
-            exercise_id: signed_record.run_id.clone(),
-            scenario_id: entry.id.to_string(),
-            mitre_technique: signed_record.mitre_technique.clone(),
-            target: target_override.unwrap_or("default").to_string(),
-            initiator: role.as_str().to_string(),
-            tag: entry.category.tag().to_string(),
-            data: json!({
-                "status": signed_record.status,
-                "mttd_ms": signed_record.measurements.mttd_ms,
-                "mttr_ms": signed_record.measurements.mttr_ms,
-                "runner_id": signed_record.runner_id,
-            }),
+            event: event.into(),
+            timestamp_utc: record.timestamp_utc.clone(),
+            exercise_id: record.run_id.clone(),
+            scenario_id: record.scenario_id.clone(),
+            mitre_technique: record.mitre_technique.clone(),
+            target: record.runner_id.clone(),
+            initiator: record.initiator.clone(),
+            tag: record.tag.clone(),
+            data: json!({"status":record.status,"evidence":record.evidence}),
         },
         Some(&state.signing_key),
     );
-
-    Ok((run_id, execution, signed_record))
 }

@@ -106,63 +106,43 @@ impl RunnerRegistry {
         list
     }
 
-    /// Find an appropriate runner for a target override or tag selector.
-    ///
-    /// Strategy:
-    /// 1. If `target` matches a runner ID exactly, use that runner.
-    /// 2. If `target` matches any runner's tag (case-insensitive), choose an active matching runner.
-    /// 3. If `target` is None or empty, return the first `Active` runner (or any registered runner).
+    /// Resolve only active runners. Exact IDs never fall back to a tag or a
+    /// different runner; ties between tags/defaults are stable by runner ID.
     pub fn find_for_target(&self, target: Option<&str>) -> Option<RunnerRecord> {
         let map = self.runners.read().unwrap();
-        if map.is_empty() {
-            return None;
+        let target = target.map(str::trim).filter(|target| !target.is_empty());
+        if let Some(record) = target.and_then(|target| map.get(target)) {
+            return (record.status == RunnerStatus::Active).then(|| record.clone());
         }
-
-        if let Some(tgt) = target {
-            let trimmed = tgt.trim();
-            if !trimmed.is_empty() {
-                // 1. Exact ID match
-                if let Some(record) = map.get(trimmed) {
-                    return Some(record.clone());
-                }
-
-                // 2. Tag match (prefer Active)
-                let tag_matches: Vec<_> = map
-                    .values()
-                    .filter(|r| r.tags.iter().any(|t| t.eq_ignore_ascii_case(trimmed)))
-                    .collect();
-
-                if let Some(active) = tag_matches
-                    .iter()
-                    .find(|r| r.status == RunnerStatus::Active)
-                {
-                    return Some((*active).clone());
-                }
-                if let Some(first) = tag_matches.first() {
-                    return Some((*first).clone());
-                }
-
-                // Target was explicitly requested, but neither ID nor tag matched.
-                return None;
-            }
-        }
-
-        // 3. Fallback when no specific target requested: first active, or first overall
         map.values()
-            .find(|r| r.status == RunnerStatus::Active)
-            .or_else(|| map.values().next())
+            .filter(|record| record.status == RunnerStatus::Active)
+            .filter(|record| {
+                target.is_none_or(|target| {
+                    record
+                        .tags
+                        .iter()
+                        .any(|tag| tag.eq_ignore_ascii_case(target))
+                })
+            })
+            .min_by(|a, b| a.id.cmp(&b.id))
             .cloned()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runners.read().unwrap().is_empty()
     }
 
     /// Update health and metrics after a successful heartbeat.
     pub fn update_heartbeat(&self, id: &str, healthy: bool, cpu_pct: u32, version: &str) {
         let mut map = self.runners.write().unwrap();
         if let Some(r) = map.get_mut(id) {
-            r.status = if healthy {
-                RunnerStatus::Active
-            } else {
-                RunnerStatus::Unresponsive
-            };
+            if r.status != RunnerStatus::Draining {
+                r.status = if healthy {
+                    RunnerStatus::Active
+                } else {
+                    RunnerStatus::Unresponsive
+                };
+            }
             r.cpu_usage_pct = cpu_pct;
             r.last_heartbeat_utc = Some(now_epoch_secs());
             if !version.is_empty() {
@@ -175,7 +155,9 @@ impl RunnerRegistry {
     pub fn mark_unresponsive(&self, id: &str) {
         let mut map = self.runners.write().unwrap();
         if let Some(r) = map.get_mut(id) {
-            r.status = RunnerStatus::Unresponsive;
+            if r.status != RunnerStatus::Draining {
+                r.status = RunnerStatus::Unresponsive;
+            }
         }
     }
 }
@@ -183,6 +165,22 @@ impl RunnerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_and_draining_runners_are_never_selected() {
+        let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec!["test".into()]);
+        reg.mark_unresponsive("probe");
+        for target in [None, Some("probe"), Some("test")] {
+            assert!(reg.find_for_target(target).is_none());
+        }
+        let mut probe = reg.get("probe").unwrap();
+        probe.status = RunnerStatus::Draining;
+        reg.register(probe);
+        reg.update_heartbeat("probe", true, 0, "test");
+        reg.mark_unresponsive("probe");
+        assert_eq!(reg.get("probe").unwrap().status, RunnerStatus::Draining);
+        assert!(reg.find_for_target(None).is_none());
+    }
 
     #[test]
     fn register_and_list_runners() {

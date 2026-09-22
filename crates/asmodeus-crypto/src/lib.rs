@@ -69,6 +69,25 @@ pub fn is_valid(manifest: &[u8], signature: &[u8], public_key: &[u8]) -> bool {
     verify_manifest(manifest, signature, public_key).is_ok()
 }
 
+/// Read an operator key in the CLI's hex file format without exposing its contents.
+pub fn read_hex_key<const N: usize>(path: &std::path::Path) -> std::io::Result<[u8; N]> {
+    let text = std::fs::read_to_string(path)?;
+    let hex = text.trim();
+    if !hex.is_ascii() || hex.len() != N * 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid key length or encoding",
+        ));
+    }
+    let mut result = [0u8; N];
+    for (i, byte) in result.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid key encoding")
+        })?;
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

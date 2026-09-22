@@ -18,7 +18,6 @@ pub struct ScenarioEntry {
     pub id: String,
     pub name: String,
     pub category: Category,
-    pub nature: ActionNature,
     pub target_path: String,
     pub detector: String,
     pub mitre: Option<MitreTechnique>,
@@ -29,9 +28,6 @@ pub struct ScenarioEntry {
     /// Synthetic, deterministic measurements for the MVP (real runs measure).
     pub sim_mttd_ms: u64,
     pub sim_mttr_ms: u64,
-    /// Injection parameters passed to the runner over gRPC.
-    pub file_count: u32,
-    pub chunk_size_kb: u32,
 }
 
 /// The scenario catalog plus the trusted signing public key.
@@ -42,6 +38,40 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub fn from_env() -> std::io::Result<Self> {
+        let mut catalog = Self::seeded();
+        if let Ok(path) = std::env::var("ASMODEUS_SCENARIO_SIGNING_KEY") {
+            let key = asmodeus_crypto::read_hex_key::<64>(std::path::Path::new(&path))?;
+            let public =
+                asmodeus_crypto::public_key_from_secret_key(&key).map_err(std::io::Error::other)?;
+            for entry in catalog.entries.values_mut() {
+                entry.signature = asmodeus_crypto::sign_message(&entry.manifest, &key)
+                    .map_err(std::io::Error::other)?
+                    .to_vec();
+                if !asmodeus_crypto::is_valid(&entry.manifest, &entry.signature, &public) {
+                    return Err(std::io::Error::other("inconsistent scenario signing key"));
+                }
+            }
+            catalog.public_key = public.to_vec();
+            catalog.secret_key = Some(key.to_vec());
+        } else if std::env::var("ASMODEUS_RUNNER_ENDPOINT").is_ok() {
+            return Err(std::io::Error::other(
+                "ASMODEUS_SCENARIO_SIGNING_KEY is required for a configured runner",
+            ));
+        }
+        if let Ok(dir) = std::env::var("ASMODEUS_SCENARIOS_DIR") {
+            if !std::path::Path::new(&dir).is_dir() {
+                return Err(std::io::Error::other(
+                    "ASMODEUS_SCENARIOS_DIR must be an existing directory",
+                ));
+            }
+            catalog
+                .load_from_dir(std::path::Path::new(&dir))
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(catalog)
+    }
+
     /// Look up an entry by scenario id.
     pub fn get(&self, id: &str) -> Option<&ScenarioEntry> {
         self.entries.get(id)
@@ -50,11 +80,6 @@ impl Catalog {
     /// The public key every entry's signature must verify against.
     pub fn public_key(&self) -> &[u8] {
         &self.public_key
-    }
-
-    /// The private signing key if available in this node.
-    pub fn secret_key(&self) -> Option<&[u8]> {
-        self.secret_key.as_deref()
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &str> {
@@ -89,7 +114,7 @@ impl Catalog {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let manifest = match asmodeus_dsl::manifest::parse_manifest(&content) {
+            let manifest = match asmodeus_dsl::manifest::parse_and_validate_manifest(&content) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(path = ?path, error = %e, "skipping invalid scenario manifest");
@@ -97,6 +122,8 @@ impl Catalog {
                 }
             };
 
+            let plan =
+                asmodeus_dsl::ExecutionPlan::from_manifest(&manifest).map_err(|e| e.to_string())?;
             let mitre = manifest
                 .metadata
                 .mitre_technique
@@ -114,19 +141,11 @@ impl Catalog {
                 Vec::new()
             };
 
-            let target_path = manifest
-                .spec
-                .target_scope
-                .as_ref()
-                .and_then(|s| s.target_path.clone())
-                .unwrap_or_else(|| "/tmp/asmodeus-canary/".into());
-
             let entry = ScenarioEntry {
                 id: manifest.metadata.id.clone(),
                 name: manifest.metadata.name,
                 category: manifest.metadata.category,
-                nature: manifest.spec.action.nature,
-                target_path,
+                target_path: plan.target_dir,
                 detector: manifest.spec.expected_outcome.detector,
                 mitre,
                 severity: manifest.metadata.severity,
@@ -139,8 +158,6 @@ impl Catalog {
                     .expected_mttd_max_ms
                     .unwrap_or(60),
                 sim_mttr_ms: 150,
-                file_count: 10,
-                chunk_size_kb: 4,
             };
             self.entries.insert(manifest.metadata.id, entry);
             count += 1;
@@ -156,7 +173,7 @@ impl Catalog {
         let mut add = |id: &str,
                        name: &str,
                        category: Category,
-                       nature: ActionNature,
+                       _nature: ActionNature,
                        target_path: &str,
                        detector: &str,
                        mitre: Option<MitreTechnique>,
@@ -164,28 +181,16 @@ impl Catalog {
                        description: &str,
                        mttd: u64,
                        mttr: u64| {
-            let (tech_line, tactic_line) = match mitre {
-                Some(m) => (
-                    format!("mitre_technique: \"{}\"\n", m.id),
-                    format!("mitre_tactic: \"{}\"\n", m.tactic),
-                ),
-                None => (String::new(), String::new()),
-            };
-            let manifest = format!(
-                "apiVersion: asmodeus.io/v1alpha1\n\
-                 kind: AttackScenario\n\
-                 metadata:\n  \
-                   id: {id}\n  \
-                   name: \"{name}\"\n  \
-                   category: \"{}\"\n  \
-                   severity: \"{severity}\"\n  \
-                   {tech_line}\
-                   {tactic_line}\
-                 spec:\n  \
-                   detector: \"{detector}\"\n",
-                category.tag()
-            )
-            .into_bytes();
+            let mut typed = asmodeus_dsl::synthetic_manifest(id, target_path, 20, 64);
+            typed.metadata.name = name.into();
+            typed.metadata.category = category;
+            typed.metadata.mitre_technique = mitre.map(|m| m.id.into());
+            typed.metadata.mitre_tactic = mitre.map(|m| m.tactic.into());
+            typed.metadata.severity = severity.into();
+            typed.metadata.description = Some(description.into());
+            typed.spec.expected_outcome.detector = detector.into();
+            typed.spec.expected_outcome.expected_mttd_max_ms = Some(mttd);
+            let manifest = serde_json::to_vec(&typed).expect("built-in manifest");
             let signature = kp.sk.sign(&manifest, None).as_ref().to_vec();
             entries.insert(
                 id.to_string(),
@@ -193,7 +198,6 @@ impl Catalog {
                     id: id.to_string(),
                     name: name.to_string(),
                     category,
-                    nature,
                     target_path: target_path.to_string(),
                     detector: detector.to_string(),
                     mitre,
@@ -203,8 +207,6 @@ impl Catalog {
                     signature,
                     sim_mttd_ms: mttd,
                     sim_mttr_ms: mttr,
-                    file_count: 20,
-                    chunk_size_kb: 64,
                 },
             );
         };
@@ -374,15 +376,11 @@ impl Catalog {
             130,
         );
 
-        let mut cat = Catalog {
+        Catalog {
             entries,
             public_key: kp.pk.as_ref().to_vec(),
             secret_key: Some(kp.sk.as_ref().to_vec()),
-        };
-        if let Ok(dir) = std::env::var("ASMODEUS_SCENARIOS_DIR") {
-            let _ = cat.load_from_dir(std::path::Path::new(&dir));
         }
-        cat
     }
 }
 
@@ -438,6 +436,35 @@ spec:
         assert_eq!(entry.name, "Dynamic Loaded Canary");
         assert_eq!(entry.detector, "dynamic_detector");
         assert_eq!(entry.mitre.as_ref().unwrap().id, "T1053");
+
+        // Parsing alone must never authorize or sign an unsafe manifest.
+        for (name, content) in [
+            (
+                "operational",
+                valid_yaml.replace("synthetic\"", "operational\""),
+            ),
+            (
+                "scope",
+                valid_yaml.replace("/tmp/asmodeus-canary/test.txt", "/etc/passwd"),
+            ),
+            (
+                "budget",
+                valid_yaml.replace("file_count: 10", "file_count: 999999"),
+            ),
+        ] {
+            std::fs::write(temp_dir.join("dyn_scenario.yaml"), content).unwrap();
+            assert_eq!(cat.load_from_dir(&temp_dir).unwrap(), 0, "{name}");
+            assert_eq!(
+                asmodeus_dsl::parse_and_validate_manifest(
+                    std::str::from_utf8(&cat.get("DYN-SCN-001").unwrap().manifest).unwrap()
+                )
+                .unwrap()
+                .spec
+                .action
+                .nature,
+                ActionNature::Synthetic
+            );
+        }
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

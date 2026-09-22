@@ -12,15 +12,19 @@ use serde_json::{json, Value};
 
 use crate::api::{caller_role, ApiError};
 use crate::dto::RunScenarioPayload;
-use crate::execution::execute_single_scenario;
+use crate::execution::start_scenario;
 use crate::state::AppState;
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 
 pub(crate) async fn run_scenario(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let role = caller_role(&headers)?;
     let payload: RunScenarioPayload = if body.is_empty() {
         RunScenarioPayload::default()
@@ -43,8 +47,21 @@ pub(crate) async fn run_scenario(
         }));
     }
 
-    let (run_id, execution, audit_rec) =
-        execute_single_scenario(&state, entry, role, payload.target_override.as_deref()).await?;
+    let started = start_scenario(
+        &state,
+        entry,
+        role,
+        payload.target_override.as_deref(),
+        payload.timeout_sec,
+    )
+    .await?;
+    if payload.background {
+        return Ok((StatusCode::ACCEPTED, Json(json!({ "run_id":started.id.to_string(), "status":"QUEUED", "status_url":format!("/api/v1/asmodeus/runs/{}", started.id) }))).into_response());
+    }
+    let (run_id, execution, audit_rec) = started
+        .completion
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))??;
 
     Ok(Json(json!({
         "run_id": run_id.to_string(),
@@ -70,9 +87,11 @@ pub(crate) async fn run_scenario(
         },
         "cleanup_status": audit_rec.cleanup_status,
         "timestamp_utc": audit_rec.timestamp_utc,
+        "evidence": audit_rec.evidence,
         "signature_hex": audit_rec.signature_hex,
         "public_key_hex": audit_rec.public_key_hex,
-    })))
+    }))
+    .into_response())
 }
 
 pub(crate) async fn list_scenarios(
@@ -204,29 +223,17 @@ pub(crate) async fn abort_all(
     if !may_abort {
         return Err(ApiError::Forbidden("role may not abort exercises"));
     }
-    let mut runs = state.runs.lock().unwrap();
-    let aborted = runs.len();
-    runs.clear();
-
-    state.webhook.dispatch(
-        crate::webhook::WebhookPayload {
-            event: "exercise_aborted".into(),
-            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
-            exercise_id: "all".into(),
-            scenario_id: "all".into(),
-            mitre_technique: String::new(),
-            target: "all".into(),
-            initiator: role.as_str().to_string(),
-            tag: "🛑 [EMERGENCY ABORT]".into(),
-            data: json!({
-                "runs_cleared": aborted,
-            }),
-        },
-        Some(&state.signing_key),
-    );
-
+    let runs = state.runs.lock().unwrap();
+    let mut requested = Vec::new();
+    for (id, active) in runs
+        .iter()
+        .filter(|(_, active)| role.can(active.category.required_capability()))
+    {
+        active.cancel();
+        requested.push(id.to_string());
+    }
     Ok(Json(
-        json!({ "status": "ABORTED", "runs_cleared": aborted }),
+        json!({ "status":"CANCELLATION_REQUESTED", "run_ids":requested, "runs_cleared":0 }),
     ))
 }
 

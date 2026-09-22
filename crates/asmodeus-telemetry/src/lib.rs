@@ -36,8 +36,14 @@ pub fn resilience_score(attacks_repelled_pct: f32, recovery_speed_pct: f32) -> u
 pub struct Aggregate {
     pub scenarios_executed: u64,
     pub detected: u64,
-    sum_mttd_ms: u64,
-    sum_mttr_ms: u64,
+    pub feedback_received: u64,
+    pub simulated_runs: u64,
+    pub pending_feedback: u64,
+    pub contained: u64,
+    detection_samples: u64,
+    containment_samples: u64,
+    sum_mttd_ms: u128,
+    sum_mttr_ms: u128,
 }
 
 impl Aggregate {
@@ -46,18 +52,81 @@ impl Aggregate {
     pub fn from_records(records: &[crate::audit::AuditRecord]) -> Self {
         let mut agg = Self::default();
         for r in records {
-            agg.record(r.measurements);
+            agg.record_run(r);
         }
         agg
     }
 
     pub fn record(&mut self, m: Measurements) {
         self.scenarios_executed += 1;
+        self.feedback_received += 1;
+        self.detection_samples += 1;
+        self.containment_samples += 1;
+        self.contained += 1;
         if m.blue_team_detected {
             self.detected += 1;
         }
-        self.sum_mttd_ms += m.mttd_ms;
-        self.sum_mttr_ms += m.mttr_ms;
+        self.sum_mttd_ms += u128::from(m.mttd_ms);
+        self.sum_mttr_ms += u128::from(m.mttr_ms);
+    }
+
+    /// Only live, explicitly submitted feedback contributes to defense metrics.
+    pub fn record_run(&mut self, record: &AuditRecord) {
+        let contribution = Self::contribution(record);
+        self.combine(&contribution, true);
+    }
+
+    pub fn update_run(&mut self, old: &AuditRecord, new: &AuditRecord) {
+        self.combine(&Self::contribution(old), false);
+        self.record_run(new);
+    }
+
+    fn contribution(record: &AuditRecord) -> Self {
+        let mut value = Self::default();
+        if !record.is_terminal() {
+            return value;
+        }
+        value.scenarios_executed = 1;
+        if record
+            .evidence
+            .as_ref()
+            .is_some_and(|e| e.execution_mode == "simulated")
+        {
+            value.simulated_runs = 1;
+        } else if record.has_confirmed_feedback() {
+            value.feedback_received = 1;
+            if record.measurements.blue_team_detected {
+                value.detected = 1;
+                value.detection_samples = 1;
+                value.sum_mttd_ms = record.measurements.mttd_ms.into();
+            }
+            if record.evidence.as_ref().is_some_and(|e| e.contained) {
+                value.contained = 1;
+                value.containment_samples = 1;
+                value.sum_mttr_ms = record.measurements.mttr_ms.into();
+            }
+        } else {
+            value.pending_feedback = 1;
+        }
+        value
+    }
+
+    fn combine(&mut self, other: &Self, add: bool) {
+        macro_rules! update { ($($field:ident),*) => { $(
+            self.$field = if add { self.$field + other.$field } else { self.$field.saturating_sub(other.$field) };
+        )* }; }
+        update!(
+            scenarios_executed,
+            detected,
+            feedback_received,
+            simulated_runs,
+            pending_feedback,
+            contained,
+            detection_samples,
+            containment_samples,
+            sum_mttd_ms,
+            sum_mttr_ms
+        );
     }
 
     /// Update an existing measurement (e.g. from closed-loop feedback).
@@ -69,28 +138,30 @@ impl Aggregate {
                 self.detected -= 1;
             }
         }
-        self.sum_mttd_ms = self.sum_mttd_ms.saturating_sub(old.mttd_ms) + new.mttd_ms;
-        self.sum_mttr_ms = self.sum_mttr_ms.saturating_sub(old.mttr_ms) + new.mttr_ms;
+        self.sum_mttd_ms =
+            self.sum_mttd_ms.saturating_sub(u128::from(old.mttd_ms)) + u128::from(new.mttd_ms);
+        self.sum_mttr_ms =
+            self.sum_mttr_ms.saturating_sub(u128::from(old.mttr_ms)) + u128::from(new.mttr_ms);
     }
 
     pub fn mean_mttd_ms(&self) -> u64 {
         self.sum_mttd_ms
-            .checked_div(self.scenarios_executed)
-            .unwrap_or(0)
+            .checked_div(u128::from(self.detection_samples))
+            .unwrap_or(0) as u64
     }
 
     pub fn mean_mttr_ms(&self) -> u64 {
         self.sum_mttr_ms
-            .checked_div(self.scenarios_executed)
-            .unwrap_or(0)
+            .checked_div(u128::from(self.containment_samples))
+            .unwrap_or(0) as u64
     }
 
     /// Percentage of runs the Blue Team detected (0..100).
     pub fn detection_rate_pct(&self) -> f32 {
-        if self.scenarios_executed == 0 {
+        if self.feedback_received == 0 {
             return 0.0;
         }
-        100.0 * self.detected as f32 / self.scenarios_executed as f32
+        100.0 * self.detected as f32 / self.feedback_received as f32
     }
 
     /// Recovery speed as a percentage of the containment target (0..100):
@@ -98,7 +169,7 @@ impl Aggregate {
     /// linearly. This is the recovery half of the resilience score, so a slow
     /// Blue Team actually lowers the index instead of it being a constant.
     pub fn recovery_speed_pct(&self) -> f32 {
-        if self.scenarios_executed == 0 {
+        if self.containment_samples == 0 {
             return 0.0;
         }
         let mean = self.mean_mttr_ms();
@@ -123,10 +194,25 @@ impl Aggregate {
              asmodeus_mttr_seconds {:.3}\n\
              # HELP asmodeus_scenarios_executed_total Scenarios executed\n\
              # TYPE asmodeus_scenarios_executed_total counter\n\
-             asmodeus_scenarios_executed_total {}\n",
+             asmodeus_scenarios_executed_total {}\n\
+             # TYPE asmodeus_feedback_received gauge\n\
+             asmodeus_feedback_received {}\n\
+             # TYPE asmodeus_simulated_runs gauge\n\
+             asmodeus_simulated_runs {}\n\
+             # TYPE asmodeus_pending_feedback gauge\n\
+             asmodeus_pending_feedback {}\n\
+             # TYPE asmodeus_detection_samples gauge\n\
+             asmodeus_detection_samples {}\n\
+             # TYPE asmodeus_containment_samples gauge\n\
+             asmodeus_containment_samples {}\n",
             self.mean_mttd_ms() as f64 / 1000.0,
             self.mean_mttr_ms() as f64 / 1000.0,
             self.scenarios_executed,
+            self.feedback_received,
+            self.simulated_runs,
+            self.pending_feedback,
+            self.detection_samples,
+            self.containment_samples,
         )
     }
 }
@@ -161,6 +247,47 @@ mod tests {
     }
 
     #[test]
+    fn pending_simulated_and_legacy_runs_cannot_improve_defense_scores() {
+        let mut pending = sample_record();
+        pending.evidence.as_mut().unwrap().feedback_received = false;
+        let mut simulated = pending.clone();
+        simulated.evidence.as_mut().unwrap().execution_mode = "simulated".into();
+        simulated.evidence.as_mut().unwrap().feedback_received = true;
+        simulated.measurements = Measurements {
+            mttd_ms: 1,
+            mttr_ms: 1,
+            blue_team_detected: true,
+        };
+        let mut legacy = simulated.clone();
+        legacy.evidence = None;
+        let records = [pending, simulated, legacy];
+        let aggregate = Aggregate::from_records(&records);
+        assert_eq!(aggregate.feedback_received, 0);
+        assert_eq!(aggregate.pending_feedback, 2);
+        assert_eq!(aggregate.simulated_runs, 1);
+        assert_eq!(aggregate.recovery_speed_pct(), 0.0);
+        let report = EcosystemResilienceReport::build(&records, &aggregate);
+        assert_eq!(report.mttr_sla_status, "NO DATA");
+        assert_eq!(report.resilience_score, 0);
+        assert!(report.nist_functions.iter().all(|f| f.score_pct == 0.0));
+    }
+
+    #[test]
+    fn large_feedback_values_do_not_overflow_aggregates_or_reports() {
+        let mut record = sample_record();
+        record.measurements.blue_team_detected = true;
+        record.measurements.mttd_ms = u64::MAX;
+        record.measurements.mttr_ms = u64::MAX;
+        let records = [record.clone(), record];
+        let mut aggregate = Aggregate::from_records(&records);
+        assert_eq!(aggregate.mean_mttd_ms(), u64::MAX);
+        let report = EcosystemResilienceReport::build(&records, &aggregate);
+        assert_eq!(report.tactics_breakdown[0].mean_mttr_ms, u64::MAX);
+        aggregate.update_measurement(records[0].measurements, Measurements::default());
+        assert_eq!(aggregate.mean_mttr_ms(), u64::MAX / 2);
+    }
+
+    #[test]
     fn from_records_rebuilds_aggregate() {
         // A restart must not lose metrics: rebuilding from the persisted audit
         // trail reproduces the same means and detection rate as live recording.
@@ -172,9 +299,9 @@ mod tests {
                 mttr_ms: mttr,
                 blue_team_detected: detected,
             };
-            live.record(m);
             let mut rec = sample_record();
             rec.measurements = m;
+            live.record_run(&rec);
             trail.append(rec);
         }
         let rebuilt = Aggregate::from_records(trail.records());
@@ -205,6 +332,13 @@ mod tests {
             timestamp_utc: "2026-09-18T00:00:00Z".into(),
             signature_hex: String::new(),
             public_key_hex: String::new(),
+            evidence: Some(crate::RunEvidence {
+                execution_mode: "runner".into(),
+                feedback_received: true,
+                contained: true,
+                cleanup_confirmed: true,
+                failure_reason: None,
+            }),
         }
     }
 

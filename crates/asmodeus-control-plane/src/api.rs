@@ -31,14 +31,18 @@ impl From<crate::execution::ExecutionError> for ApiError {
         match error {
             crate::execution::ExecutionError::InvalidSignature
             | crate::execution::ExecutionError::RunnerRejected(_)
-            | crate::execution::ExecutionError::EngineRejected(_) => {
+            | crate::execution::ExecutionError::InvalidManifest(_) => {
                 ApiError::Unprocessable(message)
             }
+            crate::execution::ExecutionError::Forbidden => {
+                ApiError::Forbidden("role may not execute this scenario category")
+            }
             crate::execution::ExecutionError::TargetNotFound(_) => ApiError::NotFound(message),
-            crate::execution::ExecutionError::Dispatch(_) => ApiError::BadGateway(message),
+            crate::execution::ExecutionError::Dispatch(_)
+            | crate::execution::ExecutionError::NoActiveRunner => ApiError::BadGateway(message),
             crate::execution::ExecutionError::RunnerIncomplete(_)
-            | crate::execution::ExecutionError::EngineTransition(_)
-            | crate::execution::ExecutionError::AuditSigning(_) => ApiError::Internal(message),
+            | crate::execution::ExecutionError::AuditSigning(_)
+            | crate::execution::ExecutionError::AuditPersistence(_) => ApiError::Internal(message),
         }
     }
 }
@@ -89,7 +93,9 @@ fn required_text<'a>(claims: &'a Value, key: &str) -> Result<&'a str, ApiError> 
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or(ApiError::Unauthorized("missing required APEX identity claim"))
+        .ok_or(ApiError::Unauthorized(
+            "missing required APEX identity claim",
+        ))
 }
 
 fn verified_apex_claims(token: &str) -> Result<Value, ApiError> {
@@ -118,7 +124,7 @@ fn verified_apex_claims(token: &str) -> Result<Value, ApiError> {
 
     let secret = std::env::var("ASMODEUS_JWT_SECRET")
         .map_err(|_| ApiError::Unauthorized("JWT verifier is not configured"))?;
-    if secret.as_bytes().len() < 32 {
+    if secret.len() < 32 {
         return Err(ApiError::Unauthorized("JWT verifier secret is too short"));
     }
 
@@ -142,9 +148,9 @@ fn verified_apex_claims(token: &str) -> Result<Value, ApiError> {
     }
     let audience = env_or("ASMODEUS_JWT_AUDIENCE", DEFAULT_APEX_AUDIENCE);
     if !audience_matches(
-        claims
-            .get("aud")
-            .ok_or(ApiError::Unauthorized("missing required APEX identity claim"))?,
+        claims.get("aud").ok_or(ApiError::Unauthorized(
+            "missing required APEX identity claim",
+        ))?,
         &audience,
     ) {
         return Err(ApiError::Unauthorized("unexpected bearer token audience"));
@@ -163,7 +169,9 @@ fn verified_apex_claims(token: &str) -> Result<Value, ApiError> {
         .get("permissions")
         .is_some_and(|permissions| permissions.is_array())
     {
-        return Err(ApiError::Unauthorized("missing required APEX identity claim"));
+        return Err(ApiError::Unauthorized(
+            "missing required APEX identity claim",
+        ));
     }
 
     let now = SystemTime::now()
@@ -173,15 +181,21 @@ fn verified_apex_claims(token: &str) -> Result<Value, ApiError> {
     let iat = claims
         .get("iat")
         .and_then(Value::as_u64)
-        .ok_or(ApiError::Unauthorized("missing required APEX identity claim"))?;
+        .ok_or(ApiError::Unauthorized(
+            "missing required APEX identity claim",
+        ))?;
     let nbf = claims
         .get("nbf")
         .and_then(Value::as_u64)
-        .ok_or(ApiError::Unauthorized("missing required APEX identity claim"))?;
+        .ok_or(ApiError::Unauthorized(
+            "missing required APEX identity claim",
+        ))?;
     let exp = claims
         .get("exp")
         .and_then(Value::as_u64)
-        .ok_or(ApiError::Unauthorized("missing required APEX identity claim"))?;
+        .ok_or(ApiError::Unauthorized(
+            "missing required APEX identity claim",
+        ))?;
 
     if iat > now.saturating_add(60) || nbf > now.saturating_add(60) {
         return Err(ApiError::Unauthorized("bearer token is not active"));
@@ -291,10 +305,7 @@ mod tests {
     fn signed_apex_identity_selects_role() {
         let mut headers = HeaderMap::new();
         let token = token("red_team", |_| {});
-        headers.insert(
-            "authorization",
-            format!("Bearer {token}").parse().unwrap(),
-        );
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
         assert_eq!(caller_role(&headers).unwrap(), Role::RedTeam);
     }
 
@@ -303,11 +314,11 @@ mod tests {
         let mut token = token("red_team", |_| {});
         token.push('x');
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        assert!(matches!(caller_role(&headers), Err(ApiError::Unauthorized(_))));
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(matches!(
+            caller_role(&headers),
+            Err(ApiError::Unauthorized(_))
+        ));
     }
 
     #[test]
@@ -316,10 +327,10 @@ mod tests {
             claims["apex_contract_version"] = json!("2.0");
         });
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        assert!(matches!(caller_role(&headers), Err(ApiError::Unauthorized(_))));
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(matches!(
+            caller_role(&headers),
+            Err(ApiError::Unauthorized(_))
+        ));
     }
 }
