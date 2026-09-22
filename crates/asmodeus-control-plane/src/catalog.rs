@@ -52,11 +52,6 @@ impl Catalog {
         &self.public_key
     }
 
-    /// The private signing key if available in this node.
-    pub fn secret_key(&self) -> Option<&[u8]> {
-        self.secret_key.as_deref()
-    }
-
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
     }
@@ -89,7 +84,7 @@ impl Catalog {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let manifest = match asmodeus_dsl::manifest::parse_manifest(&content) {
+            let manifest = match asmodeus_dsl::manifest::parse_and_validate_manifest(&content) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(path = ?path, error = %e, "skipping invalid scenario manifest");
@@ -438,6 +433,29 @@ spec:
         assert_eq!(entry.name, "Dynamic Loaded Canary");
         assert_eq!(entry.detector, "dynamic_detector");
         assert_eq!(entry.mitre.as_ref().unwrap().id, "T1053");
+
+        // Parsing alone must never authorize or sign an unsafe manifest.
+        for (name, content) in [
+            (
+                "operational",
+                valid_yaml.replace("synthetic\"", "operational\""),
+            ),
+            (
+                "scope",
+                valid_yaml.replace("/tmp/asmodeus-canary/test.txt", "/etc/passwd"),
+            ),
+            (
+                "budget",
+                valid_yaml.replace("file_count: 10", "file_count: 999999"),
+            ),
+        ] {
+            std::fs::write(temp_dir.join("dyn_scenario.yaml"), content).unwrap();
+            assert_eq!(cat.load_from_dir(&temp_dir).unwrap(), 0, "{name}");
+            assert_eq!(
+                cat.get("DYN-SCN-001").unwrap().nature,
+                ActionNature::Synthetic
+            );
+        }
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

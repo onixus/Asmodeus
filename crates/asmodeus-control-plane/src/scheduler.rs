@@ -477,7 +477,6 @@ mod tests {
         assert!((alerts[0].drift_factor - 1.8).abs() < 0.001);
     }
 
-
     #[test]
     fn drift_alert_emits_on_transition_not_every_sample() {
         let mut cat = ScheduleCatalog::new();

@@ -73,7 +73,7 @@ pub(crate) async fn verify_run(
     // Pin verification to the control plane's trusted signing key rather than
     // the public key embedded in the record, so a tampered + re-signed record
     // cannot report itself as verified.
-    let verified = record.verify_with_key(state.catalog.public_key());
+    let verified = record.verify_with_key(&state.audit_public_key);
     Ok(Json(json!({
         "run_id": record.run_id,
         "scenario_id": record.scenario_id,
@@ -111,63 +111,52 @@ pub(crate) async fn run_feedback(
         return Err(ApiError::Forbidden("role may not submit feedback"));
     }
 
-    let (old_record, updated_record) = {
-        let old = state
-            .audit
-            .get(&id)
-            .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
+    let signing_key = state.signing_key;
+    let signed = state
+        .audit
+        .update(id.clone(), move |old| {
+            let new_measurements = Measurements {
+                mttd_ms: payload.mttd_ms.unwrap_or(old.measurements.mttd_ms),
+                mttr_ms: payload.mttr_ms.unwrap_or(old.measurements.mttr_ms),
+                blue_team_detected: payload.detected,
+            };
 
-        let new_measurements = Measurements {
-            mttd_ms: payload.mttd_ms.unwrap_or(old.measurements.mttd_ms),
-            mttr_ms: payload.mttr_ms.unwrap_or(old.measurements.mttr_ms),
-            blue_team_detected: payload.detected,
-        };
+            let updated = AuditRecord {
+                run_id: old.run_id.clone(),
+                scenario_id: old.scenario_id.clone(),
+                scenario_name: old.scenario_name.clone(),
+                category: old.category.clone(),
+                mitre_technique: old.mitre_technique.clone(),
+                mitre_tactic: old.mitre_tactic.clone(),
+                severity: old.severity.clone(),
+                tag: old.tag.clone(),
+                initiator: old.initiator.clone(),
+                runner_id: old.runner_id.clone(),
+                status: if payload.contained {
+                    "CONTAINED".to_string()
+                } else if payload.detected {
+                    "DETECTED".to_string()
+                } else {
+                    "UNCONTAINED".to_string()
+                },
+                measurements: new_measurements,
+                detection_source: payload
+                    .detection_source
+                    .unwrap_or_else(|| old.detection_source.clone()),
+                containment_action: payload
+                    .containment_action
+                    .unwrap_or_else(|| old.containment_action.clone()),
+                cleanup_status: old.cleanup_status.clone(),
+                timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+                signature_hex: String::new(),
+                public_key_hex: String::new(),
+            };
 
-        let updated = AuditRecord {
-            run_id: old.run_id.clone(),
-            scenario_id: old.scenario_id.clone(),
-            scenario_name: old.scenario_name.clone(),
-            category: old.category.clone(),
-            mitre_technique: old.mitre_technique.clone(),
-            mitre_tactic: old.mitre_tactic.clone(),
-            severity: old.severity.clone(),
-            tag: old.tag.clone(),
-            initiator: old.initiator.clone(),
-            runner_id: old.runner_id.clone(),
-            status: if payload.contained {
-                "CONTAINED".to_string()
-            } else if payload.detected {
-                "DETECTED".to_string()
-            } else {
-                "UNCONTAINED".to_string()
-            },
-            measurements: new_measurements,
-            detection_source: payload
-                .detection_source
-                .unwrap_or_else(|| old.detection_source.clone()),
-            containment_action: payload
-                .containment_action
-                .unwrap_or_else(|| old.containment_action.clone()),
-            cleanup_status: old.cleanup_status.clone(),
-            timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
-            signature_hex: String::new(),
-            public_key_hex: String::new(),
-        };
-
-        (old, updated)
-    };
-
-    let signed = updated_record
-        .sign(&state.signing_key)
-        .map_err(|e| ApiError::Internal(format!("audit re-signing: {e}")))?;
-
-    state.audit.update(&id, signed.clone()).await;
-
-    state
-        .metrics
-        .lock()
-        .unwrap()
-        .update_measurement(old_record.measurements, signed.measurements);
+            updated.sign(&signing_key).map_err(std::io::Error::other)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("audit feedback: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
 
     Ok(Json(json!({
         "status": "UPDATED",

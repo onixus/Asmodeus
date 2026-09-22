@@ -83,7 +83,7 @@ impl EcosystemResilienceReport {
         let mut rc_total = 0;
         let mut rc_cleaned = 0;
 
-        let mut tactics_map: HashMap<String, (usize, usize, u64, u64)> = HashMap::new();
+        let mut tactics_map: HashMap<String, (usize, usize, u128, u128)> = HashMap::new();
 
         for r in records {
             let detected = r.measurements.blue_team_detected;
@@ -101,8 +101,8 @@ impl EcosystemResilienceReport {
             if detected {
                 entry.1 += 1;
             }
-            entry.2 += mttd;
-            entry.3 += mttr;
+            entry.2 += u128::from(mttd);
+            entry.3 += u128::from(mttr);
 
             // Mapping to NIST functions:
             // Detect (DE): all attack simulations
@@ -231,8 +231,16 @@ impl EcosystemResilienceReport {
                 tactic_name: name,
                 total_runs: tot,
                 detected_runs: det,
-                mean_mttd_ms: if tot > 0 { mttd_sum / tot as u64 } else { 0 },
-                mean_mttr_ms: if tot > 0 { mttr_sum / tot as u64 } else { 0 },
+                mean_mttd_ms: if tot > 0 {
+                    (mttd_sum / tot as u128) as u64
+                } else {
+                    0
+                },
+                mean_mttr_ms: if tot > 0 {
+                    (mttr_sum / tot as u128) as u64
+                } else {
+                    0
+                },
             })
             .collect();
         tactics_breakdown.sort_by(|a, b| a.tactic_name.cmp(&b.tactic_name));

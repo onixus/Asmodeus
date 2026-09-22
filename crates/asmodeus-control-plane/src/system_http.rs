@@ -21,7 +21,7 @@ pub(crate) async fn healthz() -> Json<Value> {
 
 /// Prometheus scrape endpoint (TT §4.3). Unauthenticated, like any exporter.
 pub(crate) async fn metrics(State(state): State<AppState>) -> Response {
-    let body = state.metrics.lock().unwrap().prometheus_text();
+    let body = state.audit.aggregate().prometheus_text();
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
@@ -38,16 +38,9 @@ pub(crate) async fn telemetry_mttd(
     if !role.can(asmodeus_common::Capability::ViewReports) {
         return Err(ApiError::Forbidden("role may not view reports"));
     }
-    let completed = state
-        .runs
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|s| s.is_terminal())
-        .count();
-    let agg = state.metrics.lock().unwrap();
+    let agg = state.audit.aggregate();
     Ok(Json(json!({
-        "runs_completed": completed,
+        "runs_completed": agg.scenarios_executed,
         "catalog_size": state.catalog.ids().count(),
         "mean_mttd_ms": agg.mean_mttd_ms(),
         "mean_mttr_ms": agg.mean_mttr_ms(),

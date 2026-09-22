@@ -36,8 +36,8 @@ pub fn resilience_score(attacks_repelled_pct: f32, recovery_speed_pct: f32) -> u
 pub struct Aggregate {
     pub scenarios_executed: u64,
     pub detected: u64,
-    sum_mttd_ms: u64,
-    sum_mttr_ms: u64,
+    sum_mttd_ms: u128,
+    sum_mttr_ms: u128,
 }
 
 impl Aggregate {
@@ -56,8 +56,8 @@ impl Aggregate {
         if m.blue_team_detected {
             self.detected += 1;
         }
-        self.sum_mttd_ms += m.mttd_ms;
-        self.sum_mttr_ms += m.mttr_ms;
+        self.sum_mttd_ms += u128::from(m.mttd_ms);
+        self.sum_mttr_ms += u128::from(m.mttr_ms);
     }
 
     /// Update an existing measurement (e.g. from closed-loop feedback).
@@ -69,20 +69,22 @@ impl Aggregate {
                 self.detected -= 1;
             }
         }
-        self.sum_mttd_ms = self.sum_mttd_ms.saturating_sub(old.mttd_ms) + new.mttd_ms;
-        self.sum_mttr_ms = self.sum_mttr_ms.saturating_sub(old.mttr_ms) + new.mttr_ms;
+        self.sum_mttd_ms =
+            self.sum_mttd_ms.saturating_sub(u128::from(old.mttd_ms)) + u128::from(new.mttd_ms);
+        self.sum_mttr_ms =
+            self.sum_mttr_ms.saturating_sub(u128::from(old.mttr_ms)) + u128::from(new.mttr_ms);
     }
 
     pub fn mean_mttd_ms(&self) -> u64 {
         self.sum_mttd_ms
-            .checked_div(self.scenarios_executed)
-            .unwrap_or(0)
+            .checked_div(u128::from(self.scenarios_executed))
+            .unwrap_or(0) as u64
     }
 
     pub fn mean_mttr_ms(&self) -> u64 {
         self.sum_mttr_ms
-            .checked_div(self.scenarios_executed)
-            .unwrap_or(0)
+            .checked_div(u128::from(self.scenarios_executed))
+            .unwrap_or(0) as u64
     }
 
     /// Percentage of runs the Blue Team detected (0..100).
@@ -158,6 +160,20 @@ mod tests {
         assert_eq!(agg.mean_mttd_ms(), 200);
         assert_eq!(agg.mean_mttr_ms(), 300);
         assert_eq!(agg.detection_rate_pct(), 50.0);
+    }
+
+    #[test]
+    fn large_feedback_values_do_not_overflow_aggregates_or_reports() {
+        let mut record = sample_record();
+        record.measurements.mttd_ms = u64::MAX;
+        record.measurements.mttr_ms = u64::MAX;
+        let records = [record.clone(), record];
+        let mut aggregate = Aggregate::from_records(&records);
+        assert_eq!(aggregate.mean_mttd_ms(), u64::MAX);
+        let report = EcosystemResilienceReport::build(&records, &aggregate);
+        assert_eq!(report.tactics_breakdown[0].mean_mttr_ms, u64::MAX);
+        aggregate.update_measurement(records[0].measurements, Measurements::default());
+        assert_eq!(aggregate.mean_mttr_ms(), u64::MAX / 2);
     }
 
     #[test]

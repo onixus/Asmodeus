@@ -26,9 +26,9 @@ mod registry;
 mod reporting;
 mod runner_http;
 mod runs_http;
+mod scenario_http;
 mod scheduler;
 mod schedules_http;
-mod scenario_http;
 mod state;
 mod system_http;
 mod watchdog;
@@ -48,9 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = ControlPlaneConfig::from_env()?;
-    let state = AppState::new(Catalog::seeded());
-    let _watchdog =
-        watchdog::spawn_watchdog(state.registry.clone(), config.watchdog_interval_sec);
+    let state = AppState::new(Catalog::seeded())?;
+    let _watchdog = watchdog::spawn_watchdog(state.registry.clone(), config.watchdog_interval_sec);
     let _scheduler = scheduler::spawn_scheduler(state.clone(), config.scheduler_interval_sec);
     let app = router(state);
 

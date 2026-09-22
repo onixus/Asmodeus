@@ -167,7 +167,7 @@ pub(crate) async fn list_drift_alerts(
 }
 
 #[derive(Debug, Deserialize)]
-struct ToggleSchedulePayload {
+pub(crate) struct ToggleSchedulePayload {
     enabled: bool,
 }
 

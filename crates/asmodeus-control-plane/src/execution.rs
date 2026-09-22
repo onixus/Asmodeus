@@ -18,6 +18,8 @@ pub(crate) enum ExecutionError {
     InvalidSignature,
     #[error("target runner not found: {0}")]
     TargetNotFound(String),
+    #[error("no active runner available")]
+    NoActiveRunner,
     #[error("dispatch: {0}")]
     Dispatch(String),
     #[error("runner rejected: {0}")]
@@ -30,6 +32,8 @@ pub(crate) enum ExecutionError {
     EngineTransition(String),
     #[error("audit signing: {0}")]
     AuditSigning(String),
+    #[error("audit persistence: {0}")]
+    AuditPersistence(String),
 }
 
 pub(crate) async fn execute_single_scenario(
@@ -47,11 +51,34 @@ pub(crate) async fn execute_single_scenario(
         return Err(ExecutionError::InvalidSignature);
     }
 
+    // Target resolution. An explicitly requested target must resolve to a
+    // registered runner: we never silently fall back to the static default
+    // endpoint, otherwise a mistyped or unavailable target would fire the
+    // scenario against the wrong runner. The static endpoint is only used when
+    // no target was requested at all.
+    let explicit_target = target_override.map(str::trim).filter(|t| !t.is_empty());
+    let matched_runner = state.registry.find_for_target(target_override);
+    let target_endpoint = if let Some(target) = explicit_target {
+        match matched_runner.as_ref() {
+            Some(runner) => Some(runner.endpoint.clone()),
+            None => return Err(ExecutionError::TargetNotFound(target.to_string())),
+        }
+    } else {
+        if matched_runner.is_none() && !state.registry.is_empty() {
+            return Err(ExecutionError::NoActiveRunner);
+        }
+        matched_runner
+            .as_ref()
+            .map(|r| r.endpoint.clone())
+            .or_else(|| state.runner_endpoint.clone())
+    };
+
+    let run_id = state.next_run_id();
     state.webhook.dispatch(
         crate::webhook::WebhookPayload {
             event: "exercise_started".into(),
             timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
-            exercise_id: String::new(),
+            exercise_id: run_id.to_string(),
             scenario_id: entry.id.to_string(),
             mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
             target: target_override.unwrap_or("default").to_string(),
@@ -64,27 +91,6 @@ pub(crate) async fn execute_single_scenario(
         },
         Some(&state.signing_key),
     );
-
-    // Target resolution. An explicitly requested target must resolve to a
-    // registered runner: we never silently fall back to the static default
-    // endpoint, otherwise a mistyped or unavailable target would fire the
-    // scenario against the wrong runner. The static endpoint is only used when
-    // no target was requested at all.
-    let explicit_target = target_override.map(str::trim).filter(|t| !t.is_empty());
-    let matched_runner = state.registry.find_for_target(target_override);
-    let target_endpoint = if let Some(target) = explicit_target {
-        match matched_runner.as_ref() {
-            Some(runner) => Some(runner.endpoint.clone()),
-            None => {
-                return Err(ExecutionError::TargetNotFound(target.to_string()))
-            }
-        }
-    } else {
-        matched_runner
-            .as_ref()
-            .map(|r| r.endpoint.clone())
-            .or_else(|| state.runner_endpoint.clone())
-    };
 
     // Execute: dispatch to a live runner over gRPC if one is configured,
     // else drive the in-process engine. Detection metrics stay simulated
@@ -139,18 +145,6 @@ pub(crate) async fn execute_single_scenario(
         )
     };
 
-    let run_id = state.next_run_id();
-    state
-        .runs
-        .lock()
-        .unwrap()
-        .insert(run_id.clone(), final_state);
-    state.metrics.lock().unwrap().record(Measurements {
-        mttd_ms: entry.sim_mttd_ms,
-        mttr_ms: entry.sim_mttr_ms,
-        blue_team_detected: true,
-    });
-
     let raw_record = AuditRecord {
         run_id: run_id.to_string(),
         scenario_id: entry.id.to_string(),
@@ -186,7 +180,16 @@ pub(crate) async fn execute_single_scenario(
         .sign(&state.signing_key)
         .map_err(|e| ExecutionError::AuditSigning(e.to_string()))?;
 
-    state.audit.append(signed_record.clone()).await;
+    state
+        .audit
+        .append(signed_record.clone())
+        .await
+        .map_err(|e| ExecutionError::AuditPersistence(e.to_string()))?;
+    state
+        .runs
+        .lock()
+        .unwrap()
+        .insert(run_id.clone(), final_state);
 
     state.webhook.dispatch(
         crate::webhook::WebhookPayload {
