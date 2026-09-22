@@ -131,7 +131,9 @@ impl ComplianceReport {
             // Find runs matching these scenarios or techniques
             let matching_runs: Vec<&AuditRecord> = records
                 .iter()
-                .filter(|r| techniques.iter().any(|&t| r.mitre_technique == t))
+                .filter(|r| {
+                    r.has_confirmed_feedback() && techniques.iter().any(|&t| r.mitre_technique == t)
+                })
                 .collect();
 
             let total_runs = matching_runs.len();
@@ -367,6 +369,13 @@ mod tests {
 
     fn sample_record(tech: &str, detected: bool) -> AuditRecord {
         AuditRecord {
+            evidence: Some(crate::RunEvidence {
+                execution_mode: "runner".into(),
+                feedback_received: true,
+                contained: true,
+                cleanup_confirmed: true,
+                failure_reason: None,
+            }),
             run_id: "run-comp-1".into(),
             scenario_id: "SCN-RT-001".into(),
             scenario_name: "Test".into(),

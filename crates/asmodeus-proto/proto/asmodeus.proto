@@ -12,6 +12,7 @@ service RunnerControl {
   // Liveness probe for the operator view. The dead-man switch that aborts a
   // run on lost control is runner-side; this is the control-plane's view of it.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  rpc Cancel(CancelRequest) returns (CancelReply);
 }
 
 message ExecuteRequest {
@@ -22,6 +23,8 @@ message ExecuteRequest {
   string target_dir    = 5;  // MUST be within canary scope
   uint32 file_count    = 6;
   uint32 chunk_size_kb = 7;
+  string run_id = 8;
+  uint32 timeout_sec = 9; // may shorten, never extend the signed safety deadline
 }
 
 enum EventKind {
@@ -29,6 +32,9 @@ enum EventKind {
   STATE_CHANGED = 1;
   COMPLETED     = 2;
   REJECTED      = 3;
+  CANCELLED = 4;
+  FAILED = 5;
+  TIMED_OUT = 6;
 }
 
 message RunnerEvent {
@@ -37,7 +43,10 @@ message RunnerEvent {
   uint32    files_created = 3;
   uint64    bytes_written = 4;
   uint64    inject_ms     = 5;
-  string    detail        = 6;  // reason for REJECTED
+  string    detail        = 6;
+  string run_id = 7;
+  bool cleanup_confirmed = 8;
+  bool simulated = 9; // backend performed no external injection (e.g. SimBackend)
 }
 
 message HeartbeatRequest {
@@ -53,3 +62,6 @@ message HeartbeatReply {
   string active_exercise_id = 4;
   string version = 5;
 }
+
+message CancelRequest { string run_id = 1; }
+message CancelReply { bool accepted = 1; string state = 2; }

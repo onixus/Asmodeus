@@ -1,7 +1,7 @@
 //! HTTP handlers for run history, verification and Blue Team feedback.
 
 use asmodeus_common::Role;
-use asmodeus_telemetry::{AuditRecord, Measurements};
+use asmodeus_telemetry::{Measurements, RunEvidence};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -54,7 +54,15 @@ pub(crate) async fn get_run(
         .audit
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
-    Ok(Json(json!(record)))
+    let mut value = json!(record);
+    value["live_state"] = state
+        .runs
+        .lock()
+        .unwrap()
+        .get(&asmodeus_common::RunId::new(&id))
+        .map(|active| json!(*active.status.lock().unwrap()))
+        .unwrap_or(serde_json::Value::Null);
+    Ok(Json(value))
 }
 
 pub(crate) async fn verify_run(
@@ -85,6 +93,7 @@ pub(crate) async fn verify_run(
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunFeedbackPayload {
     pub detected: bool,
     #[serde(default)]
@@ -111,61 +120,135 @@ pub(crate) async fn run_feedback(
         return Err(ApiError::Forbidden("role may not submit feedback"));
     }
 
+    let old = state
+        .audit
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
+    if !old.is_terminal() {
+        return Err(ApiError::Unprocessable(
+            "feedback requires a terminal execution result".into(),
+        ));
+    }
+    if payload.contained && !payload.detected {
+        return Err(ApiError::Unprocessable(
+            "contained requires detected=true".into(),
+        ));
+    }
+    if payload.detected && payload.mttd_ms.is_none() {
+        return Err(ApiError::Unprocessable(
+            "detected feedback requires mttd_ms".into(),
+        ));
+    }
+    if payload.contained && payload.mttr_ms.is_none() {
+        return Err(ApiError::Unprocessable(
+            "contained feedback requires mttr_ms".into(),
+        ));
+    }
     let signing_key = state.signing_key;
     let signed = state
         .audit
-        .update(id.clone(), move |old| {
-            let new_measurements = Measurements {
-                mttd_ms: payload.mttd_ms.unwrap_or(old.measurements.mttd_ms),
-                mttr_ms: payload.mttr_ms.unwrap_or(old.measurements.mttr_ms),
+        .update(id.clone(), move |mut old| {
+            old.measurements = Measurements {
+                mttd_ms: if payload.detected {
+                    payload.mttd_ms.unwrap_or(0)
+                } else {
+                    0
+                },
+                mttr_ms: if payload.contained {
+                    payload.mttr_ms.unwrap_or(0)
+                } else {
+                    0
+                },
                 blue_team_detected: payload.detected,
             };
-
-            let updated = AuditRecord {
-                run_id: old.run_id.clone(),
-                scenario_id: old.scenario_id.clone(),
-                scenario_name: old.scenario_name.clone(),
-                category: old.category.clone(),
-                mitre_technique: old.mitre_technique.clone(),
-                mitre_tactic: old.mitre_tactic.clone(),
-                severity: old.severity.clone(),
-                tag: old.tag.clone(),
-                initiator: old.initiator.clone(),
-                runner_id: old.runner_id.clone(),
-                status: if payload.contained {
-                    "CONTAINED".to_string()
-                } else if payload.detected {
-                    "DETECTED".to_string()
-                } else {
-                    "UNCONTAINED".to_string()
-                },
-                measurements: new_measurements,
-                detection_source: payload
-                    .detection_source
-                    .unwrap_or_else(|| old.detection_source.clone()),
-                containment_action: payload
+            let evidence = old.evidence.get_or_insert_with(|| RunEvidence {
+                execution_mode: "legacy_unverified".into(),
+                ..Default::default()
+            });
+            evidence.feedback_received = true;
+            evidence.contained = payload.contained;
+            old.detection_source = payload
+                .detection_source
+                .unwrap_or_else(|| "operator_feedback".into());
+            old.containment_action = if payload.contained {
+                payload
                     .containment_action
-                    .unwrap_or_else(|| old.containment_action.clone()),
-                cleanup_status: old.cleanup_status.clone(),
-                timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
-                signature_hex: String::new(),
-                public_key_hex: String::new(),
+                    .unwrap_or_else(|| "operator_confirmed".into())
+            } else {
+                "UNCONFIRMED".into()
             };
-
-            updated.sign(&signing_key).map_err(std::io::Error::other)
+            old.timestamp_utc = asmodeus_telemetry::current_utc_iso8601();
+            old.sign(&signing_key).map_err(std::io::Error::other)
         })
         .await
         .map_err(|e| ApiError::Internal(format!("audit feedback: {e}")))?
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
+
+    let feedback = signed.clone();
+    state
+        .schedules
+        .update(move |catalog| {
+            catalog.record_feedback(&feedback);
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!("feedback saved but schedule update failed: {e}"))
+        })?;
 
     Ok(Json(json!({
         "status": "UPDATED",
         "run_id": signed.run_id,
         "run_status": signed.status,
         "measurements": signed.measurements,
+        "evidence": signed.evidence,
+        "detection_status": if signed.measurements.blue_team_detected { "DETECTED" } else { "NOT_DETECTED" },
         "detection_source": signed.detection_source,
         "containment_action": signed.containment_action,
         "signature_hex": signed.signature_hex,
         "timestamp_utc": signed.timestamp_utc,
     })))
+}
+
+pub(crate) async fn cancel_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(axum::http::StatusCode, Json<Value>), ApiError> {
+    let role = caller_role(&headers)?;
+    let record = state
+        .audit
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
+    let category: asmodeus_common::Category = record
+        .category
+        .parse()
+        .map_err(|_| ApiError::Unprocessable("unknown run category".into()))?;
+    if !role.can(category.required_capability()) {
+        return Err(ApiError::Forbidden(
+            "role may not cancel this scenario category",
+        ));
+    }
+    if record.is_terminal() {
+        return Ok((
+            axum::http::StatusCode::OK,
+            Json(json!({"run_id":id,"status":record.status,"evidence":record.evidence})),
+        ));
+    }
+    if let Some(active) = state
+        .runs
+        .lock()
+        .unwrap()
+        .get(&asmodeus_common::RunId::new(&id))
+    {
+        active.cancel();
+        return Ok((
+            axum::http::StatusCode::ACCEPTED,
+            Json(json!({"run_id":id,"status":"CANCELLATION_REQUESTED","cleanup_confirmed":false})),
+        ));
+    }
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(json!({"run_id":id,"status":record.status,"evidence":record.evidence})),
+    ))
 }

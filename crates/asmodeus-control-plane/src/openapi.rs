@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 /// Generates the canonical OpenAPI 3.1 schema for Asmodeus.
 pub fn generate_spec() -> Value {
-    json!({
+    let mut spec = json!({
         "openapi": "3.1.0",
         "info": {
             "title": "Asmodeus Control Plane API",
@@ -22,19 +22,30 @@ pub fn generate_spec() -> Value {
         ],
         "security": [
             {
-                "ApexRole": []
+                "ApexBearer": []
             }
         ],
         "components": {
             "securitySchemes": {
-                "ApexRole": {
-                    "type": "apiKey",
-                    "name": "X-Apex-Role",
-                    "in": "header",
-                    "description": "Role-Based Access Control context header. Accepted values: admin, red_team, devsecops, ciso, secops, auditor."
+                "ApexBearer": {
+                    "type": "http", "scheme": "bearer", "bearerFormat": "JWT",
+                    "description": "Verified APEX identity token. X-Apex-Role is available only with explicit development bypass."
                 }
             },
             "schemas": {
+                "RunEvidence": {
+                    "type":"object", "properties": {
+                        "execution_mode":{"type":"string","enum":["runner","simulated","legacy_unverified"]},
+                        "feedback_received":{"type":"boolean"}, "contained":{"type":"boolean"},
+                        "cleanup_confirmed":{"type":"boolean"}, "failure_reason":{"type":["string","null"]}
+                    }, "required":["execution_mode","feedback_received","contained","cleanup_confirmed"]
+                },
+                "RunRequest": {
+                    "type":"object", "additionalProperties":false,
+                    "properties": {"background":{"type":"boolean","default":false},
+                        "timeout_sec":{"type":"integer","minimum":1,"maximum":300,"description":"May shorten the signed scenario deadline."},
+                        "target_override":{"type":"string","description":"Registered runner ID or tag; does not override the signed filesystem scope."}}
+                },
                 "Measurements": {
                     "type": "object",
                     "properties": {
@@ -59,6 +70,8 @@ pub fn generate_spec() -> Value {
                         "runner_id": { "type": "string" },
                         "status": { "type": "string" },
                         "measurements": { "$ref": "#/components/schemas/Measurements" },
+                        "evidence": { "$ref": "#/components/schemas/RunEvidence" },
+                        "live_state": { "type": "string", "description":"Volatile progress, outside the signed audit record." },
                         "detection_source": { "type": "string" },
                         "containment_action": { "type": "string" },
                         "cleanup_status": { "type": "string" },
@@ -115,6 +128,8 @@ pub fn generate_spec() -> Value {
                         "created_at_utc": { "type": "string" },
                         "last_run_utc": { "type": "string", "nullable": true },
                         "last_status": { "type": "string", "nullable": true },
+                        "last_run_id": { "type": ["string", "null"] },
+                        "last_run_epoch_secs": { "type": ["integer", "null"] },
                         "last_mttd_ms": { "type": "integer", "nullable": true },
                         "baseline_mttd_ms": { "type": "integer", "nullable": true },
                         "drift_detected": { "type": "boolean" },
@@ -171,7 +186,7 @@ pub fn generate_spec() -> Value {
         "paths": {
             "/healthz": {
                 "get": {
-                    "summary": "Health check probe",
+                    "summary": "Health check probe", "security":[],
                     "responses": {
                         "200": { "description": "Control plane is healthy" }
                     }
@@ -179,7 +194,7 @@ pub fn generate_spec() -> Value {
             },
             "/metrics": {
                 "get": {
-                    "summary": "Prometheus metrics exposition",
+                    "summary": "Prometheus metrics exposition", "security":[],
                     "responses": {
                         "200": { "description": "Text exposition of resilience scores and MTTD/MTTR" }
                     }
@@ -187,7 +202,7 @@ pub fn generate_spec() -> Value {
             },
             "/api/v1/asmodeus/openapi.json": {
                 "get": {
-                    "summary": "Retrieve OpenAPI 3.1 JSON schema",
+                    "summary": "Retrieve OpenAPI 3.1 JSON schema", "security":[],
                     "responses": {
                         "200": { "description": "OpenAPI 3.1 specification" }
                     }
@@ -230,8 +245,11 @@ pub fn generate_spec() -> Value {
             "/api/v1/asmodeus/scenarios/{id}/run": {
                 "post": {
                     "summary": "Execute a scenario on runner or in-process simulation",
+                    "requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/RunRequest"}}}},
                     "responses": {
-                        "200": { "description": "Execution result with initial measurements and audit record" },
+                        "200": { "description": "Terminal execution result; detection awaits explicit feedback" },
+                        "202": { "description": "Background run durably admitted; returns run_id and status_url" },
+                        "422": { "description": "Unsupported options or invalid timeout" },
                         "403": { "description": "Caller role forbidden to execute category" },
                         "404": { "description": "Scenario or target not found" }
                     }
@@ -239,9 +257,9 @@ pub fn generate_spec() -> Value {
             },
             "/api/v1/asmodeus/scenarios/abort": {
                 "post": {
-                    "summary": "Emergency abort of all active runs and triggers cleanup",
+                    "summary": "Request cancellation of active runs permitted for the caller role",
                     "responses": {
-                        "200": { "description": "All runs transitioned to RolledBack" }
+                        "200": { "description": "Cancellation requested; cleanup remains unconfirmed until the terminal runner result" }
                     }
                 }
             },
@@ -303,6 +321,11 @@ pub fn generate_spec() -> Value {
                     }
                 }
             },
+            "/api/v1/asmodeus/runs/{id}/cancel": {
+                "post": {"summary":"Cancel one active run; poll its status for cleanup confirmation",
+                    "responses":{"202":{"description":"Cancellation requested"},"200":{"description":"Run already terminal"},
+                        "403":{"description":"Role cannot cancel this category"},"404":{"description":"Run not found"}}}
+            },
             "/api/v1/asmodeus/runs/{id}/verify": {
                 "get": {
                     "summary": "Cryptographically verify Ed25519 signature of audit record",
@@ -314,6 +337,13 @@ pub fn generate_spec() -> Value {
             "/api/v1/asmodeus/runs/{id}/feedback": {
                 "post": {
                     "summary": "Submit Blue Team detection and containment feedback (Closed-Loop)",
+                    "requestBody":{"required":true,"content":{"application/json":{"schema":{
+                        "type":"object", "properties":{
+                            "detected":{"type":"boolean"},"contained":{"type":"boolean","description":"Requires detected=true and mttr_ms"},
+                            "mttd_ms":{"type":"integer","minimum":0,"description":"Required when detected=true"},
+                            "mttr_ms":{"type":"integer","minimum":0},"detection_source":{"type":"string"},"containment_action":{"type":"string"}
+                        },"required":["detected"]
+                    }}}},
                     "responses": {
                         "200": { "description": "Record updated and re-signed with Ed25519 key" },
                         "403": { "description": "Role forbidden from submitting feedback" }
@@ -442,7 +472,14 @@ pub fn generate_spec() -> Value {
                 }
             }
         }
-    })
+    });
+    for (path, item) in spec["paths"].as_object_mut().expect("paths schema") {
+        if path.contains("{id}") {
+            item["parameters"] =
+                json!([{"name":"id","in":"path","required":true,"schema":{"type":"string"}}]);
+        }
+    }
+    spec
 }
 
 #[cfg(test)]

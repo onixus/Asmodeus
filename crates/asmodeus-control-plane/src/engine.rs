@@ -28,7 +28,8 @@ pub struct Outcome {
 /// an illegal step aborts the run instead of proceeding.
 pub fn execute(entry: &ScenarioEntry) -> Result<Outcome, EngineError> {
     // INV-0 + canary-scope gate before anything is armed.
-    validate(entry.nature, &entry.target_path).map_err(EngineError::Rejected)?;
+    validate(asmodeus_common::ActionNature::Synthetic, &entry.target_path)
+        .map_err(EngineError::Rejected)?;
 
     let mut state = RunState::Idle;
     state = state.on(RunEvent::Validate)?;

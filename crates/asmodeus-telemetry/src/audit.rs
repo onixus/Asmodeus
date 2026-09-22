@@ -5,6 +5,18 @@ use std::time::SystemTime;
 
 use crate::Measurements;
 
+/// Evidence is explicitly separate from scenario execution. Legacy records
+/// without this field remain verifiable but cannot prove Blue Team outcomes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvidence {
+    pub execution_mode: String,
+    pub feedback_received: bool,
+    pub contained: bool,
+    pub cleanup_confirmed: bool,
+    pub failure_reason: Option<String>,
+}
+
 /// Single immutable audit log record of a red team / chaos run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
@@ -26,6 +38,8 @@ pub struct AuditRecord {
     pub timestamp_utc: String,
     pub signature_hex: String,
     pub public_key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<RunEvidence>,
 }
 
 impl AuditRecord {
@@ -63,7 +77,26 @@ impl AuditRecord {
         field(&mut buf, &self.containment_action);
         field(&mut buf, &self.cleanup_status);
         field(&mut buf, &self.timestamp_utc);
+        // Preserve canonical bytes for historical records; evidence-bearing
+        // revisions use a tagged extension whose contents are also signed.
+        if let Some(evidence) = &self.evidence {
+            field(&mut buf, "evidence-v1");
+            field(
+                &mut buf,
+                &serde_json::to_string(evidence).expect("evidence serialization"),
+            );
+        }
         buf
+    }
+
+    pub fn has_confirmed_feedback(&self) -> bool {
+        self.evidence
+            .as_ref()
+            .is_some_and(|e| e.execution_mode == "runner" && e.feedback_received)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self.status.as_str(), "QUEUED" | "RUNNING" | "CANCELLING")
     }
 
     /// Sign this audit record using the operator's Ed25519 private key.
@@ -363,6 +396,7 @@ mod tests {
             timestamp_utc: "2026-09-09T12:00:00.000Z".to_string(),
             signature_hex: String::new(),
             public_key_hex: String::new(),
+            evidence: None,
         }
     }
 
@@ -374,6 +408,30 @@ mod tests {
         assert!(!record.signature_hex.is_empty());
         assert!(!record.public_key_hex.is_empty());
         assert!(record.verify(), "Record signature must verify successfully");
+    }
+
+    #[test]
+    fn legacy_signatures_and_signed_evidence_are_not_interchangeable() {
+        let (pk, sk) = generate_keypair();
+        let legacy = sample_record().sign(&sk).unwrap();
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("evidence"));
+        let restored: AuditRecord = serde_json::from_str(&json).unwrap();
+        assert!(restored.verify_with_key(&pk));
+        assert!(!restored.has_confirmed_feedback());
+        let mut record = legacy;
+        record.evidence = Some(RunEvidence {
+            execution_mode: "runner".into(),
+            feedback_received: true,
+            contained: true,
+            cleanup_confirmed: true,
+            failure_reason: None,
+        });
+        assert!(!record.verify_with_key(&pk));
+        let mut record = record.sign(&sk).unwrap();
+        assert!(record.verify_with_key(&pk));
+        record.evidence.as_mut().unwrap().cleanup_confirmed = false;
+        assert!(!record.verify_with_key(&pk));
     }
 
     #[test]

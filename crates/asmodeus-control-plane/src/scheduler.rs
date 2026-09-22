@@ -20,6 +20,8 @@ const DRIFT_THRESHOLD: f32 = 1.5;
 /// Scheduled BAS exercise job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledJob {
+    #[serde(default)]
+    pub generation: String,
     pub id: String,
     pub name: String,
     pub scenario_id: String,
@@ -29,9 +31,11 @@ pub struct ScheduledJob {
     pub enabled: bool,
     pub created_at_utc: String,
     pub last_run_utc: Option<String>,
-    #[serde(skip_serializing, default)]
+    #[serde(default)]
     pub last_run_epoch_secs: Option<u64>,
     pub last_status: Option<String>,
+    #[serde(default)]
+    pub last_run_id: Option<String>,
     pub last_mttd_ms: Option<u64>,
     pub baseline_mttd_ms: Option<u64>,
     pub drift_detected: bool,
@@ -46,6 +50,10 @@ pub struct ScheduledJob {
 /// detection-capability drift over time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScheduledRunSample {
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub feedback_received: bool,
     pub timestamp_utc: String,
     pub status: String,
     pub mttd_ms: u64,
@@ -81,7 +89,7 @@ pub struct CreateScheduleRequest {
 
 /// In-memory catalog of scheduled BAS jobs plus a bounded detection-drift
 /// alert ring.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleCatalog {
     jobs: HashMap<String, ScheduledJob>,
     alerts: VecDeque<DriftAlert>,
@@ -108,17 +116,19 @@ impl ScheduleCatalog {
         let mut cat = Self::new();
 
         cat.register(ScheduledJob {
+            generation: String::new(),
             id: "SCHED-BASE-RANSOMWARE".into(),
             name: "Continuous Ransomware Canary Baseline".into(),
-            scenario_id: "SCN-RT-001".into(),
+            scenario_id: "RANSOMWARE_CANARY_SPIKE".into(),
             interval_sec: 120,
             role: Role::RedTeam,
             target_override: None,
-            enabled: true,
+            enabled: false,
             created_at_utc: "2026-09-09T00:00:00Z".into(),
             last_run_utc: None,
             last_run_epoch_secs: None,
             last_status: None,
+            last_run_id: None,
             last_mttd_ms: None,
             baseline_mttd_ms: Some(200),
             drift_detected: false,
@@ -127,17 +137,19 @@ impl ScheduleCatalog {
         });
 
         cat.register(ScheduledJob {
+            generation: String::new(),
             id: "SCHED-BASE-C2-BEACON".into(),
             name: "Continuous C2 Beaconing Baseline".into(),
-            scenario_id: "SCN-RT-003".into(),
+            scenario_id: "C2_BEACONING_SIMULATION".into(),
             interval_sec: 180,
             role: Role::RedTeam,
             target_override: None,
-            enabled: true,
+            enabled: false,
             created_at_utc: "2026-09-09T00:00:00Z".into(),
             last_run_utc: None,
             last_run_epoch_secs: None,
             last_status: None,
+            last_run_id: None,
             last_mttd_ms: None,
             baseline_mttd_ms: Some(150),
             drift_detected: false,
@@ -188,6 +200,7 @@ impl ScheduleCatalog {
     /// bounded history sample and emits a retained [`DriftAlert`] only when
     /// the job enters the degraded state. The returned bool is true only for
     /// that healthy -> degraded transition.
+    #[cfg(test)]
     pub fn record_outcome(
         &mut self,
         id: &str,
@@ -223,6 +236,8 @@ impl ScheduleCatalog {
             }
 
             job.run_history.push_back(ScheduledRunSample {
+                run_id: None,
+                feedback_received: true,
                 timestamp_utc: timestamp_utc.to_string(),
                 status: status.to_string(),
                 mttd_ms,
@@ -266,108 +281,221 @@ impl ScheduleCatalog {
     }
 }
 
-/// Spawn a background task periodically checking and executing scheduled BAS jobs.
+/// Persist admission timestamps before dispatch, including failed attempts, so
+/// restarts and unreachable runners cannot create a tight retry loop.
 pub fn spawn_scheduler(
     state: crate::state::AppState,
     poll_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(poll_secs.max(5)));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(5)));
         loop {
             interval.tick().await;
-
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let due_jobs: Vec<ScheduledJob> = {
-                let cat = state.schedules.read().unwrap();
-                cat.list()
-                    .into_iter()
-                    .filter(|j| {
-                        j.enabled
-                            && match j.last_run_epoch_secs {
-                                None => true,
-                                Some(last) => now_epoch >= last.saturating_add(j.interval_sec),
-                            }
-                    })
-                    .collect()
+            let now = epoch();
+            let due = state
+                .schedules
+                .update(move |catalog| Ok(catalog.claim_due(now)))
+                .await;
+            let jobs = match due {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    tracing::error!(%error, "schedule admission persistence failed");
+                    continue;
+                }
             };
-
-            for job in due_jobs {
-                let entry_opt = state.catalog.get(&job.scenario_id).cloned();
-                if let Some(entry) = entry_opt {
-                    tracing::info!(
-                        job_id = %job.id,
-                        scenario_id = %job.scenario_id,
-                        "Triggering scheduled BAS baseline execution"
-                    );
-
-                    match crate::execution::execute_single_scenario(
-                        &state,
-                        &entry,
-                        job.role,
-                        job.target_override.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok((_run_id, _exec, audit_rec)) => {
-                            let mut cat = state.schedules.write().unwrap();
-                            if let Some(drift) = cat.record_outcome(
-                                &job.id,
-                                &audit_rec.status,
-                                audit_rec.measurements.mttd_ms,
-                                &audit_rec.timestamp_utc,
-                                now_epoch,
-                            ) {
-                                if drift {
-                                    tracing::warn!(
-                                        job_id = %job.id,
-                                        mttd_ms = audit_rec.measurements.mttd_ms,
-                                        baseline_ms = ?job.baseline_mttd_ms,
-                                        "MTTD drift detected: detection capability degraded"
-                                    );
-
-                                    state.webhook.dispatch(
-                                        crate::webhook::WebhookPayload {
-                                            event: "drift_detected".into(),
-                                            timestamp_utc: audit_rec.timestamp_utc.clone(),
-                                            exercise_id: audit_rec.run_id.clone(),
-                                            scenario_id: job.scenario_id.clone(),
-                                            mitre_technique: audit_rec.mitre_technique.clone(),
-                                            target: job
-                                                .target_override
-                                                .clone()
-                                                .unwrap_or_else(|| "default".into()),
-                                            initiator: job.role.as_str().into(),
-                                            tag: "🔴 [RED TEAM EXERCISE]".into(),
-                                            data: serde_json::json!({
-                                                "job_id": job.id,
-                                                "last_mttd_ms": audit_rec.measurements.mttd_ms,
-                                                "baseline_mttd_ms": job.baseline_mttd_ms,
-                                                "drift_factor": (audit_rec.measurements.mttd_ms as f32)
-                                                    / (job.baseline_mttd_ms.unwrap_or(1) as f32),
-                                            }),
-                                        },
-                                        Some(&state.signing_key),
-                                    );
+            for job in jobs {
+                if !state
+                    .schedules
+                    .read()
+                    .unwrap()
+                    .get(&job.id)
+                    .is_some_and(|current| current.enabled && current.generation == job.generation)
+                {
+                    let skipped = job.clone();
+                    let _ = state
+                        .schedules
+                        .update(move |catalog| {
+                            if let Some(current) = catalog.get_mut(&skipped.id) {
+                                if current.generation == skipped.generation {
+                                    current.last_status = Some("SKIPPED".into());
+                                }
+                            }
+                            Ok(())
+                        })
+                        .await;
+                    continue;
+                }
+                let started = match state.catalog.get(&job.scenario_id) {
+                    Some(entry) => {
+                        crate::execution::start_scenario(
+                            &state,
+                            entry,
+                            job.role,
+                            job.target_override.as_deref(),
+                            None,
+                        )
+                        .await
+                    }
+                    None => Err(crate::execution::ExecutionError::InvalidManifest(
+                        "scheduled scenario no longer exists".into(),
+                    )),
+                };
+                let (run_id, status) = match started {
+                    Ok(started) => {
+                        let id = started.id.to_string();
+                        let result = started.completion.await;
+                        let status = match result {
+                            Ok(Ok((_, _, record))) => record.status,
+                            _ => state
+                                .audit
+                                .get(&id)
+                                .filter(|r| r.is_terminal())
+                                .map(|r| r.status)
+                                .unwrap_or_else(|| "FAILED".into()),
+                        };
+                        (Some(id), status)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, job_id=%job.id, "scheduled execution failed");
+                        (None, "FAILED".into())
+                    }
+                };
+                let feedback = run_id.as_deref().and_then(|id| state.audit.get(id));
+                if let Err(error) = state
+                    .schedules
+                    .update(move |catalog| {
+                        if let Some(current) = catalog.get_mut(&job.id) {
+                            if current.generation == job.generation {
+                                current.last_run_id = run_id;
+                                current.last_status = Some(status.clone());
+                                current.last_run_utc =
+                                    Some(asmodeus_telemetry::current_utc_iso8601());
+                                current.last_mttd_ms = None;
+                                current.run_history.push_back(ScheduledRunSample {
+                                    run_id: current.last_run_id.clone(),
+                                    feedback_received: false,
+                                    timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+                                    status,
+                                    mttd_ms: 0,
+                                    drift_detected: current.drift_detected,
+                                    drift_factor: None,
+                                });
+                                while current.run_history.len() > MAX_HISTORY_PER_JOB {
+                                    current.run_history.pop_front();
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                job_id = %job.id,
-                                error = %e,
-                                "Failed to execute scheduled BAS job"
-                            );
+                        if let Some(record) = feedback {
+                            catalog.record_feedback(&record);
                         }
-                    }
+                        Ok(())
+                    })
+                    .await
+                {
+                    tracing::error!(%error, "schedule outcome persistence failed");
                 }
             }
         }
     })
+}
+
+fn epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+impl ScheduleCatalog {
+    pub fn claim_due(&mut self, now: u64) -> Vec<ScheduledJob> {
+        let mut due = Vec::new();
+        for job in self.jobs.values_mut() {
+            if job.enabled
+                && job.last_status.as_deref() != Some("RUNNING")
+                && job
+                    .last_run_epoch_secs
+                    .is_none_or(|last| now >= last.saturating_add(job.interval_sec))
+            {
+                job.last_run_epoch_secs = Some(now);
+                job.last_status = Some("RUNNING".into());
+                job.last_run_utc = Some(asmodeus_telemetry::current_utc_iso8601());
+                due.push(job.clone());
+            }
+        }
+        due.sort_by(|a, b| a.id.cmp(&b.id));
+        due
+    }
+
+    pub fn recover_interrupted(&mut self) {
+        for job in self.jobs.values_mut() {
+            if job.last_status.as_deref() == Some("RUNNING") {
+                job.last_status = Some("INTERRUPTED".into());
+            }
+        }
+    }
+
+    pub fn record_feedback(&mut self, record: &asmodeus_telemetry::AuditRecord) {
+        if !record.is_terminal() || !record.has_confirmed_feedback() {
+            return;
+        }
+        for job in self.jobs.values_mut() {
+            let Some(sample) = job
+                .run_history
+                .iter_mut()
+                .find(|sample| sample.run_id.as_deref() == Some(&record.run_id))
+            else {
+                continue;
+            };
+            let mttd = if record.measurements.blue_team_detected {
+                record.measurements.mttd_ms
+            } else {
+                0
+            };
+            if sample.feedback_received && sample.mttd_ms == mttd {
+                continue;
+            }
+            sample.feedback_received = true;
+            sample.mttd_ms = mttd;
+            // Old feedback remains attached to its run. It must not shift the
+            // dispatch clock or overwrite the latest baseline/drift state.
+            if job.last_run_id.as_deref() != Some(&record.run_id) {
+                continue;
+            }
+            job.last_mttd_ms = record.measurements.blue_team_detected.then_some(mttd);
+            if job.baseline_mttd_ms.is_none() && mttd > 0 {
+                job.baseline_mttd_ms = Some(mttd);
+            }
+            let factor = job
+                .baseline_mttd_ms
+                .filter(|base| *base > 0)
+                .map(|base| mttd as f32 / base as f32);
+            let was_drifting = job.drift_detected;
+            job.drift_detected = record.measurements.blue_team_detected
+                && factor.is_some_and(|f| f >= DRIFT_THRESHOLD);
+            job.drift_factor = record
+                .measurements
+                .blue_team_detected
+                .then_some(factor)
+                .flatten();
+            sample.drift_detected = job.drift_detected;
+            sample.drift_factor = job.drift_factor;
+            if job.drift_detected && !was_drifting {
+                self.alert_seq += 1;
+                self.alerts.push_back(DriftAlert {
+                    seq: self.alert_seq,
+                    job_id: job.id.clone(),
+                    scenario_id: job.scenario_id.clone(),
+                    baseline_mttd_ms: job.baseline_mttd_ms,
+                    observed_mttd_ms: mttd,
+                    drift_factor: factor.unwrap_or_default(),
+                    timestamp_utc: record.timestamp_utc.clone(),
+                });
+                while self.alerts.len() > MAX_ALERTS {
+                    self.alerts.pop_front();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -380,9 +508,10 @@ mod tests {
         assert!(cat.list().is_empty());
 
         let job = ScheduledJob {
+            generation: String::new(),
             id: "SCHED-TEST-1".into(),
             name: "Test Job".into(),
-            scenario_id: "SCN-RT-001".into(),
+            scenario_id: "RANSOMWARE_CANARY_SPIKE".into(),
             interval_sec: 60,
             role: Role::RedTeam,
             target_override: None,
@@ -391,6 +520,7 @@ mod tests {
             last_run_utc: None,
             last_run_epoch_secs: None,
             last_status: None,
+            last_run_id: None,
             last_mttd_ms: None,
             baseline_mttd_ms: Some(100),
             drift_detected: false,
@@ -435,9 +565,10 @@ mod tests {
 
     fn seeded_job(id: &str, baseline: u64) -> ScheduledJob {
         ScheduledJob {
+            generation: String::new(),
             id: id.into(),
             name: "Test Job".into(),
-            scenario_id: "SCN-RT-001".into(),
+            scenario_id: "RANSOMWARE_CANARY_SPIKE".into(),
             interval_sec: 60,
             role: Role::RedTeam,
             target_override: None,
@@ -446,6 +577,7 @@ mod tests {
             last_run_utc: None,
             last_run_epoch_secs: None,
             last_status: None,
+            last_run_id: None,
             last_mttd_ms: None,
             baseline_mttd_ms: Some(baseline),
             drift_detected: false,

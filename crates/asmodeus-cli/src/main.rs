@@ -55,6 +55,11 @@ enum Cmd {
     Run {
         #[arg(long)]
         scenario: String,
+        /// Return a run ID immediately; inspect with runs get and stop with runs cancel.
+        #[arg(long)]
+        background: bool,
+        #[arg(long)]
+        timeout_sec: Option<u32>,
         /// Optional target override or environment tag (e.g. k8s_workload)
         #[arg(long)]
         target: Option<String>,
@@ -213,6 +218,15 @@ enum RunsAction {
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
     },
+    /// Request cancellation; poll runs get until cleanup is confirmed.
+    Cancel {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "red_team")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
     /// Cryptographically verify the Ed25519 digital signature of an audit record.
     Verify {
         #[arg(long)]
@@ -352,12 +366,26 @@ enum RunnersAction {
     },
 }
 
+/// Use a verified APEX identity in normal deployments; role headers are only
+/// honored by a control plane with the explicit local development bypass.
+fn authenticate(
+    builder: reqwest::blocking::RequestBuilder,
+) -> Result<reqwest::blocking::RequestBuilder, Box<dyn std::error::Error>> {
+    let builder = builder.timeout(std::time::Duration::from_secs(330));
+    match std::env::var("ASMODEUS_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => Ok(builder.bearer_auth(token.trim())),
+        Ok(_) => Err("ASMODEUS_TOKEN is empty".into()),
+        Err(std::env::VarError::NotPresent) => Ok(builder),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Send a request, print the (pretty) body and fail on a non-2xx status.
 fn call(
     builder: reqwest::blocking::RequestBuilder,
     what: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resp = builder.send()?;
+    let resp = authenticate(builder)?.send()?;
     let status = resp.status();
     let body = resp.text()?;
     match serde_json::from_str::<serde_json::Value>(&body) {
@@ -441,16 +469,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Run {
             scenario,
+            background,
+            timeout_sec,
             target,
             role,
             url,
         } => {
             let endpoint = format!("{url}/api/v1/asmodeus/scenarios/{scenario}/run");
             let client = reqwest::blocking::Client::new();
-            let mut req = client.post(&endpoint).header("X-Apex-Role", &role);
-            if let Some(t) = target {
-                req = req.json(&json!({ "target_override": t }));
-            }
+            let req = client.post(&endpoint).header("X-Apex-Role", &role)
+                .json(&json!({ "target_override":target, "background":background, "timeout_sec":timeout_sec }));
             call(req, "run")?;
         }
         Cmd::Status { role, url } => {
@@ -644,6 +672,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "runs get",
                 )?;
             }
+            RunsAction::Cancel { id, role, url } => {
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client
+                        .post(format!("{url}/api/v1/asmodeus/runs/{id}/cancel"))
+                        .header("X-Apex-Role", &role),
+                    "runs cancel",
+                )?;
+            }
             RunsAction::Verify { id, role, url } => {
                 let endpoint = format!("{url}/api/v1/asmodeus/runs/{id}/verify");
                 let client = reqwest::blocking::Client::new();
@@ -702,7 +739,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let endpoint = format!("{url}/api/v1/asmodeus/audit/export?format={format}");
                 let client = reqwest::blocking::Client::new();
-                let resp = client.get(&endpoint).header("X-Apex-Role", &role).send()?;
+                let resp =
+                    authenticate(client.get(&endpoint).header("X-Apex-Role", &role))?.send()?;
                 let status = resp.status();
                 let text = resp.text()?;
                 if !status.is_success() {

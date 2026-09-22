@@ -10,13 +10,13 @@ use serde_json::{json, Value};
 
 use crate::api::{caller_role, ApiError};
 use crate::dto::RunScenarioPayload;
-use crate::execution::execute_single_scenario;
+use crate::execution::start_scenario;
 use crate::state::AppState;
 
 pub(crate) async fn register_campaign(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(campaign): Json<crate::campaign::Campaign>,
+    Json(mut campaign): Json<crate::campaign::Campaign>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let role = caller_role(&headers)?;
     if !role.can(asmodeus_common::Capability::ManageScenarios)
@@ -39,7 +39,32 @@ pub(crate) async fn register_campaign(
         ));
     }
 
-    state.campaigns.write().unwrap().register(campaign.clone());
+    campaign.steps.sort_by_key(|step| step.order);
+    for (i, step) in campaign.steps.iter().enumerate() {
+        if step.order == 0 || (i > 0 && campaign.steps[i - 1].order == step.order) {
+            return Err(ApiError::Unprocessable(
+                "campaign step order must be positive and unique".into(),
+            ));
+        }
+        let entry = state.catalog.get(&step.scenario_id).ok_or_else(|| {
+            ApiError::NotFound(format!("scenario not found: {}", step.scenario_id))
+        })?;
+        if !role.can(entry.category.required_capability()) {
+            return Err(ApiError::Forbidden(
+                "role may not register this scenario category",
+            ));
+        }
+    }
+
+    let saved = campaign.clone();
+    state
+        .campaigns
+        .update(move |catalog| {
+            catalog.register(saved);
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("campaign persistence: {e}")))?;
 
     Ok((
         StatusCode::CREATED,
@@ -63,7 +88,13 @@ pub(crate) async fn delete_campaign(
         return Err(ApiError::Forbidden("role may not delete attack campaigns"));
     }
 
-    if state.campaigns.write().unwrap().deregister(&id) {
+    let delete_id = id.clone();
+    if state
+        .campaigns
+        .update(move |catalog| Ok(catalog.deregister(&delete_id)))
+        .await
+        .map_err(|e| ApiError::Internal(format!("campaign persistence: {e}")))?
+    {
         Ok(Json(json!({
             "status": "deleted",
             "id": id,
@@ -114,10 +145,23 @@ pub(crate) async fn run_campaign(
         .ok_or_else(|| ApiError::NotFound(format!("campaign not found: {id}")))?
         .clone();
 
+    if payload.background {
+        return Err(ApiError::Unprocessable(
+            "background campaigns are unsupported; use background scenario runs".into(),
+        ));
+    }
+    for step in &campaign.steps {
+        if let Some(entry) = state.catalog.get(&step.scenario_id) {
+            if !role.can(entry.category.required_capability()) {
+                return Err(ApiError::Forbidden(
+                    "role may not execute every campaign category",
+                ));
+            }
+        }
+    }
+
     let mut step_results = Vec::new();
-    let mut sum_mttd = 0u64;
-    let mut sum_mttr = 0u64;
-    let mut detected_count = 0usize;
+    let mut aggregate = asmodeus_telemetry::Aggregate::default();
     let total_steps = campaign.steps.len();
 
     // Execute the kill-chain stage by stage. A failing stage stops the chain
@@ -136,20 +180,34 @@ pub(crate) async fn run_campaign(
                     mttd_ms: 0,
                     mttr_ms: 0,
                     detected: false,
+                    evidence: None,
                 });
                 break;
             }
         };
 
-        match execute_single_scenario(&state, entry, role, payload.target_override.as_deref()).await
-        {
+        let mut admitted_id = String::new();
+        let result = async {
+            let started = start_scenario(
+                &state,
+                entry,
+                role,
+                payload.target_override.as_deref(),
+                payload.timeout_sec,
+            )
+            .await?;
+            admitted_id = started.id.to_string();
+            started
+                .completion
+                .await
+                .map_err(|e| crate::execution::ExecutionError::Dispatch(e.to_string()))?
+        }
+        .await;
+        match result {
             Ok((run_id, _exec, audit_rec)) => {
-                sum_mttd += audit_rec.measurements.mttd_ms;
-                sum_mttr += audit_rec.measurements.mttr_ms;
-                if audit_rec.measurements.blue_team_detected {
-                    detected_count += 1;
-                }
+                aggregate.record_run(&audit_rec);
 
+                let completed = audit_rec.status == "COMPLETED";
                 step_results.push(crate::campaign::CampaignStepResult {
                     step_order: step.order,
                     scenario_id: step.scenario_id.clone(),
@@ -158,17 +216,22 @@ pub(crate) async fn run_campaign(
                     mttd_ms: audit_rec.measurements.mttd_ms,
                     mttr_ms: audit_rec.measurements.mttr_ms,
                     detected: audit_rec.measurements.blue_team_detected,
+                    evidence: audit_rec.evidence,
                 });
+                if !completed {
+                    break;
+                }
             }
             Err(_) => {
                 step_results.push(crate::campaign::CampaignStepResult {
                     step_order: step.order,
                     scenario_id: step.scenario_id.clone(),
-                    run_id: String::new(),
+                    run_id: admitted_id,
                     status: "FAILED".to_string(),
                     mttd_ms: 0,
                     mttr_ms: 0,
                     detected: false,
+                    evidence: None,
                 });
                 break;
             }
@@ -181,26 +244,10 @@ pub(crate) async fn run_campaign(
         .iter()
         .filter(|r| r.status == "COMPLETED")
         .count();
-    let mean_mttd = if successful_steps > 0 {
-        sum_mttd / successful_steps as u64
-    } else {
-        0
-    };
-    let mean_mttr = if successful_steps > 0 {
-        sum_mttr / successful_steps as u64
-    } else {
-        0
-    };
-    let detection_rate_pct = if successful_steps > 0 {
-        100.0 * detected_count as f32 / successful_steps as f32
-    } else {
-        0.0
-    };
-    let recovery_speed_pct = if mean_mttr == 0 {
-        100.0
-    } else {
-        (100.0 * asmodeus_telemetry::TARGET_MTTR_MS as f32 / mean_mttr as f32).clamp(0.0, 100.0)
-    };
+    let mean_mttd = aggregate.mean_mttd_ms();
+    let mean_mttr = aggregate.mean_mttr_ms();
+    let detection_rate_pct = aggregate.detection_rate_pct();
+    let recovery_speed_pct = aggregate.recovery_speed_pct();
     let resilience_score =
         asmodeus_telemetry::resilience_score(detection_rate_pct, recovery_speed_pct);
 
@@ -217,6 +264,9 @@ pub(crate) async fn run_campaign(
         detection_rate_pct,
         recovery_speed_pct,
         resilience_score,
+        confirmed_feedback_runs: aggregate.feedback_received,
+        simulated_runs: aggregate.simulated_runs,
+        pending_feedback_runs: aggregate.pending_feedback,
         timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
     };
 

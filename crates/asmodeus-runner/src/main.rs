@@ -9,8 +9,10 @@
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 mod aya_backend;
 mod canary;
+mod cpu_budget;
 mod injectors;
 mod netchaos;
+mod sandbox;
 mod service;
 
 use std::net::SocketAddr;
@@ -45,8 +47,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => tracing::warn!(%addr, "asmodeus-runner serving RunnerControl WITHOUT TLS (dev)"),
     }
 
+    let key_path = std::env::var("ASMODEUS_RUNNER_TRUSTED_KEY")
+        .map_err(|_| "ASMODEUS_RUNNER_TRUSTED_KEY must name the trusted scenario public key")?;
+    let key = asmodeus_crypto::read_hex_key::<32>(std::path::Path::new(&key_path))?;
     server
-        .add_service(RunnerControlServer::new(RunnerService::default()))
+        .add_service(RunnerControlServer::new(RunnerService::with_trusted_key(
+            key.to_vec(),
+        )))
         .serve(addr)
         .await?;
     Ok(())
@@ -58,14 +65,22 @@ fn dry_run() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ASMODEUS_CANARY_DIR").unwrap_or_else(|_| "/tmp/asmodeus-canary/demo".into());
     println!("{EXERCISE_TAG_RED_TEAM} asmodeus-runner dry-run in {dir}");
 
-    let injector = CanaryInjector::new(&dir, 20, 64)?;
+    let id = format!(
+        "dry-run-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let sandbox = sandbox::Sandbox::create(&dir, &id)?;
+    let injector = CanaryInjector::new(sandbox.path(), 20, 64)?;
     println!("scope accepted: {}", injector.dir().display());
     let report = injector.inject()?;
     println!(
         "injected: {} canary files, {} bytes (synthetic XOR, reversible)",
         report.files_created, report.bytes_written
     );
-    injector.cleanup()?;
+    sandbox.cleanup()?;
     println!("cleanup: SUCCESS (canary removed, 0 host side-effects)");
 
     // Synthetic network-chaos pass on the reserved test segment (loopback).

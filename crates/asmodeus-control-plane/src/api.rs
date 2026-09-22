@@ -31,14 +31,16 @@ impl From<crate::execution::ExecutionError> for ApiError {
         match error {
             crate::execution::ExecutionError::InvalidSignature
             | crate::execution::ExecutionError::RunnerRejected(_)
-            | crate::execution::ExecutionError::EngineRejected(_) => {
+            | crate::execution::ExecutionError::InvalidManifest(_) => {
                 ApiError::Unprocessable(message)
+            }
+            crate::execution::ExecutionError::Forbidden => {
+                ApiError::Forbidden("role may not execute this scenario category")
             }
             crate::execution::ExecutionError::TargetNotFound(_) => ApiError::NotFound(message),
             crate::execution::ExecutionError::Dispatch(_)
             | crate::execution::ExecutionError::NoActiveRunner => ApiError::BadGateway(message),
             crate::execution::ExecutionError::RunnerIncomplete(_)
-            | crate::execution::ExecutionError::EngineTransition(_)
             | crate::execution::ExecutionError::AuditSigning(_)
             | crate::execution::ExecutionError::AuditPersistence(_) => ApiError::Internal(message),
         }

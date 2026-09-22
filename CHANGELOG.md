@@ -7,6 +7,23 @@
 
 ## [Unreleased]
 
+### Добавлено — завершение функций, 2026-09-22
+
+- Durable admission, фоновые прогоны, cancel RPC/REST/CLI, lease 3 с, signed
+  deadline, кооперативная остановка и отдельное подтверждение cleanup.
+- Один активный worker на runner, изолированный каталог run, ошибка вместо
+  тихого подавления cleanup failure; закреплённый ключ сценариев.
+- Единый DSL execution plan, custom scenario ID, реальные file/count/IO/duration/
+  network-параметры, pacing CPU рабочего потока, отклонение неизвестных параметров.
+- Подписанный `RunEvidence`; метрики только по явному live feedback, `NO DATA`
+  вместо выдуманной детекции/мгновенного восстановления, provenance в ClickHouse.
+- Постоянные campaigns/schedules, сохранение пауз/удалений/времени попытки,
+  восстановление `INTERRUPTED`, feedback по run ID без повторного drift alert.
+- Проверки RBAC категорий в кампаниях и расписаниях; CLI принимает APEX JWT
+  через `ASMODEUS_TOKEN`; OpenAPI описывает background/cancel/evidence.
+- Двухпроцессная приёмка `scripts/feature_smoke.py` и
+  [эксплуатационный контракт](docs/features-2026-09-22.ru.md).
+
 ### Исправлено — архитектурная надёжность, 2026-09-22
 
 - Восстановлены сборка HTTP-модулей, YAML-фикстура, форматирование и строгий Clippy.

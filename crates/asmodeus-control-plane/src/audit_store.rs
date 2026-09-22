@@ -34,6 +34,28 @@ impl AuditStore {
         })
     }
 
+    /// Startup reconciliation never retries a potentially executed operation.
+    pub fn recover_incomplete(&self, key: &[u8]) -> io::Result<()> {
+        let _writer = self.writer.lock().unwrap();
+        for mut record in self.records().into_iter().filter(|r| !r.is_terminal()) {
+            let old = record.clone();
+            record.status = "INTERRUPTED".into();
+            record.cleanup_status = "UNCONFIRMED".into();
+            if let Some(evidence) = &mut record.evidence {
+                evidence.cleanup_confirmed = false;
+                evidence.failure_reason =
+                    Some("control-plane restarted before terminal acknowledgement".into());
+            }
+            record.timestamp_utc = asmodeus_telemetry::current_utc_iso8601();
+            let record = record.sign(key).map_err(io::Error::other)?;
+            self.persist(&record)?;
+            let mut snapshot = self.snapshot.write().unwrap();
+            snapshot.aggregate.update_run(&old, &record);
+            snapshot.trail.update(&record.run_id.clone(), record);
+        }
+        Ok(())
+    }
+
     pub fn records(&self) -> Vec<AuditRecord> {
         self.snapshot.read().unwrap().trail.records().to_vec()
     }
@@ -75,7 +97,7 @@ impl AuditStore {
             }
             store.persist(&record)?;
             let mut snapshot = store.snapshot.write().unwrap();
-            snapshot.aggregate.record(record.measurements);
+            snapshot.aggregate.record_run(&record);
             snapshot.trail.append(record);
             Ok(())
         })
@@ -103,9 +125,7 @@ impl AuditStore {
             }
             store.persist(&record)?;
             let mut snapshot = store.snapshot.write().unwrap();
-            snapshot
-                .aggregate
-                .update_measurement(old.measurements, record.measurements);
+            snapshot.aggregate.update_run(&old, &record);
             snapshot.trail.update(&run_id, record.clone());
             Ok(Some(record))
         })
@@ -171,6 +191,13 @@ mod tests {
             timestamp_utc: "2026-09-22T00:00:00Z".into(),
             signature_hex: String::new(),
             public_key_hex: String::new(),
+            evidence: Some(asmodeus_telemetry::RunEvidence {
+                execution_mode: "runner".into(),
+                feedback_received: true,
+                contained: true,
+                cleanup_confirmed: true,
+                failure_reason: None,
+            }),
         }
     }
 

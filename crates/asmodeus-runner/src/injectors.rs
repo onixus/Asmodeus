@@ -503,11 +503,10 @@ pub fn create_injector(
             let inj = NetChaosInjector::new(target_dir, spec)?;
             Ok(Box::new(inj))
         }
-        _ => {
-            // Safe fallback: standard canary injector
-            let inj = CanaryInjector::new(target_dir, file_count, chunk_size_kb)?;
-            Ok(Box::new(inj))
-        }
+        _ => Err(InjectError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported scenario/action",
+        ))),
     }
 }
 

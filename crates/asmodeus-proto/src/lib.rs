@@ -8,7 +8,10 @@ pub mod v1 {
 
 pub use v1::runner_control_client::RunnerControlClient;
 pub use v1::runner_control_server::{RunnerControl, RunnerControlServer};
-pub use v1::{EventKind, ExecuteRequest, HeartbeatReply, HeartbeatRequest, RunnerEvent};
+pub use v1::{
+    CancelReply, CancelRequest, EventKind, ExecuteRequest, HeartbeatReply, HeartbeatRequest,
+    RunnerEvent,
+};
 
 pub mod tls;
 

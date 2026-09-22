@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use asmodeus_common::{RunId, RunState};
+use asmodeus_common::RunId;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::io;
 
@@ -22,7 +22,7 @@ use crate::webhook::WebhookDispatcher;
 #[derive(Clone)]
 pub struct AppState {
     pub catalog: Arc<Catalog>,
-    pub runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+    pub runs: Arc<Mutex<HashMap<RunId, crate::run_control::ActiveRun>>>,
     counter: Arc<AtomicU64>,
     run_namespace: String,
     pub audit_public_key: [u8; 32],
@@ -30,8 +30,8 @@ pub struct AppState {
     /// otherwise the in-process engine simulates the run.
     pub runner_endpoint: Option<String>,
     pub registry: RunnerRegistry,
-    pub campaigns: Arc<std::sync::RwLock<CampaignCatalog>>,
-    pub schedules: Arc<std::sync::RwLock<ScheduleCatalog>>,
+    pub campaigns: crate::persistent::Persistent<CampaignCatalog>,
+    pub schedules: crate::persistent::Persistent<ScheduleCatalog>,
     pub webhook: Arc<WebhookDispatcher>,
     pub signing_key: [u8; 64],
     pub audit: AuditStore,
@@ -88,6 +88,9 @@ impl AppState {
         audit_path: Option<std::path::PathBuf>,
         signing_key: [u8; 64],
     ) -> io::Result<Self> {
+        let state_dir = std::env::var("ASMODEUS_STATE_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
         let audit_public_key =
             asmodeus_crypto::public_key_from_secret_key(&signing_key).map_err(io::Error::other)?;
         let audit = AuditStore::load(audit_path)?;
@@ -99,6 +102,7 @@ impl AppState {
                 ));
             }
         }
+        audit.recover_incomplete(&signing_key)?;
         let mut namespace = [0u8; 16];
         SystemRandom::new()
             .fill(&mut namespace)
@@ -112,8 +116,14 @@ impl AppState {
             audit_public_key,
             runner_endpoint,
             registry,
-            campaigns: Arc::new(std::sync::RwLock::new(CampaignCatalog::seeded())),
-            schedules: Arc::new(std::sync::RwLock::new(ScheduleCatalog::seeded())),
+            campaigns: crate::persistent::Persistent::load(
+                state_dir.as_ref().map(|p| p.join("campaigns.json")),
+                CampaignCatalog::seeded,
+            )?,
+            schedules: crate::persistent::Persistent::load(
+                state_dir.as_ref().map(|p| p.join("schedules.json")),
+                ScheduleCatalog::seeded,
+            )?,
             webhook: Arc::new(WebhookDispatcher::from_env()),
             signing_key,
             audit,

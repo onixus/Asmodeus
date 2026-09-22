@@ -29,7 +29,8 @@ pub const CLICKHOUSE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS apex.asmodeus_run
     cleanup_status LowCardinality(String),
     timestamp String,
     signature_hex String,
-    public_key_hex String
+    public_key_hex String,
+    evidence_json String DEFAULT 'null'
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMM(parseDateTimeBestEffort(timestamp))
 ORDER BY (category, mitre_technique, timestamp, run_id);"#;
@@ -53,7 +54,7 @@ pub fn escape_sql_string(input: &str) -> String {
 /// Format a single `AuditRecord` as a ClickHouse SQL VALUES row tuple.
 pub fn record_to_sql_row(r: &AuditRecord) -> String {
     format!(
-        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', {}, {}, {}, '{}', '{}', '{}', '{}', '{}', '{}')",
+        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', {}, {}, {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
         escape_sql_string(&r.run_id),
         escape_sql_string(&r.scenario_id),
         escape_sql_string(&r.scenario_name),
@@ -74,6 +75,7 @@ pub fn record_to_sql_row(r: &AuditRecord) -> String {
         escape_sql_string(&r.timestamp_utc),
         escape_sql_string(&r.signature_hex),
         escape_sql_string(&r.public_key_hex),
+        escape_sql_string(&serde_json::to_string(&r.evidence).expect("evidence serialization")),
     )
 }
 
@@ -87,7 +89,7 @@ pub fn records_to_clickhouse_sql(records: &[AuditRecord]) -> String {
 
     let rows: Vec<String> = records.iter().map(record_to_sql_row).collect();
     format!(
-        "INSERT INTO apex.asmodeus_runs (\n    run_id, scenario_id, scenario_name, category, mitre_technique, mitre_tactic,\n    severity, tag, initiator, runner_id, status, mttd_ms, mttr_ms, blue_team_detected,\n    detection_source, containment_action, cleanup_status, timestamp, signature_hex, public_key_hex\n) VALUES\n{};\n",
+        "INSERT INTO apex.asmodeus_runs (\n    run_id, scenario_id, scenario_name, category, mitre_technique, mitre_tactic,\n    severity, tag, initiator, runner_id, status, mttd_ms, mttr_ms, blue_team_detected,\n    detection_source, containment_action, cleanup_status, timestamp, signature_hex, public_key_hex, evidence_json\n) VALUES\n{};\n",
         rows.join(",\n")
     )
 }
@@ -115,6 +117,7 @@ pub struct ClickHouseJsonRow<'a> {
     pub timestamp: &'a str,
     pub signature_hex: &'a str,
     pub public_key_hex: &'a str,
+    pub evidence_json: String,
 }
 
 impl<'a> From<&'a AuditRecord> for ClickHouseJsonRow<'a> {
@@ -144,6 +147,7 @@ impl<'a> From<&'a AuditRecord> for ClickHouseJsonRow<'a> {
             timestamp: &r.timestamp_utc,
             signature_hex: &r.signature_hex,
             public_key_hex: &r.public_key_hex,
+            evidence_json: serde_json::to_string(&r.evidence).expect("evidence serialization"),
         }
     }
 }
@@ -167,6 +171,13 @@ mod tests {
 
     fn sample_record() -> AuditRecord {
         AuditRecord {
+            evidence: Some(crate::RunEvidence {
+                execution_mode: "runner".into(),
+                feedback_received: true,
+                contained: true,
+                cleanup_confirmed: true,
+                failure_reason: None,
+            }),
             run_id: "run-test-ch-1".into(),
             scenario_id: "SCN-RT-001".into(),
             scenario_name: "Ransomware Spike".into(),
@@ -210,7 +221,8 @@ mod tests {
         assert!(row.starts_with("('run-test-ch-1'"));
         assert!(row.contains("'T1486'"));
         assert!(row.contains("180, 240, 1"));
-        assert!(row.ends_with("'cafebabe0304')"));
+        assert!(row.contains("'cafebabe0304',"));
+        assert!(row.contains("execution_mode"));
     }
 
     #[test]

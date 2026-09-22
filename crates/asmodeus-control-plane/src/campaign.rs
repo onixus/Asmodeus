@@ -33,6 +33,7 @@ pub struct CampaignStepResult {
     pub mttd_ms: u64,
     pub mttr_ms: u64,
     pub detected: bool,
+    pub evidence: Option<asmodeus_telemetry::RunEvidence>,
 }
 
 /// Complete report of an executed attack campaign.
@@ -50,11 +51,14 @@ pub struct CampaignRunResult {
     pub detection_rate_pct: f32,
     pub recovery_speed_pct: f32,
     pub resilience_score: u8,
+    pub confirmed_feedback_runs: u64,
+    pub simulated_runs: u64,
+    pub pending_feedback_runs: u64,
     pub timestamp_utc: String,
 }
 
 /// Preconfigured catalog of standard attack campaigns and kill-chains.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CampaignCatalog {
     campaigns: Vec<Campaign>,
 }

@@ -41,6 +41,11 @@ pub(crate) async fn telemetry_mttd(
     let agg = state.audit.aggregate();
     Ok(Json(json!({
         "runs_completed": agg.scenarios_executed,
+        "confirmed_feedback_runs": agg.feedback_received,
+        "simulated_runs": agg.simulated_runs,
+        "pending_feedback_runs": agg.pending_feedback,
+        "detected_runs": agg.detected,
+        "contained_runs": agg.contained,
         "catalog_size": state.catalog.ids().count(),
         "mean_mttd_ms": agg.mean_mttd_ms(),
         "mean_mttr_ms": agg.mean_mttr_ms(),

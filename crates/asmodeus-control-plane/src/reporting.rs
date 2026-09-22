@@ -96,7 +96,7 @@ pub(crate) async fn get_run_report(
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("run not found: {id}")))?;
 
-    let run_report = SingleRunReport::build(&record, Some(state.catalog.public_key()));
+    let run_report = SingleRunReport::build(&record, Some(&state.audit_public_key));
 
     if query.format.as_deref() == Some("markdown") {
         Ok((

@@ -76,11 +76,21 @@ impl CanaryInjector {
 
     /// Create the decoy files and apply the reversible XOR "encryption" pass.
     pub fn inject(&self) -> Result<Report, InjectError> {
+        self.inject_checked(&|| Ok(()), 0)
+    }
+
+    pub fn inject_checked(
+        &self,
+        check: &dyn Fn() -> Result<(), InjectError>,
+        interval_ms: u64,
+    ) -> Result<Report, InjectError> {
+        check()?;
         fs::create_dir_all(&self.dir)?;
         let chunk = vec![b'C'; self.chunk_size_kb * 1024];
         let mut bytes_written = 0u64;
 
         for i in 0..self.file_count {
+            check()?;
             let path = self.dir.join(format!("canary_{i:03}.docx"));
             // 1. write plaintext decoy
             let mut f = fs::File::create(&path)?;
@@ -94,6 +104,14 @@ impl CanaryInjector {
             }
             fs::write(&path, &data)?;
             bytes_written += data.len() as u64;
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
+            while std::time::Instant::now() < end {
+                check()?;
+                std::thread::sleep(
+                    end.saturating_duration_since(std::time::Instant::now())
+                        .min(std::time::Duration::from_millis(20)),
+                );
+            }
         }
 
         Ok(Report {

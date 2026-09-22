@@ -10,8 +10,6 @@ use tonic::Status;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
-// Allow the DSL's 300-second maximum plus transport/cleanup headroom.
-const EXECUTION_TIMEOUT: Duration = Duration::from_secs(330);
 
 /// Folded result of a runner's event stream.
 #[derive(Debug, Default, Clone)]
@@ -22,6 +20,10 @@ pub struct DispatchOutcome {
     pub inject_ms: u64,
     /// True iff the runner emitted a terminal `Completed` event.
     pub completed: bool,
+    pub terminal: bool,
+    pub simulated: bool,
+    pub cleanup_confirmed: bool,
+    pub detail: String,
     /// Present iff the runner refused the scenario (signature / scope / INV-0).
     pub rejected: Option<String>,
 }
@@ -71,58 +73,81 @@ pub async fn connect_with_tls(
     Ok(RunnerControlClient::new(channel))
 }
 
-/// Dispatch one scenario to `endpoint` with explicit TLS configuration.
-pub async fn dispatch_with_tls(
-    endpoint: &str,
-    req: ExecuteRequest,
-    tls: Option<ClientTlsConfig>,
-) -> Result<DispatchOutcome, Status> {
-    dispatch_with_deadline(endpoint, req, tls, EXECUTION_TIMEOUT).await
-}
-
+#[cfg(test)]
 async fn dispatch_with_deadline(
     endpoint: &str,
     req: ExecuteRequest,
     tls: Option<ClientTlsConfig>,
     timeout: Duration,
 ) -> Result<DispatchOutcome, Status> {
+    dispatch_controlled(
+        endpoint,
+        req,
+        tls,
+        timeout,
+        crate::run_control::ActiveRun::new(asmodeus_common::Category::RedTeam),
+    )
+    .await
+}
+
+pub async fn dispatch_controlled(
+    endpoint: &str,
+    req: ExecuteRequest,
+    tls: Option<ClientTlsConfig>,
+    timeout: Duration,
+    control: crate::run_control::ActiveRun,
+) -> Result<DispatchOutcome, Status> {
     tokio::time::timeout(timeout, async {
         let mut client = connect_with_tls(endpoint, tls).await?;
-        let mut req = tonic::Request::new(req);
-        req.set_timeout(timeout);
-        let mut stream = client.execute(req).await?.into_inner();
-
+        let mut lease_client = client.clone();
+        let run_id = req.run_id.clone();
+        let mut request = tonic::Request::new(req);
+        request.set_timeout(timeout);
+        let mut stream = client.execute(request).await?.into_inner();
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut last_beat = tokio::time::Instant::now() - Duration::from_secs(2);
+        let mut cancel_sent = false;
         let mut outcome = DispatchOutcome::default();
-        while let Some(ev) = stream.message().await? {
-            match EventKind::try_from(ev.kind) {
-                Ok(EventKind::StateChanged) => outcome.final_state = ev.state,
-                Ok(EventKind::Completed) => {
-                    outcome.completed = true;
-                    outcome.final_state = ev.state;
-                    outcome.files_created = ev.files_created;
-                    outcome.bytes_written = ev.bytes_written;
-                    outcome.inject_ms = ev.inject_ms;
-                    break;
+        loop {
+            tokio::select! {
+                item = stream.message() => {
+                    let Some(ev) = item? else { break; };
+                    if ev.run_id != run_id { return Err(Status::data_loss("runner event run_id mismatch")); }
+                    outcome.final_state = ev.state.to_uppercase();
+                    *control.status.lock().unwrap() = outcome.final_state.clone();
+                    if let Ok(EventKind::Completed | EventKind::Cancelled | EventKind::Failed | EventKind::TimedOut | EventKind::Rejected) = EventKind::try_from(ev.kind) {
+                            outcome.terminal = true;
+                            outcome.simulated = ev.simulated;
+                            outcome.completed = ev.kind == EventKind::Completed as i32;
+                            outcome.cleanup_confirmed = ev.cleanup_confirmed;
+                            outcome.files_created = ev.files_created;
+                            outcome.bytes_written = ev.bytes_written;
+                            outcome.inject_ms = ev.inject_ms;
+                            outcome.detail = ev.detail.clone();
+                            if ev.kind == EventKind::Rejected as i32 { outcome.rejected = Some(ev.detail); }
+                            break;
+                    }
+                },
+                _ = tick.tick() => {
+                    if control.cancel.load(std::sync::atomic::Ordering::Acquire) && !cancel_sent {
+                        let reply = tokio::time::timeout(Duration::from_secs(2), lease_client.cancel(asmodeus_proto::CancelRequest { run_id: run_id.clone() })).await;
+                        match reply {
+                            Ok(Ok(_)) => cancel_sent = true,
+                            Ok(Err(error)) if error.code() == tonic::Code::NotFound => (), // terminal event may be in flight
+                            _ => return Err(Status::unavailable("runner cancellation could not be confirmed")),
+                        }
+                    }
+                    if last_beat.elapsed() >= Duration::from_secs(1) {
+                        let request = asmodeus_proto::HeartbeatRequest { exercise_id: run_id.clone(), runner_id: "control-plane".into(), timestamp_utc: 0 };
+                        tokio::time::timeout(Duration::from_secs(1), lease_client.heartbeat(request)).await
+                            .map_err(|_| Status::deadline_exceeded("execution lease heartbeat timed out"))??;
+                        last_beat = tokio::time::Instant::now();
+                    }
                 }
-                Ok(EventKind::Rejected) => {
-                    outcome.rejected = Some(ev.detail);
-                    break;
-                }
-                _ => {}
             }
         }
         Ok(outcome)
-    })
-    .await
-    .map_err(|_| Status::deadline_exceeded("runner execution deadline exceeded"))?
-}
-
-/// Dispatch one scenario to `endpoint` and drain the event stream.
-/// mTLS configuration is loaded from the environment (falling back to plaintext in dev).
-pub async fn dispatch(endpoint: &str, req: ExecuteRequest) -> Result<DispatchOutcome, Status> {
-    let tls = asmodeus_proto::tls::client_from_env("asmodeus-runner")
-        .map_err(|e| Status::internal(format!("tls config: {e}")))?;
-    dispatch_with_tls(endpoint, req, tls).await
+    }).await.map_err(|_| Status::deadline_exceeded("runner execution deadline exceeded; cleanup unconfirmed"))?
 }
 
 /// Ping a runner via gRPC Heartbeat probe.
@@ -173,7 +198,7 @@ mod tests {
         type ExecuteStream = Pin<Box<dyn Stream<Item = Result<RunnerEvent, Status>> + Send>>;
         async fn execute(
             &self,
-            _: Request<ExecuteRequest>,
+            req: Request<ExecuteRequest>,
         ) -> Result<Response<Self::ExecuteStream>, Status> {
             let first = if self.terminal {
                 EventKind::Completed
@@ -182,6 +207,7 @@ mod tests {
             };
             let stream = tokio_stream::iter([Ok(RunnerEvent {
                 kind: first as i32,
+                run_id: req.into_inner().run_id,
                 state: if self.terminal {
                     "Completed"
                 } else {
@@ -193,6 +219,16 @@ mod tests {
             .chain(tokio_stream::pending());
             Ok(Response::new(Box::pin(stream)))
         }
+
+        async fn cancel(
+            &self,
+            _: tonic::Request<asmodeus_proto::CancelRequest>,
+        ) -> Result<tonic::Response<asmodeus_proto::CancelReply>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "cancel not used by this test double",
+            ))
+        }
+
         async fn heartbeat(
             &self,
             _: Request<HeartbeatRequest>,

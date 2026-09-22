@@ -7,7 +7,7 @@ use crate::reporting::{
     export_audit_trail, get_compliance_report, get_resilience_report, get_run_report,
 };
 use crate::runner_http::{deregister_runner, list_runners, ping_runner_handler, register_runner};
-use crate::runs_http::{get_run, list_runs, run_feedback, verify_run};
+use crate::runs_http::{cancel_run, get_run, list_runs, run_feedback, verify_run};
 use crate::scenario_http::{
     abort_all, get_scenario, list_scenarios, mitre_matrix, run_scenario, validate_scenario_manifest,
 };
@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/asmodeus/runs", get(list_runs))
         .route("/api/v1/asmodeus/runs/:id", get(get_run))
         .route("/api/v1/asmodeus/runs/:id/verify", get(verify_run))
+        .route("/api/v1/asmodeus/runs/:id/cancel", post(cancel_run))
         .route("/api/v1/asmodeus/runs/:id/feedback", post(run_feedback))
         .route("/api/v1/asmodeus/runs/:id/report", get(get_run_report))
         .route(
