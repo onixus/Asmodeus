@@ -154,7 +154,39 @@ def main():
             assert updated["last_status"] == "COMPLETED" and len(updated["run_history"]) == 1
             assert updated["run_history"][0]["feedback_received"] and updated["drift_detected"]
             assert len(request("GET", prefix + "/schedules/alerts")["alerts"]) == 1
+            request("POST", feedback_path, {"detected":False,"contained":False})
+            missed = request("GET", prefix + "/schedules/SMOKE-SCHEDULE")["schedule"]
+            assert missed["drift_detected"] and missed["detection_missed"]
+            assert missed["run_history"][0]["detected"] is False
+            alerts = request("GET", prefix + "/schedules/alerts")["alerts"]
+            assert len(alerts) == 2 and alerts[0]["detection_missed"]
+            request("POST", feedback_path, {"detected":False,"contained":False})
+            assert len(request("GET", prefix + "/schedules/alerts")["alerts"]) == 2
+            request("POST", feedback_path, feedback)  # restore measurements used below
             request("PATCH", prefix + "/schedules/SMOKE-SCHEDULE", {"enabled":False})
+            request("POST", prefix + "/schedules", {"id":"SMOKE-RETRY", "name":"Retry", "scenario_id":"SMOKE-LONG",
+                    "interval_sec":600, "enabled":True}, 201)
+            def retry_job():
+                return request("GET", prefix + "/schedules/SMOKE-RETRY")["schedule"]
+            until(lambda: retry_job()["last_status"] == "RUNNING")
+            snapshot = work / "state" / "schedules.json"
+            backup = snapshot.with_suffix(".backup")
+            snapshot.rename(backup)
+            snapshot.mkdir()  # fail the outcome's atomic rename, not audit writes
+            def outcome_failed():
+                for log in logs:
+                    log.seek(0)
+                    if "schedule outcome persistence failed" in log.read():
+                        return True
+                return False
+            until(outcome_failed, seconds=12)
+            assert retry_job()["last_status"] == "RUNNING"
+            snapshot.rmdir()
+            backup.rename(snapshot)
+            recovered = until(lambda: j if (j := retry_job())["last_status"] == "COMPLETED" else None)
+            assert len(recovered["run_history"]) == 1
+            assert recovered["run_history"][0]["run_id"] == recovered["last_run_id"]
+            request("PATCH", prefix + "/schedules/SMOKE-RETRY", {"enabled":False})
             request("DELETE", prefix + "/schedules/SCHED-BASE-RANSOMWARE")
             interrupted = background()
             stop(cp)
@@ -173,7 +205,7 @@ def main():
             simulated = launch("LATENCY_SPIKE_VM")
             assert simulated["evidence"]["execution_mode"] == "simulated"
             assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 2
-            print("PASS: signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, timeout, simulation provenance")
+            print("PASS: signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
         except Exception:
             for log in logs:
                 log.flush()

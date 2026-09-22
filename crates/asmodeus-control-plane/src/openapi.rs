@@ -133,6 +133,7 @@ pub fn generate_spec() -> Value {
                         "last_mttd_ms": { "type": "integer", "nullable": true },
                         "baseline_mttd_ms": { "type": "integer", "nullable": true },
                         "drift_detected": { "type": "boolean" },
+                        "detection_missed": { "type": "boolean", "description": "Latest confirmed feedback reports no detection" },
                         "drift_factor": { "type": "number", "nullable": true }
                     },
                     "required": ["id", "name", "scenario_id", "interval_sec", "role", "enabled", "created_at_utc", "drift_detected"]

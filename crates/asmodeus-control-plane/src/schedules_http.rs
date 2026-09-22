@@ -106,6 +106,7 @@ pub(crate) async fn create_schedule(
         last_mttd_ms: None,
         baseline_mttd_ms: req.baseline_mttd_ms,
         drift_detected: false,
+        detection_missed: false,
         drift_factor: None,
         run_history: Default::default(),
     };
