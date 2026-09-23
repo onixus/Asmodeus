@@ -1,0 +1,181 @@
+// Тесты Asmodeus на нативном amd64-агенте (Arch Linux, метка `gaming`) и
+// демо-стенд с UI консоли APEX, который остаётся поднятым после билда.
+//
+// Зачем отдельный файл: основной Jenkinsfile собирает на mac-контроллере и
+// завязан на его docker.sock и SCM-путь /Users/onixus/Git/Asmodeus, которого на
+// ноде нет. Linux-ноды в режиме EXCLUSIVE — сюда попадает только то, что явно
+// просит метку. Исходники на ноду едут через stash с контроллера (у Asmodeus,
+// в отличие от Ferrum, нет bare-репо на ноде — и заводить его ради этого незачем).
+//
+// Здесь только то, что нужно для «тесты + стенд»: fmt/clippy/test. SAST и
+// supply-chain остаются в основном пайплайне на маке.
+
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        // Неявный checkout в воркспейсе агента пошёл бы по mac-пути.
+        skipDefaultCheckout()
+    }
+
+    environment {
+        CARGO_TERM_COLOR = 'never'
+    }
+
+    stages {
+        // Контроллер видит оба репозитория по mac-путям. SCM джобы (Asmodeus)
+        // заодно служит триггером опроса. unified-platform берётся через
+        // git archive, а не шагом checkout: зарегистрированный второй SCM
+        // начал бы запускать эту джобу на коммиты в платформу.
+        stage('Исходники (контроллер)') {
+            agent any
+            steps {
+                checkout scm
+                sh '''
+                    set -eu
+                    APEX=/Users/onixus/Git/unified-platform
+                    rm -rf .apex && mkdir .apex
+                    git -c safe.directory='*' -C "$APEX" archive main | tar -x -C .apex
+                    # Lock консоли закреплён за registry.npmmirror.com. С ноды (трафик
+                    # через VPN-туннель) его CDN недоступен: npm ci висел ~170 с и
+                    # падал багом npm 10 «Exit handler never called!» с кодом 0, а
+                    # `next build` потом не находил next. Тарболы на npmjs те же —
+                    # целостность проверяется по integrity-хэшам lock'а. Правится
+                    # только копия в .apex, сам репозиторий платформы не трогаем.
+                    sed -i 's#https://registry.npmmirror.com/#https://registry.npmjs.org/#g' \
+                        .apex/web-console/package-lock.json
+                    ! grep -q npmmirror .apex/web-console/package-lock.json
+                    echo "unified-platform main @ $(git -c safe.directory='*' -C "$APEX" rev-parse --short main)"
+                    git log --oneline -1
+                '''
+                stash name: 'src', includes: '**'
+            }
+        }
+
+        stage('Test (linux/amd64)') {
+            agent { label 'gaming' }
+            steps {
+                deleteDir()
+                unstash 'src'
+                // Кэш cargo — в домашнем каталоге агента, а не в томе: тома
+                // создаются от root, а cargo здесь идёт под uid агента (см. тот же
+                // урок в Ferrum/Jenkinsfile.linux). Каталог создаём до `docker run`,
+                // иначе Docker создаст его сам — от root.
+                sh 'mkdir -p "$HOME/.cache/asmodeus-ci"'
+                script {
+                    def ci = docker.build('asmodeus-ci:1.90', '-f stand/Dockerfile.ci stand')
+                    ci.inside("-v ${env.HOME}/.cache/asmodeus-ci:/cache") {
+                        withEnv(['CARGO_HOME=/cache/cargo-home', 'CARGO_TARGET_DIR=/cache/target']) {
+                            // Формат не блокирует тесты и стенд: это не поведение.
+                            // Стадия краснеет, билд становится UNSTABLE.
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                sh 'cargo fmt --all -- --check'
+                            }
+                            sh '''
+                                set -eu
+                                rustc -vV
+                                cargo clippy --workspace --all-targets --locked -- -D warnings
+                                # На Linux aya-backend компилируется по-настоящему; тесты
+                                # ему нужны с CAP_BPF, которых у контейнера нет.
+                                cargo clippy -p asmodeus-runner --features ebpf --all-targets --locked -- -D warnings
+                            '''
+                            // Без tee: в /bin/sh образа (dash) нет pipefail, и
+                            // упавший cargo test прятался бы за успешным tee.
+                            sh '''
+                                cargo test --workspace --locked > cargo-test.log 2>&1 || {
+                                    cat cargo-test.log; exit 1
+                                }
+                                cat cargo-test.log
+                            '''
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'cargo-test.log', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // Стенд копируется в постоянный каталог узла: compose монтирует оттуда
+        // файлы (init-SQL ClickHouse), а воркспейс следующий билд сотрёт.
+        // Контейнеры принадлежат docker-демону, `restart: unless-stopped` —
+        // окончание билда и перезагрузка узла стенд не гасят.
+        stage('Стенд') {
+            agent { label 'gaming' }
+            steps {
+                deleteDir()
+                unstash 'src'
+                script {
+                    // SSH_CONNECTION агента: «клиент порт сервер порт» — третий
+                    // адрес и есть LAN-адрес узла. Маршрут «наружу» тут не годится:
+                    // на машине VPN с kill-switch, он дал бы адрес туннеля.
+                    def host = sh(returnStdout: true, script: '''
+                        set -eu
+                        h=$(echo "${SSH_CONNECTION:-}" | awk '{print $3}')
+                        [ -n "$h" ] || h=$(hostname -i | awk '{print $1}')
+                        echo "$h"
+                    ''').trim()
+                    withEnv(["STAND_HOST=${host}"]) {
+                        // На ноде Docker ставили с buildx, но без compose. Плагин
+                        // кладётся в ~/.docker/cli-plugins агента: без sudo и без
+                        // изменений в системных пакетах игрового ПК. Версия и
+                        // sha256 пиннятся — это исполняемый файл из сети.
+                        sh '''
+                            set -eu
+                            docker compose version >/dev/null 2>&1 && exit 0
+                            V=v5.5.1
+                            SUM=db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576
+                            D="$HOME/.docker/cli-plugins"
+                            mkdir -p "$D"
+                            curl -fsSL -o "$D/docker-compose.part" \
+                                "https://github.com/docker/compose/releases/download/$V/docker-compose-linux-x86_64"
+                            echo "$SUM  $D/docker-compose.part" | sha256sum -c -
+                            chmod 755 "$D/docker-compose.part"
+                            mv "$D/docker-compose.part" "$D/docker-compose"
+                            docker compose version
+                        '''
+                        sh '''
+                            set -eu
+                            STAND="$HOME/asmodeus-stand"
+                            mkdir -p "$STAND"
+                            rm -rf "$STAND/src.new"
+                            cp -a . "$STAND/src.new"
+                            rm -rf "$STAND/src"
+                            mv "$STAND/src.new" "$STAND/src"
+                            cd "$STAND/src"
+                            C="docker compose -f stand/compose.yml"
+                            $C build
+                            # Логи контейнеров лежат только на ноде — при неудаче выводим их в билд.
+                            $C up -d --no-build --remove-orphans --wait --wait-timeout 300 || {
+                                $C ps -a; $C logs --no-color --tail 80; exit 1
+                            }
+                            docker compose -f stand/compose.yml ps
+                        '''
+                        // Смоук: шлюз отдаёт каталог именно из живого Asmodeus
+                        // (is_mock=false), а не из встроенных моков.
+                        sh '''
+                            set -eu
+                            curl -fsS http://localhost:8842/healthz
+                            echo
+                            body=$(curl -fsS -H 'X-Apex-Role: admin' http://localhost:8800/api/v1/chaos/experiments)
+                            echo "$body" | head -c 600; echo
+                            echo "$body" | grep -q '"is_mock":false' || {
+                                echo 'Шлюз не видит живой Asmodeus — отдаёт моки' >&2
+                                exit 1
+                            }
+                            curl -fsS -o /dev/null -w 'console /chaos: HTTP %{http_code}\\n' http://localhost:3100/chaos
+                        '''
+                    }
+                    currentBuild.description = "UI: http://${host}:3100/chaos"
+                    echo "Стенд поднят: UI http://${host}:3100/chaos, шлюз http://${host}:8800, Asmodeus http://${host}:8842"
+                }
+            }
+        }
+    }
+}

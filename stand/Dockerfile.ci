@@ -1,0 +1,17 @@
+# Сборочный образ для Jenkinsfile.linux: тот же rust, что пинит
+# rust-toolchain.toml, плюс то, что без root в контейнер не поставить.
+#
+# protoc нужен asmodeus-proto/build.rs (tonic-build). rustfmt/clippy — потому
+# что официальный образ ставит тулчейн с профилем minimal. Пайплайн гоняет
+# cargo под uid агента, поэтому всё это должно быть в образе, а не в шагах.
+FROM rust:1.90-bookworm
+
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add rustfmt clippy
+
+# Образ ставит тулчейн под именем 1.90.0, а rust-toolchain.toml просит канал
+# 1.90 — для rustup это разные тулчейны, и без переопределения он докачивал бы
+# второй на каждом прогоне (и не смог бы: /usr/local/rustup не наш под uid агента).
+ENV RUSTUP_TOOLCHAIN=1.90.0

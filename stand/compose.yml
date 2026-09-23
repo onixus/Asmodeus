@@ -1,0 +1,117 @@
+# Демо-стенд Asmodeus с UI консоли APEX (/chaos). Поднимается стадией
+# «Стенд» в Jenkinsfile.linux и остаётся жить после билда.
+#
+# Исходники unified-platform пайплайн кладёт в ../.apex (git archive main), так
+# что стенд собирается из закоммиченного состояния обоих репозиториев.
+#
+# Стенд изолированный и демонстрационный: шлюз APEX пока шлёт только
+# X-Apex-Role, без подписанного APEX v1 bearer, поэтому control-plane здесь
+# принимает роль из заголовка (ASMODEUS_ALLOW_ROLE_HEADER=1). В продуктивном
+# контуре этого флага быть не должно — см. caller_role() в api.rs.
+#
+# STAND_HOST — адрес узла, по которому браузер ходит в шлюз: он вшивается в
+# бандл консоли при сборке, поэтому смена адреса требует пересборки.
+
+name: asmodeus-stand
+
+x-asmodeus: &asmodeus
+  image: asmodeus-stand:local
+  build:
+    context: ..
+    dockerfile: stand/Dockerfile
+  restart: unless-stopped
+  networks: [stand]
+
+services:
+  asmodeus-runner:
+    <<: *asmodeus
+    command: ["asmodeus-runner"]
+    environment:
+      ASMODEUS_RUNNER_LISTEN: 0.0.0.0:8850
+
+  asmodeus-control-plane:
+    <<: *asmodeus
+    command: ["asmodeus-control-plane"]
+    environment:
+      ASMODEUS_LISTEN: 0.0.0.0:8842
+      ASMODEUS_RUNNER_ENDPOINT: http://asmodeus-runner:8850
+      ASMODEUS_AUDIT_LOG: /data/audit.jsonl
+      ASMODEUS_ALLOW_ROLE_HEADER: "1"
+    volumes:
+      - asmodeus-data:/data
+    ports:
+      - "8842:8842"
+    depends_on: [asmodeus-runner]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8842/healthz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 6
+
+  apex-gateway:
+    build: ../.apex/gateway
+    image: asmodeus-stand-apex-gateway:local
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8800
+      DEBUG: "false"
+      DEMO_MODE: "true"
+      LOG_LEVEL: INFO
+      ASMODEUS_URL: http://asmodeus-control-plane:8842
+      CLICKHOUSE_URL: http://clickhouse:8123
+      # Остальных продуктов на стенде нет — шлюз уходит на свои моки.
+      SHAPOCLYACK_URL: http://127.0.0.1:1
+      BSDM_URL: http://127.0.0.1:1
+      FERRUM_URL: http://127.0.0.1:1
+      OKORA_URL: http://127.0.0.1:1
+      EVACAL_URL: http://127.0.0.1:1
+    ports:
+      - "8800:8800"
+    depends_on:
+      asmodeus-control-plane:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks: [stand]
+
+  apex-console:
+    build:
+      context: ../.apex/web-console
+      args:
+        NEXT_PUBLIC_GATEWAY_URL: http://${STAND_HOST:?STAND_HOST не задан}:8800
+    image: asmodeus-stand-apex-console:local
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    depends_on:
+      apex-gateway:
+        condition: service_healthy
+    networks: [stand]
+
+  # Порты наружу не публикуются: ClickHouse нужен только шлюзу.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    restart: unless-stopped
+    volumes:
+      - ../.apex/shared/clickhouse/01_unified_telemetry.sql:/docker-entrypoint-initdb.d/01_unified_telemetry.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+    networks: [stand]
+
+networks:
+  stand:
+
+volumes:
+  asmodeus-data:
+  clickhouse-data:
