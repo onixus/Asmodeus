@@ -149,6 +149,14 @@ pipeline {
                             rm -rf "$STAND/src"
                             mv "$STAND/src.new" "$STAND/src"
                             cd "$STAND/src"
+                            # Общий секрет шлюза и Asmodeus для APEX v1 bearer. Живёт рядом
+                            # со стендом, а не в воркспейсе: при смене секрета живые токены
+                            # консоли перестали бы проходить. set +x — чтобы не попал в лог.
+                            set +x
+                            [ -s "$STAND/jwt.secret" ] || (umask 077; od -An -tx1 -N32 /dev/urandom | tr -d " \\n" > "$STAND/jwt.secret")
+                            STAND_JWT_SECRET=$(cat "$STAND/jwt.secret")
+                            export STAND_JWT_SECRET
+                            set -x
                             C="docker compose -f stand/compose.yml"
                             $C build
                             # Логи контейнеров лежат только на ноде — при неудаче выводим их в билд.
@@ -163,6 +171,13 @@ pipeline {
                             set -eu
                             curl -fsS http://localhost:8842/healthz
                             echo
+                            # Обхода по заголовку быть не должно: без подписанного bearer — 401.
+                            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Apex-Role: admin' \
+                                http://localhost:8842/api/v1/asmodeus/scenarios)
+                            [ "$code" = 401 ] || {
+                                echo "Asmodeus принял неподписанный X-Apex-Role (HTTP $code)" >&2
+                                exit 1
+                            }
                             body=$(curl -fsS -H 'X-Apex-Role: admin' http://localhost:8800/api/v1/chaos/experiments)
                             echo "$body" | head -c 600; echo
                             echo "$body" | grep -q '"is_mock":false' || {
