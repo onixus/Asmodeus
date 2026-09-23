@@ -58,7 +58,6 @@ services:
       PORT: 8800
       DEBUG: "false"
       DEMO_MODE: "true"
-      CORS_ORIGINS: "*"
       LOG_LEVEL: INFO
       ASMODEUS_URL: http://asmodeus-control-plane:8842
       CLICKHOUSE_URL: http://clickhouse:8123

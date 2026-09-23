@@ -151,7 +151,10 @@ pipeline {
                             cd "$STAND/src"
                             C="docker compose -f stand/compose.yml"
                             $C build
-                            $C up -d --no-build --remove-orphans --wait --wait-timeout 300
+                            # Логи контейнеров лежат только на ноде — при неудаче выводим их в билд.
+                            $C up -d --no-build --remove-orphans --wait --wait-timeout 300 || {
+                                $C ps -a; $C logs --no-color --tail 80; exit 1
+                            }
                             docker compose -f stand/compose.yml ps
                         '''
                         // Смоук: шлюз отдаёт каталог именно из живого Asmodeus
