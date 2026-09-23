@@ -140,7 +140,22 @@ pipeline {
                             rm -rf "$STAND/src"
                             mv "$STAND/src.new" "$STAND/src"
                             cd "$STAND/src"
-                            docker compose -f stand/compose.yml up -d --build --remove-orphans --wait --wait-timeout 300
+                            C="docker compose -f stand/compose.yml"
+                            $C build asmodeus-runner asmodeus-control-plane apex-gateway
+                            # npm ci консоли на этой ноде (весь трафик через VPN-туннель)
+                            # ловил «Exit handler never called!» — баг npm 10 на обрыве
+                            # сети, который выходит с кодом 0. Слой с пустым node_modules
+                            # кэшируется, и падает уже `next build`. Поэтому повтор — только
+                            # с --no-cache, иначе он переиспользует тот же битый слой.
+                            ok=
+                            for i in 1 2 3; do
+                                if [ "$i" = 1 ]; then $C build apex-console && { ok=1; break; }
+                                else $C build --no-cache apex-console && { ok=1; break; }
+                                fi
+                                echo "apex-console: попытка $i не удалась" >&2
+                            done
+                            [ -n "$ok" ]
+                            $C up -d --no-build --remove-orphans --wait --wait-timeout 300
                             docker compose -f stand/compose.yml ps
                         '''
                         // Смоук: шлюз отдаёт каталог именно из живого Asmodeus
