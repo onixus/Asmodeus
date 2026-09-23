@@ -4,10 +4,12 @@
 # Исходники unified-platform пайплайн кладёт в ../.apex (git archive main), так
 # что стенд собирается из закоммиченного состояния обоих репозиториев.
 #
-# Стенд изолированный и демонстрационный: шлюз APEX пока шлёт только
-# X-Apex-Role, без подписанного APEX v1 bearer, поэтому control-plane здесь
-# принимает роль из заголовка (ASMODEUS_ALLOW_ROLE_HEADER=1). В продуктивном
-# контуре этого флага быть не должно — см. caller_role() в api.rs.
+# Идентичность — подписанный APEX v1 bearer, как в продуктиве: шлюз выпускает
+# короткоживущий HS256-токен на каждый вызов, control-plane его проверяет.
+# Общий секрет STAND_JWT_SECRET пайплайн генерирует один раз на узле.
+# ASMODEUS_ALLOW_ROLE_HEADER на стенде не включается — смоук это проверяет.
+# Демо-режим остаётся только у консоли (анонимный вход под admin), а
+# DEMO_UPSTREAM_PASSTHROUGH пускает шлюз в живой Asmodeus вместо моков.
 #
 # STAND_HOST — адрес узла, по которому браузер ходит в шлюз: он вшивается в
 # бандл консоли при сборке, поэтому смена адреса требует пересборки.
@@ -66,7 +68,7 @@ services:
       ASMODEUS_AUDIT_LOG: /data/audit/audit.jsonl
       ASMODEUS_AUDIT_SIGNING_KEY: /secrets/audit.key
       ASMODEUS_STATE_DIR: /data/state
-      ASMODEUS_ALLOW_ROLE_HEADER: "1"
+      ASMODEUS_JWT_SECRET: ${STAND_JWT_SECRET:?STAND_JWT_SECRET не задан}
     volumes:
       - asmodeus-data:/data
       - asmodeus-secrets:/secrets:ro
@@ -91,6 +93,8 @@ services:
       PORT: 8800
       DEBUG: "false"
       DEMO_MODE: "true"
+      DEMO_UPSTREAM_PASSTHROUGH: "true"
+      JWT_SECRET: ${STAND_JWT_SECRET:?STAND_JWT_SECRET не задан}
       LOG_LEVEL: INFO
       ASMODEUS_URL: http://asmodeus-control-plane:8842
       CLICKHOUSE_URL: http://clickhouse:8123
