@@ -40,6 +40,15 @@ pipeline {
                     APEX=/Users/onixus/Git/unified-platform
                     rm -rf .apex && mkdir .apex
                     git -c safe.directory='*' -C "$APEX" archive main | tar -x -C .apex
+                    # Lock консоли закреплён за registry.npmmirror.com. С ноды (трафик
+                    # через VPN-туннель) его CDN недоступен: npm ci висел ~170 с и
+                    # падал багом npm 10 «Exit handler never called!» с кодом 0, а
+                    # `next build` потом не находил next. Тарболы на npmjs те же —
+                    # целостность проверяется по integrity-хэшам lock'а. Правится
+                    # только копия в .apex, сам репозиторий платформы не трогаем.
+                    sed -i 's#https://registry.npmmirror.com/#https://registry.npmjs.org/#g' \
+                        .apex/web-console/package-lock.json
+                    ! grep -q npmmirror .apex/web-console/package-lock.json
                     echo "unified-platform main @ $(git -c safe.directory='*' -C "$APEX" rev-parse --short main)"
                     git log --oneline -1
                 '''
@@ -141,20 +150,7 @@ pipeline {
                             mv "$STAND/src.new" "$STAND/src"
                             cd "$STAND/src"
                             C="docker compose -f stand/compose.yml"
-                            $C build asmodeus-runner asmodeus-control-plane apex-gateway
-                            # npm ci консоли на этой ноде (весь трафик через VPN-туннель)
-                            # ловил «Exit handler never called!» — баг npm 10 на обрыве
-                            # сети, который выходит с кодом 0. Слой с пустым node_modules
-                            # кэшируется, и падает уже `next build`. Поэтому повтор — только
-                            # с --no-cache, иначе он переиспользует тот же битый слой.
-                            ok=
-                            for i in 1 2 3; do
-                                if [ "$i" = 1 ]; then $C build apex-console && { ok=1; break; }
-                                else $C build --no-cache apex-console && { ok=1; break; }
-                                fi
-                                echo "apex-console: попытка $i не удалась" >&2
-                            done
-                            [ -n "$ok" ]
+                            $C build
                             $C up -d --no-build --remove-orphans --wait --wait-timeout 300
                             docker compose -f stand/compose.yml ps
                         '''
