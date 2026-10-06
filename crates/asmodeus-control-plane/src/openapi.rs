@@ -89,7 +89,8 @@ pub fn generate_spec() -> Value {
                         "endpoint": { "type": "string" },
                         "tags": { "type": "array", "items": { "type": "string" } },
                         "status": { "type": "string", "enum": ["active", "unresponsive", "draining"] },
-                        "last_heartbeat_utc": { "type": "string" },
+                        "last_heartbeat_utc": { "type": ["integer", "null"], "minimum": 0, "description": "Unix epoch seconds of the latest accepted heartbeat, or null while awaiting a fresh probe" },
+                        "registered_at_utc": { "type": "integer", "minimum": 0 },
                         "cpu_usage_pct": { "type": "integer" },
                         "version": { "type": "string" }
                     },
@@ -288,6 +289,21 @@ pub fn generate_spec() -> Value {
                 }
             },
             "/api/v1/asmodeus/runners/{id}": {
+                "patch": {
+                    "summary": "Drain a runner or resume after a fresh healthy heartbeat",
+                    "description": "Admin, Red Team and DevSecOps may set draining. Drain excludes the runner from subsequent routing selections; already selected runs continue. Resume returns unresponsive until a new successful healthy heartbeat. Repeated requests are idempotent. Registry and maintenance state are process-local and lost on restart.",
+                    "requestBody": {"required":true,"content":{"application/json":{"schema":{
+                        "type":"object","additionalProperties":false,"required":["draining"],
+                        "properties":{"draining":{"type":"boolean"}}
+                    }}}},
+                    "responses": {
+                        "200": {"description":"Updated runner record","content":{"application/json":{"schema":{"$ref":"#/components/schemas/RunnerRecord"}}}},
+                        "401": {"description":"Missing or invalid identity"},
+                        "403": {"description":"Role may not change runner maintenance"},
+                        "404": {"description":"Runner not found"},
+                        "422": {"description":"Invalid maintenance payload"}
+                    }
+                },
                 "delete": {
                     "summary": "Deregister an execution runner probe",
                     "responses": {
@@ -300,7 +316,7 @@ pub fn generate_spec() -> Value {
                 "get": {
                     "summary": "Active liveness ping probe to runner via gRPC Heartbeat",
                     "responses": {
-                        "200": { "description": "Runner is healthy and responsive" },
+                        "200": { "description": "Heartbeat reply (healthy may be false); registry_updated is false if a newer probe, registration or maintenance change superseded this probe" },
                         "502": { "description": "Runner unreachable" }
                     }
                 }

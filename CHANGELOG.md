@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+### Добавлено — обслуживание раннеров, 2026-10-06
+
+- `PATCH /api/v1/asmodeus/runners/:id` с `{"draining":true|false}` и CLI
+  `asmodeus runners drain/resume --id <ID>` для Admin, Red Team и DevSecOps.
+- Drain исключает раннер из последующих выборов по ID, тегу и по умолчанию;
+  уже выбранные прогоны продолжаются. Resume ждёт нового healthy heartbeat.
+- Повторная регистрация не снимает drain и не обходит проверку после resume;
+  новый endpoint требует healthy heartbeat. Устаревшие heartbeat-ответы после
+  смены регистрации, обслуживания или более нового запроса не меняют реестр.
+- Интеграционные проверки RBAC/маршрутизации, регрессии гонок heartbeat и
+  двухпроцессная приёмка CLI. [Контракт](docs/runner-maintenance.ru.md).
+
 ### Добавлено — завершение функций, 2026-09-22
 
 - Durable admission, фоновые прогоны, cancel RPC/REST/CLI, lease 3 с, signed

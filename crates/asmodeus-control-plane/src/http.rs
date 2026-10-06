@@ -6,7 +6,9 @@ use crate::campaign_http::{delete_campaign, list_campaigns, register_campaign, r
 use crate::reporting::{
     export_audit_trail, get_compliance_report, get_resilience_report, get_run_report,
 };
-use crate::runner_http::{deregister_runner, list_runners, ping_runner_handler, register_runner};
+use crate::runner_http::{
+    deregister_runner, list_runners, ping_runner_handler, register_runner, set_runner_maintenance,
+};
 use crate::runs_http::{cancel_run, get_run, list_runs, run_feedback, verify_run};
 use crate::scenario_http::{
     abort_all, get_scenario, list_scenarios, mitre_matrix, run_scenario, validate_scenario_manifest,
@@ -41,7 +43,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/asmodeus/runners",
             get(list_runners).post(register_runner),
         )
-        .route("/api/v1/asmodeus/runners/:id", delete(deregister_runner))
+        .route(
+            "/api/v1/asmodeus/runners/:id",
+            delete(deregister_runner).patch(set_runner_maintenance),
+        )
         .route(
             "/api/v1/asmodeus/runners/:id/ping",
             get(ping_runner_handler),

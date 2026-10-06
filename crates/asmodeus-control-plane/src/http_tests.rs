@@ -649,6 +649,177 @@ async fn runners_lifecycle_and_rbac() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+fn maintenance_request(id: &str, role: Option<&str>, body: Value) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/asmodeus/runners/{id}"))
+        .header("content-type", "application/json");
+    if let Some(role) = role {
+        request = request.header("x-apex-role", role);
+    }
+    request.body(Body::from(body.to_string())).unwrap()
+}
+
+#[tokio::test]
+async fn runner_maintenance_rbac_and_payload_validation() {
+    let registry = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec![]);
+    let app = router(AppState::with_registry(Catalog::seeded(), registry.clone()).unwrap());
+    for (role, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some("auditor"), StatusCode::FORBIDDEN),
+        (Some("ciso"), StatusCode::FORBIDDEN),
+        (Some("secops"), StatusCode::FORBIDDEN),
+    ] {
+        for draining in [true, false] {
+            let response = app
+                .clone()
+                .oneshot(maintenance_request(
+                    "probe",
+                    role,
+                    json!({"draining":draining}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(
+            registry.get("probe").unwrap().status,
+            crate::registry::RunnerStatus::Active
+        );
+    }
+    for role in ["admin", "red_team", "devsecops"] {
+        for draining in [true, false] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(maintenance_request(
+                        "probe",
+                        Some(role),
+                        json!({"draining":draining})
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(maintenance_request(
+                "missing",
+                Some("admin"),
+                json!({"draining":true})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    for body in [
+        json!({}),
+        json!({"draining":"false"}),
+        json!({"draining":false,"status":"active"}),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(maintenance_request("probe", Some("admin"), body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+}
+
+#[tokio::test]
+async fn runner_maintenance_blocks_dispatch_until_fresh_ping() {
+    let _lock = DISPATCH_TEST_LOCK.lock().await;
+    let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+    let endpoint = start_mock_runner().await;
+    let registry = RunnerRegistry::with_default("probe", &endpoint, vec!["endpoint_agent".into()]);
+    let state = AppState::with_registry(Catalog::seeded(), registry.clone()).unwrap();
+    let app = router(state.clone());
+    let ping = || {
+        Request::builder()
+            .uri("/api/v1/asmodeus/runners/probe/ping")
+            .header("x-apex-role", "auditor")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for draining in [true, false] {
+        let response = app
+            .clone()
+            .oneshot(maintenance_request(
+                "probe",
+                Some("admin"),
+                json!({"draining":draining}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["status"],
+            if draining { "draining" } else { "unresponsive" }
+        );
+        // Registration is a metadata update, not an alternate resume path.
+        let register = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/runners")
+            .header("x-apex-role", "admin")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"id":"probe","endpoint":endpoint,"tags":["endpoint_agent"]}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(register).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let saved: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(saved["status"], body["status"]);
+        assert_eq!(saved["last_heartbeat_utc"], body["last_heartbeat_utc"]);
+        for target in [None, Some("probe"), Some("endpoint_agent")] {
+            let body = target
+                .map(|id| json!({"target_override":id}))
+                .unwrap_or(json!({}));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+                .header("x-apex-role", "admin")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                if target.is_some() {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+        }
+        assert_eq!(state.audit.len(), 0);
+        let response = app.clone().oneshot(ping()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["registry_updated"], true);
+        assert_eq!(registry.find_for_target(None).is_some(), !draining);
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run")
+        .header("x-apex-role", "admin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(state.audit.len(), 1);
+}
+
 #[tokio::test]
 async fn dispatch_with_target_override_and_ping() {
     let _lock = DISPATCH_TEST_LOCK.lock().await;
@@ -1475,7 +1646,9 @@ async fn unavailable_registry_does_not_fall_back_to_simulation_or_static_runner(
             vec![],
         ));
         for runner in state.registry.list() {
-            state.registry.mark_unresponsive(&runner.id);
+            state
+                .registry
+                .mark_unresponsive(&state.registry.begin_probe(&runner.id).unwrap());
         }
         let response = router(state.clone())
             .oneshot(

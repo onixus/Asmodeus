@@ -355,6 +355,24 @@ enum RunnersAction {
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
     },
+    /// Stop new dispatches to a runner without cancelling already selected runs.
+    Drain {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// End maintenance; routing resumes after a fresh healthy heartbeat.
+    Resume {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
     /// Send an active gRPC Heartbeat liveness probe to a runner.
     Ping {
         #[arg(long)]
@@ -364,6 +382,31 @@ enum RunnersAction {
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
     },
+}
+
+fn runner_maintenance(
+    id: &str,
+    role: &str,
+    url: &str,
+    draining: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut endpoint = reqwest::Url::parse(url)?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|_| "invalid control-plane URL")?
+        .pop_if_empty()
+        .extend(["api", "v1", "asmodeus", "runners", id]);
+    call(
+        reqwest::blocking::Client::new()
+            .patch(endpoint)
+            .header("X-Apex-Role", role)
+            .json(&json!({ "draining": draining })),
+        if draining {
+            "runners drain"
+        } else {
+            "runners resume"
+        },
+    )
 }
 
 /// Use a verified APEX identity in normal deployments; role headers are only
@@ -626,6 +669,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     client.delete(&endpoint).header("X-Apex-Role", &role),
                     "runners deregister",
                 )?;
+            }
+            RunnersAction::Drain { id, role, url } => {
+                runner_maintenance(&id, &role, &url, true)?;
+            }
+            RunnersAction::Resume { id, role, url } => {
+                runner_maintenance(&id, &role, &url, false)?;
             }
             RunnersAction::Ping { id, role, url } => {
                 let endpoint = format!("{url}/api/v1/asmodeus/runners/{id}/ping");
