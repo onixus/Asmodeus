@@ -89,7 +89,8 @@ pub fn generate_spec() -> Value {
                         "endpoint": { "type": "string" },
                         "tags": { "type": "array", "items": { "type": "string" } },
                         "status": { "type": "string", "enum": ["active", "unresponsive", "draining"] },
-                        "last_heartbeat_utc": { "type": "string" },
+                        "last_heartbeat_utc": { "type": ["integer", "null"], "minimum": 0, "description": "Unix epoch seconds of the latest accepted heartbeat, or null while awaiting a fresh probe" },
+                        "registered_at_utc": { "type": "integer", "minimum": 0 },
                         "cpu_usage_pct": { "type": "integer" },
                         "version": { "type": "string" }
                     },

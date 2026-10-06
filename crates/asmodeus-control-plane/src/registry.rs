@@ -97,12 +97,22 @@ impl RunnerRegistry {
     /// Register or update a runner.
     pub fn register(&self, mut record: RunnerRecord) -> RunnerRecord {
         let mut map = self.runners.write().unwrap();
-        // Registration updates metadata, never overrides an operator's drain.
-        if map
-            .get(&record.id)
-            .is_some_and(|r| r.record.status == RunnerStatus::Draining)
-        {
-            record.status = RunnerStatus::Draining;
+        // Metadata updates must not bypass drain/resume or invent health.
+        if let Some(previous) = map.get(&record.id) {
+            record.status = previous.record.status;
+            record.registered_at_utc = previous.record.registered_at_utc;
+            if record.endpoint == previous.record.endpoint {
+                record.last_heartbeat_utc = previous.record.last_heartbeat_utc;
+                record.cpu_usage_pct = previous.record.cpu_usage_pct;
+                record.version = previous.record.version.clone();
+            } else {
+                if record.status != RunnerStatus::Draining {
+                    record.status = RunnerStatus::Unresponsive;
+                }
+                record.last_heartbeat_utc = None;
+                record.cpu_usage_pct = 0;
+                record.version.clear();
+            }
         }
         map.insert(
             record.id.clone(),
@@ -242,6 +252,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn endpoint_replacement_requires_health_and_metadata_updates_preserve_it() {
+        let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec![]);
+        let probe = reg.begin_probe("probe").unwrap();
+        reg.update_heartbeat(&probe, true, 7, "live-version");
+        let before = reg.get("probe").unwrap();
+        let updated = reg.register(RunnerRecord::new(
+            "probe",
+            "Renamed",
+            "http://127.0.0.1:1",
+            vec![],
+        ));
+        assert_eq!(updated.status, RunnerStatus::Active);
+        assert_eq!(updated.last_heartbeat_utc, before.last_heartbeat_utc);
+        assert_eq!(updated.registered_at_utc, before.registered_at_utc);
+        assert_eq!(updated.cpu_usage_pct, 7);
+        assert_eq!(updated.version, "live-version");
+        let changed = reg.register(RunnerRecord::new(
+            "probe",
+            "Changed",
+            "http://127.0.0.1:2",
+            vec![],
+        ));
+        assert_eq!(changed.status, RunnerStatus::Unresponsive);
+        assert_eq!(changed.last_heartbeat_utc, None);
+        assert_eq!(changed.cpu_usage_pct, 0);
+        assert!(changed.version.is_empty());
+        assert!(!reg.update_heartbeat(&probe, true, 7, "old"));
+        assert!(reg.find_for_target(None).is_none());
+    }
+
+    #[test]
+    fn registration_cannot_bypass_resume_health_gate() {
+        let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec![]);
+        reg.set_draining("probe", true);
+        reg.set_draining("probe", false);
+        let saved = reg.register(RunnerRecord::new(
+            "probe",
+            "Updated",
+            "http://127.0.0.1:1",
+            vec![],
+        ));
+        assert_eq!(saved.status, RunnerStatus::Unresponsive);
+        assert_eq!(saved.last_heartbeat_utc, None);
+        assert!(reg.find_for_target(None).is_none());
+    }
+
+    #[test]
     fn resume_requires_a_fresh_healthy_probe_and_is_idempotent() {
         let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec!["test".into()]);
         let before_drain = reg.begin_probe("probe").unwrap();
@@ -329,9 +386,7 @@ mod tests {
         for target in [None, Some("probe"), Some("test")] {
             assert!(reg.find_for_target(target).is_none());
         }
-        let mut probe = reg.get("probe").unwrap();
-        probe.status = RunnerStatus::Draining;
-        reg.register(probe);
+        reg.set_draining("probe", true);
         reg.update_heartbeat(&reg.begin_probe("probe").unwrap(), true, 0, "test");
         reg.mark_unresponsive(&reg.begin_probe("probe").unwrap());
         assert_eq!(reg.get("probe").unwrap().status, RunnerStatus::Draining);

@@ -764,6 +764,23 @@ async fn runner_maintenance_blocks_dispatch_until_fresh_ping() {
             body["status"],
             if draining { "draining" } else { "unresponsive" }
         );
+        // Registration is a metadata update, not an alternate resume path.
+        let register = Request::builder()
+            .method("POST")
+            .uri("/api/v1/asmodeus/runners")
+            .header("x-apex-role", "admin")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"id":"probe","endpoint":endpoint,"tags":["endpoint_agent"]}).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(register).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let saved: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(saved["status"], body["status"]);
+        assert_eq!(saved["last_heartbeat_utc"], body["last_heartbeat_utc"]);
         for target in [None, Some("probe"), Some("endpoint_agent")] {
             let body = target
                 .map(|id| json!({"target_override":id}))
