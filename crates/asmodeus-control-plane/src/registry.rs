@@ -143,6 +143,13 @@ impl RunnerRegistry {
     /// Seed used only when no durable snapshot exists.
     pub fn with_default(id: &str, endpoint: &str, tags: Vec<String>) -> Self {
         let registry = Self::new();
+        // Preserve dispatch's historical host:port shorthand. An explicit HTTP
+        // scheme is still upgraded to HTTPS by dispatch when mTLS is configured.
+        let endpoint = if endpoint.contains("://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{endpoint}")
+        };
         registry.data.write().unwrap().register(RunnerRecord::new(
             id,
             "Default Probe",
@@ -179,6 +186,8 @@ impl RunnerRegistry {
     /// Configuration writers serialize; readers and heartbeat updates never
     /// hold a lock across disk I/O. Reapplying to live data preserves heartbeats
     /// received during the write instead of replacing them with a stale clone.
+    /// The mutation runs twice and must be deterministic for configuration;
+    /// only its second result (with current health observations) is returned.
     async fn update<R: Send + 'static>(
         &self,
         update: impl Fn(&mut RegistryData) -> R + Send + 'static,

@@ -28,6 +28,14 @@ struct RunnerConfig {
 pub(super) fn validate_identity(id: &str, endpoint: &str) -> io::Result<()> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid runner endpoint URL"))?;
+    // URL parsing normalizes spaces and control characters; gRPC consumes the
+    // original URI and rejects them. Validate against the actual transport too.
+    tonic::transport::Channel::from_shared(endpoint.to_string()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid gRPC runner endpoint URI",
+        )
+    })?;
     if id.is_empty()
         || id.trim() != id
         || !matches!(url.scheme(), "http" | "https")

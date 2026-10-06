@@ -5,6 +5,28 @@ fn runner(id: &str) -> RunnerRecord {
     RunnerRecord::new(id, "Probe", "http://127.0.0.1:1", vec!["test".into()])
 }
 
+#[test]
+fn bare_environment_endpoint_remains_compatible_with_persistence() {
+    let polygon = Polygon::new("runner-bare-endpoint");
+    let path = polygon.dir().join("runners.json");
+    let registry = RunnerRegistry::with_default("default-runner", "127.0.0.1:8850", vec![])
+        .with_persistence(Some(path))
+        .unwrap();
+    assert_eq!(
+        registry.get("default-runner").unwrap().endpoint,
+        "http://127.0.0.1:8850"
+    );
+}
+
+#[test]
+fn endpoint_validation_does_not_accept_urls_rejected_by_grpc() {
+    for endpoint in ["http://127.0.0.1:8850/a\nb", "http://127.0.0.1:8850/a b"] {
+        assert!(reqwest::Url::parse(endpoint).is_ok());
+        assert!(tonic::transport::Channel::from_shared(endpoint.to_string()).is_err());
+        assert!(crate::registry_store::validate_identity("probe", endpoint).is_err());
+    }
+}
+
 #[tokio::test]
 async fn restart_preserves_configuration_and_drain_but_not_health() {
     let polygon = Polygon::new("runner-restart");

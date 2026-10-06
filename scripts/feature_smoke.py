@@ -65,7 +65,7 @@ def main():
             base = f"http://127.0.0.1:{api_port}"
             env.update({
                 "ASMODEUS_RUNNER_LISTEN": f"127.0.0.1:{runner_port}",
-                "ASMODEUS_RUNNER_ENDPOINT": f"http://127.0.0.1:{runner_port}",
+                "ASMODEUS_RUNNER_ENDPOINT": f"127.0.0.1:{runner_port}",
                 "ASMODEUS_LISTEN": f"127.0.0.1:{api_port}",
                 "ASMODEUS_RUNNER_TRUSTED_KEY": str(work / "operator.pub"),
                 "ASMODEUS_SCENARIO_SIGNING_KEY": str(work / "operator.key"),
@@ -132,13 +132,13 @@ def main():
                 return json.loads(result.stdout)
 
             request("POST", prefix + "/runners", {"id":"persistent-probe", "name":"Saved probe",
-                "endpoint":env["ASMODEUS_RUNNER_ENDPOINT"], "tags":["saved-tag"]}, 201)
+                "endpoint":f"http://127.0.0.1:{runner_port}", "tags":["saved-tag"]}, 201)
             request("PATCH", prefix + "/runners/persistent-probe", {"draining":True})
             request("POST", prefix + "/runners", {"id":"retired", "endpoint":"http://127.0.0.1:1"}, 201)
             request("DELETE", prefix + "/runners/retired")
             assert maintenance("drain")["status"] == "draining"
             stop(cp)
-            original_endpoint = env["ASMODEUS_RUNNER_ENDPOINT"]
+            original_endpoint = f"http://127.0.0.1:{runner_port}"
             env["ASMODEUS_RUNNER_ENDPOINT"] = "http://127.0.0.1:1"  # snapshot wins over seed
             cp = start("asmodeus-control-plane")
             until(ready)
