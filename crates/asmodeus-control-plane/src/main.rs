@@ -25,6 +25,7 @@ mod http_tests;
 mod openapi;
 mod persistent;
 mod registry;
+mod registry_store;
 mod reporting;
 mod run_control;
 mod runner_http;

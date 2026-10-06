@@ -832,7 +832,9 @@ async fn dispatch_with_target_override_and_ping() {
         "Targeted K8s Probe",
         &runner_url,
         vec!["k8s_workload".into()],
-    ));
+    ))
+    .await
+    .unwrap();
 
     let app = router(AppState::with_registry(Catalog::seeded(), reg).unwrap());
 
@@ -1639,12 +1641,16 @@ async fn schedule_detail_toggle_and_alerts() {
 async fn unavailable_registry_does_not_fall_back_to_simulation_or_static_runner() {
     for endpoint in [None, Some("http://127.0.0.1:1".into())] {
         let state = AppState::with_runner(Catalog::seeded(), endpoint).unwrap();
-        state.registry.register(RunnerRecord::new(
-            "unavailable",
-            "Test",
-            "http://127.0.0.1:1",
-            vec![],
-        ));
+        state
+            .registry
+            .register(RunnerRecord::new(
+                "unavailable",
+                "Test",
+                "http://127.0.0.1:1",
+                vec![],
+            ))
+            .await
+            .unwrap();
         for runner in state.registry.list() {
             state
                 .registry
@@ -1664,6 +1670,101 @@ async fn unavailable_registry_does_not_fall_back_to_simulation_or_static_runner(
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(state.audit.len(), 0);
     }
+}
+
+#[tokio::test]
+async fn deleting_last_runner_never_falls_back_or_admits_another_run() {
+    for endpoint in [None, Some("http://127.0.0.1:1".into())] {
+        let state = AppState::with_runner(Catalog::seeded(), endpoint).unwrap();
+        state
+            .registry
+            .register(RunnerRecord::new(
+                "dynamic",
+                "Dynamic",
+                "http://127.0.0.1:1",
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        for record in state.registry.list() {
+            let (status, _) = feature_request(
+                &app,
+                "DELETE",
+                &format!("/api/v1/asmodeus/runners/{}", record.id),
+                "admin",
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _) = feature_request(
+            &app,
+            "POST",
+            "/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run",
+            "admin",
+            json!({"background":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(state.audit.len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn runner_configuration_write_errors_reach_http_without_changing_state() {
+    let polygon = asmodeus_testkit::Polygon::new("registry-http-failure");
+    let path = polygon.dir().join("runners.json");
+    let registry = RunnerRegistry::new()
+        .with_persistence(Some(path.clone()))
+        .unwrap();
+    registry
+        .register(RunnerRecord::new(
+            "probe",
+            "Probe",
+            "http://127.0.0.1:1",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    registry.set_draining("probe", true).await.unwrap();
+    let app = router(AppState::with_registry(Catalog::seeded(), registry.clone()).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    for (method, url, payload) in [
+        (
+            "PATCH",
+            "/api/v1/asmodeus/runners/probe",
+            json!({"draining":false}),
+        ),
+        ("DELETE", "/api/v1/asmodeus/runners/probe", json!({})),
+        (
+            "POST",
+            "/api/v1/asmodeus/runners",
+            json!({"id":"new","endpoint":"http://127.0.0.1:2"}),
+        ),
+    ] {
+        let (status, body) = feature_request(&app, method, url, "admin", payload).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("persistence failed"));
+    }
+    assert_eq!(
+        registry.get("probe").unwrap().status,
+        crate::registry::RunnerStatus::Draining
+    );
+    assert_eq!(registry.list().len(), 1);
+    let (status, _) = feature_request(
+        &app,
+        "POST",
+        "/api/v1/asmodeus/runners",
+        "admin",
+        json!({"id":"invalid","endpoint":"http://"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 async fn feature_request(

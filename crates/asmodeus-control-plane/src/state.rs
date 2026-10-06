@@ -26,9 +26,6 @@ pub struct AppState {
     counter: Arc<AtomicU64>,
     run_namespace: String,
     pub audit_public_key: [u8; 32],
-    /// When set, scenarios are dispatched to this live runner over gRPC;
-    /// otherwise the in-process engine simulates the run.
-    pub runner_endpoint: Option<String>,
     pub registry: RunnerRegistry,
     pub campaigns: crate::persistent::Persistent<CampaignCatalog>,
     pub schedules: crate::persistent::Persistent<ScheduleCatalog>,
@@ -54,23 +51,19 @@ impl AppState {
         } else {
             RunnerRegistry::new()
         };
-        Self::build(catalog, runner_endpoint, registry)
+        Self::build(catalog, registry)
     }
 
     #[allow(dead_code)]
     pub fn with_registry(catalog: Catalog, registry: RunnerRegistry) -> io::Result<Self> {
-        Self::build(catalog, None, registry)
+        Self::build(catalog, registry)
     }
 
     /// Shared constructor: derives the audit signing key, restores the
     /// persistent audit trail from `ASMODEUS_AUDIT_LOG` (if set) and rebuilds
     /// the Prometheus aggregate from it, so `/metrics` and the resilience report
     /// survive a restart instead of resetting to zero.
-    fn build(
-        catalog: Catalog,
-        runner_endpoint: Option<String>,
-        registry: RunnerRegistry,
-    ) -> io::Result<Self> {
+    fn build(catalog: Catalog, registry: RunnerRegistry) -> io::Result<Self> {
         let audit_path = std::env::var("ASMODEUS_AUDIT_LOG")
             .ok()
             .map(std::path::PathBuf::from);
@@ -78,12 +71,11 @@ impl AppState {
             .ok()
             .map(std::path::PathBuf::from);
         let signing_key = load_audit_key(key_path.as_deref(), audit_path.is_some())?;
-        Self::with_storage(catalog, runner_endpoint, registry, audit_path, signing_key)
+        Self::with_storage(catalog, registry, audit_path, signing_key)
     }
 
     fn with_storage(
         catalog: Catalog,
-        runner_endpoint: Option<String>,
         registry: RunnerRegistry,
         audit_path: Option<std::path::PathBuf>,
         signing_key: [u8; 64],
@@ -91,6 +83,8 @@ impl AppState {
         let state_dir = std::env::var("ASMODEUS_STATE_DIR")
             .ok()
             .map(std::path::PathBuf::from);
+        let registry =
+            registry.with_persistence(state_dir.as_ref().map(|p| p.join("runners.json")))?;
         let audit_public_key =
             asmodeus_crypto::public_key_from_secret_key(&signing_key).map_err(io::Error::other)?;
         let audit = AuditStore::load(audit_path)?;
@@ -114,7 +108,6 @@ impl AppState {
             counter: Arc::new(AtomicU64::new(1)),
             run_namespace,
             audit_public_key,
-            runner_endpoint,
             registry,
             campaigns: crate::persistent::Persistent::load(
                 state_dir.as_ref().map(|p| p.join("campaigns.json")),
@@ -186,7 +179,6 @@ mod tests {
         let (_, key) = asmodeus_crypto::generate_keypair();
         let first = AppState::with_storage(
             Catalog::seeded(),
-            None,
             RunnerRegistry::new(),
             Some(path.clone()),
             key,
@@ -200,7 +192,6 @@ mod tests {
         assert!(record.verify_with_key(&first.audit_public_key));
         let restored = AppState::with_storage(
             Catalog::seeded(),
-            None,
             RunnerRegistry::new(),
             Some(path.clone()),
             key,
@@ -226,7 +217,6 @@ mod tests {
         let (_, wrong_key) = asmodeus_crypto::generate_keypair();
         assert!(AppState::with_storage(
             Catalog::seeded(),
-            None,
             RunnerRegistry::new(),
             Some(path),
             wrong_key
@@ -246,7 +236,6 @@ mod tests {
         let (_, key) = asmodeus_crypto::generate_keypair();
         let state = AppState::with_storage(
             Catalog::seeded(),
-            None,
             RunnerRegistry::new(),
             Some(path.clone()),
             key,

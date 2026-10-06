@@ -6,7 +6,10 @@
 //! and health tracking via gRPC Heartbeat.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::{io, path::PathBuf};
+
+use crate::registry_store::RegistrySnapshot;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -69,36 +72,22 @@ pub struct RunnerProbe {
 }
 
 #[derive(Debug, Clone)]
-struct RegisteredRunner {
-    record: RunnerRecord,
-    epoch: Arc<()>,
+pub(super) struct RegisteredRunner {
+    pub(super) record: RunnerRecord,
+    pub(super) epoch: Arc<()>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct RunnerRegistry {
-    runners: Arc<RwLock<HashMap<String, RegisteredRunner>>>,
+pub(super) struct RegistryData {
+    pub(super) runners: HashMap<String, RegisteredRunner>,
+    // Sticky once configured: removing the final runner must not re-enable
+    // simulation or a static environment fallback, including after restart.
+    pub(super) require_runner: bool,
 }
 
-impl RunnerRegistry {
-    pub fn new() -> Self {
-        RunnerRegistry {
-            runners: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Convenience: instantiate with a default static runner endpoint if one was configured.
-    pub fn with_default(id: &str, endpoint: &str, tags: Vec<String>) -> Self {
-        let registry = Self::new();
-        let record = RunnerRecord::new(id, "Default Probe", endpoint, tags);
-        registry.register(record);
-        registry
-    }
-
-    /// Register or update a runner.
-    pub fn register(&self, mut record: RunnerRecord) -> RunnerRecord {
-        let mut map = self.runners.write().unwrap();
-        // Metadata updates must not bypass drain/resume or invent health.
-        if let Some(previous) = map.get(&record.id) {
+impl RegistryData {
+    fn register(&mut self, mut record: RunnerRecord) -> RunnerRecord {
+        if let Some(previous) = self.runners.get(&record.id) {
             record.status = previous.record.status;
             record.registered_at_utc = previous.record.registered_at_utc;
             if record.endpoint == previous.record.endpoint {
@@ -114,7 +103,8 @@ impl RunnerRegistry {
                 record.version.clear();
             }
         }
-        map.insert(
+        self.require_runner = true;
+        self.runners.insert(
             record.id.clone(),
             RegisteredRunner {
                 record: record.clone(),
@@ -124,11 +114,8 @@ impl RunnerRegistry {
         record
     }
 
-    /// Stop new routing, or require a fresh successful probe before resuming.
-    /// Runs already admitted to the runner are not cancelled by maintenance.
-    pub fn set_draining(&self, id: &str, draining: bool) -> Option<RunnerRecord> {
-        let mut map = self.runners.write().unwrap();
-        let runner = map.get_mut(id)?;
+    fn set_draining(&mut self, id: &str, draining: bool) -> Option<RunnerRecord> {
+        let runner = self.runners.get_mut(id)?;
         if draining && runner.record.status != RunnerStatus::Draining {
             runner.record.status = RunnerStatus::Draining;
             runner.epoch = Arc::new(());
@@ -139,12 +126,102 @@ impl RunnerRegistry {
         }
         Some(runner.record.clone())
     }
+}
 
-    /// Capture the current endpoint immediately before sending a heartbeat.
+#[derive(Debug, Clone, Default)]
+pub struct RunnerRegistry {
+    data: Arc<RwLock<RegistryData>>,
+    writer: Arc<Mutex<()>>,
+    path: Option<PathBuf>,
+}
+
+impl RunnerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed used only when no durable snapshot exists.
+    pub fn with_default(id: &str, endpoint: &str, tags: Vec<String>) -> Self {
+        let registry = Self::new();
+        registry.data.write().unwrap().register(RunnerRecord::new(
+            id,
+            "Default Probe",
+            endpoint,
+            tags,
+        ));
+        registry
+    }
+
+    /// Startup only. A snapshot is authoritative over environment defaults.
+    /// Restored health is unknown; the durable maintenance decision is retained.
+    pub fn with_persistence(self, path: Option<PathBuf>) -> io::Result<Self> {
+        let Some(path) = path else {
+            return Ok(self);
+        };
+        let snapshot = match std::fs::read(&path) {
+            Ok(bytes) => RegistrySnapshot::decode(&bytes)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let snapshot = RegistrySnapshot::from_data(&self.data.read().unwrap());
+                snapshot.validate()?;
+                snapshot.write(&path)?;
+                snapshot
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            data: Arc::new(RwLock::new(snapshot.into_data())),
+            writer: Arc::new(Mutex::new(())),
+            path: Some(path),
+        })
+    }
+
+    /// The worker owns persist + publish even when the HTTP caller disconnects.
+    /// Configuration writers serialize; readers and heartbeat updates never
+    /// hold a lock across disk I/O. Reapplying to live data preserves heartbeats
+    /// received during the write instead of replacing them with a stale clone.
+    async fn update<R: Send + 'static>(
+        &self,
+        update: impl Fn(&mut RegistryData) -> R + Send + 'static,
+    ) -> io::Result<R> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _writer = store.writer.lock().unwrap();
+            let mut next = store.data.read().unwrap().clone();
+            let before = RegistrySnapshot::from_data(&next);
+            update(&mut next);
+            let after = RegistrySnapshot::from_data(&next);
+            if let Some(path) = &store.path {
+                if before != after {
+                    after.write(path)?;
+                }
+            }
+            Ok(update(&mut store.data.write().unwrap()))
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    pub async fn register(&self, record: RunnerRecord) -> io::Result<RunnerRecord> {
+        crate::registry_store::validate_identity(&record.id, &record.endpoint)?;
+        self.update(move |data| data.register(record.clone())).await
+    }
+
+    /// Already selected runs continue. Resume requires a fresh healthy probe.
+    pub async fn set_draining(&self, id: &str, draining: bool) -> io::Result<Option<RunnerRecord>> {
+        let id = id.to_string();
+        self.update(move |data| data.set_draining(&id, draining))
+            .await
+    }
+
+    pub async fn deregister(&self, id: &str) -> io::Result<bool> {
+        let id = id.to_string();
+        self.update(move |data| data.runners.remove(&id).is_some())
+            .await
+    }
+
     pub fn begin_probe(&self, id: &str) -> Option<RunnerProbe> {
-        let mut map = self.runners.write().unwrap();
-        let runner = map.get_mut(id)?;
-        // Only the most recently started probe may publish a result.
+        let mut data = self.data.write().unwrap();
+        let runner = data.runners.get_mut(id)?;
         runner.epoch = Arc::new(());
         Some(RunnerProbe {
             record: runner.record.clone(),
@@ -152,55 +229,43 @@ impl RunnerRegistry {
         })
     }
 
-    /// Deregister a runner by its ID.
-    pub fn deregister(&self, id: &str) -> bool {
-        let mut map = self.runners.write().unwrap();
-        map.remove(id).is_some()
-    }
-
-    /// Look up a runner by its unique ID.
     #[cfg(test)]
     pub fn get(&self, id: &str) -> Option<RunnerRecord> {
-        let map = self.runners.read().unwrap();
-        map.get(id).map(|r| r.record.clone())
+        self.data
+            .read()
+            .unwrap()
+            .runners
+            .get(id)
+            .map(|r| r.record.clone())
     }
 
-    /// List all registered runners sorted by ID.
     pub fn list(&self) -> Vec<RunnerRecord> {
-        let map = self.runners.read().unwrap();
-        let mut list: Vec<_> = map.values().map(|r| r.record.clone()).collect();
+        let data = self.data.read().unwrap();
+        let mut list: Vec<_> = data.runners.values().map(|r| r.record.clone()).collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }
 
-    /// Resolve only active runners. Exact IDs never fall back to a tag or a
-    /// different runner; ties between tags/defaults are stable by runner ID.
+    /// Exact IDs never fall back to tags; ties remain stable by runner ID.
     pub fn find_for_target(&self, target: Option<&str>) -> Option<RunnerRecord> {
-        let map = self.runners.read().unwrap();
-        let target = target.map(str::trim).filter(|target| !target.is_empty());
-        if let Some(record) = target.and_then(|target| map.get(target)).map(|r| &r.record) {
+        let data = self.data.read().unwrap();
+        let target = target.map(str::trim).filter(|t| !t.is_empty());
+        if let Some(record) = target.and_then(|t| data.runners.get(t)).map(|r| &r.record) {
             return (record.status == RunnerStatus::Active).then(|| record.clone());
         }
-        map.values()
+        data.runners
+            .values()
             .map(|r| &r.record)
-            .filter(|record| record.status == RunnerStatus::Active)
-            .filter(|record| {
-                target.is_none_or(|target| {
-                    record
-                        .tags
-                        .iter()
-                        .any(|tag| tag.eq_ignore_ascii_case(target))
-                })
-            })
+            .filter(|r| r.status == RunnerStatus::Active)
+            .filter(|r| target.is_none_or(|t| r.tags.iter().any(|tag| tag.eq_ignore_ascii_case(t))))
             .min_by(|a, b| a.id.cmp(&b.id))
             .cloned()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.runners.read().unwrap().is_empty()
+    pub fn requires_runner(&self) -> bool {
+        self.data.read().unwrap().require_runner
     }
 
-    /// Update health and metrics after a successful heartbeat.
     pub fn update_heartbeat(
         &self,
         probe: &RunnerProbe,
@@ -208,8 +273,9 @@ impl RunnerRegistry {
         cpu_pct: u32,
         version: &str,
     ) -> bool {
-        let mut map = self.runners.write().unwrap();
-        if let Some(runner) = map
+        let mut data = self.data.write().unwrap();
+        if let Some(runner) = data
+            .runners
             .get_mut(&probe.record.id)
             .filter(|r| Arc::ptr_eq(&r.epoch, &probe.epoch))
         {
@@ -231,10 +297,10 @@ impl RunnerRegistry {
         false
     }
 
-    /// Mark a runner as unresponsive on connection failure.
     pub fn mark_unresponsive(&self, probe: &RunnerProbe) -> bool {
-        let mut map = self.runners.write().unwrap();
-        if let Some(runner) = map
+        let mut data = self.data.write().unwrap();
+        if let Some(runner) = data
+            .runners
             .get_mut(&probe.record.id)
             .filter(|r| Arc::ptr_eq(&r.epoch, &probe.epoch))
         {
@@ -248,32 +314,42 @@ impl RunnerRegistry {
 }
 
 #[cfg(test)]
+#[path = "registry_persistence_tests.rs"]
+mod persistence_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn endpoint_replacement_requires_health_and_metadata_updates_preserve_it() {
+    #[tokio::test]
+    async fn endpoint_replacement_requires_health_and_metadata_updates_preserve_it() {
         let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec![]);
         let probe = reg.begin_probe("probe").unwrap();
         reg.update_heartbeat(&probe, true, 7, "live-version");
         let before = reg.get("probe").unwrap();
-        let updated = reg.register(RunnerRecord::new(
-            "probe",
-            "Renamed",
-            "http://127.0.0.1:1",
-            vec![],
-        ));
+        let updated = reg
+            .register(RunnerRecord::new(
+                "probe",
+                "Renamed",
+                "http://127.0.0.1:1",
+                vec![],
+            ))
+            .await
+            .unwrap();
         assert_eq!(updated.status, RunnerStatus::Active);
         assert_eq!(updated.last_heartbeat_utc, before.last_heartbeat_utc);
         assert_eq!(updated.registered_at_utc, before.registered_at_utc);
         assert_eq!(updated.cpu_usage_pct, 7);
         assert_eq!(updated.version, "live-version");
-        let changed = reg.register(RunnerRecord::new(
-            "probe",
-            "Changed",
-            "http://127.0.0.1:2",
-            vec![],
-        ));
+        let changed = reg
+            .register(RunnerRecord::new(
+                "probe",
+                "Changed",
+                "http://127.0.0.1:2",
+                vec![],
+            ))
+            .await
+            .unwrap();
         assert_eq!(changed.status, RunnerStatus::Unresponsive);
         assert_eq!(changed.last_heartbeat_utc, None);
         assert_eq!(changed.cpu_usage_pct, 0);
@@ -282,28 +358,35 @@ mod tests {
         assert!(reg.find_for_target(None).is_none());
     }
 
-    #[test]
-    fn registration_cannot_bypass_resume_health_gate() {
+    #[tokio::test]
+    async fn registration_cannot_bypass_resume_health_gate() {
         let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec![]);
-        reg.set_draining("probe", true);
-        reg.set_draining("probe", false);
-        let saved = reg.register(RunnerRecord::new(
-            "probe",
-            "Updated",
-            "http://127.0.0.1:1",
-            vec![],
-        ));
+        reg.set_draining("probe", true).await.unwrap();
+        reg.set_draining("probe", false).await.unwrap();
+        let saved = reg
+            .register(RunnerRecord::new(
+                "probe",
+                "Updated",
+                "http://127.0.0.1:1",
+                vec![],
+            ))
+            .await
+            .unwrap();
         assert_eq!(saved.status, RunnerStatus::Unresponsive);
         assert_eq!(saved.last_heartbeat_utc, None);
         assert!(reg.find_for_target(None).is_none());
     }
 
-    #[test]
-    fn resume_requires_a_fresh_healthy_probe_and_is_idempotent() {
+    #[tokio::test]
+    async fn resume_requires_a_fresh_healthy_probe_and_is_idempotent() {
         let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec!["test".into()]);
         let before_drain = reg.begin_probe("probe").unwrap();
         assert_eq!(
-            reg.set_draining("probe", true).unwrap().status,
+            reg.set_draining("probe", true)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             RunnerStatus::Draining
         );
         assert!(!reg.update_heartbeat(&before_drain, true, 1, "old"));
@@ -314,26 +397,30 @@ mod tests {
         for target in [None, Some("probe"), Some("test")] {
             assert!(reg.find_for_target(target).is_none());
         }
-        let resumed = reg.set_draining("probe", false).unwrap();
+        let resumed = reg.set_draining("probe", false).await.unwrap().unwrap();
         assert_eq!(resumed.status, RunnerStatus::Unresponsive);
         assert_eq!(resumed.last_heartbeat_utc, None);
         assert!(!reg.update_heartbeat(&during_drain, true, 3, "stale"));
         let fresh = reg.begin_probe("probe").unwrap();
-        reg.set_draining("probe", false); // a retried resume must not invalidate it
+        reg.set_draining("probe", false).await.unwrap(); // a retried resume must not invalidate it
         assert!(reg.update_heartbeat(&fresh, false, 4, "unhealthy"));
         assert!(reg.find_for_target(None).is_none());
         let healthy = reg.begin_probe("probe").unwrap();
         assert!(reg.update_heartbeat(&healthy, true, 5, "healthy"));
         assert_eq!(
-            reg.set_draining("probe", false).unwrap().status,
+            reg.set_draining("probe", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             RunnerStatus::Active
         );
         assert_eq!(reg.find_for_target(Some("test")).unwrap().id, "probe");
-        assert!(reg.set_draining("missing", true).is_none());
+        assert!(reg.set_draining("missing", true).await.unwrap().is_none());
     }
 
-    #[test]
-    fn stale_probe_results_cannot_overwrite_newer_health_or_registration() {
+    #[tokio::test]
+    async fn stale_probe_results_cannot_overwrite_newer_health_or_registration() {
         let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec![]);
         let old = reg.begin_probe("probe").unwrap();
         let new = reg.begin_probe("probe").unwrap();
@@ -344,14 +431,16 @@ mod tests {
         for remove_first in [false, true] {
             let old = reg.begin_probe("probe").unwrap();
             if remove_first {
-                reg.deregister("probe");
+                reg.deregister("probe").await.unwrap();
             }
             reg.register(RunnerRecord::new(
                 "probe",
                 "Replacement",
                 "http://127.0.0.1:2",
                 vec![],
-            ));
+            ))
+            .await
+            .unwrap();
             let new = reg.begin_probe("probe").unwrap();
             assert_eq!(new.record.endpoint, "http://127.0.0.1:2");
             assert!(reg.update_heartbeat(&new, true, 7, "replacement"));
@@ -363,38 +452,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn registration_does_not_clear_operator_drain() {
+    #[tokio::test]
+    async fn registration_does_not_clear_operator_drain() {
         let reg = RunnerRegistry::new();
         let mut record = RunnerRecord::new("probe", "Probe", "http://127.0.0.1:1", vec![]);
         record.status = RunnerStatus::Draining;
-        reg.register(record);
+        reg.register(record).await.unwrap();
         reg.register(RunnerRecord::new(
             "probe",
             "Replacement",
             "http://127.0.0.1:2",
             vec![],
-        ));
+        ))
+        .await
+        .unwrap();
         assert_eq!(reg.get("probe").unwrap().status, RunnerStatus::Draining);
         assert!(reg.find_for_target(Some("probe")).is_none());
     }
 
-    #[test]
-    fn unavailable_and_draining_runners_are_never_selected() {
+    #[tokio::test]
+    async fn unavailable_and_draining_runners_are_never_selected() {
         let reg = RunnerRegistry::with_default("probe", "http://127.0.0.1:1", vec!["test".into()]);
         reg.mark_unresponsive(&reg.begin_probe("probe").unwrap());
         for target in [None, Some("probe"), Some("test")] {
             assert!(reg.find_for_target(target).is_none());
         }
-        reg.set_draining("probe", true);
+        reg.set_draining("probe", true).await.unwrap();
         reg.update_heartbeat(&reg.begin_probe("probe").unwrap(), true, 0, "test");
         reg.mark_unresponsive(&reg.begin_probe("probe").unwrap());
         assert_eq!(reg.get("probe").unwrap().status, RunnerStatus::Draining);
         assert!(reg.find_for_target(None).is_none());
     }
 
-    #[test]
-    fn register_and_list_runners() {
+    #[tokio::test]
+    async fn register_and_list_runners() {
         let reg = RunnerRegistry::new();
         assert!(reg.list().is_empty());
 
@@ -411,21 +502,21 @@ mod tests {
             vec!["k8s_workload".into()],
         );
 
-        reg.register(r1);
-        reg.register(r2);
+        reg.register(r1).await.unwrap();
+        reg.register(r2).await.unwrap();
 
         let all = reg.list();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, "k8s-pod-1");
         assert_eq!(all[1].id, "lariska-1");
 
-        assert!(reg.deregister("lariska-1"));
+        assert!(reg.deregister("lariska-1").await.unwrap());
         assert_eq!(reg.list().len(), 1);
-        assert!(!reg.deregister("non-existent"));
+        assert!(!reg.deregister("non-existent").await.unwrap());
     }
 
-    #[test]
-    fn find_for_target_routing() {
+    #[tokio::test]
+    async fn find_for_target_routing() {
         let reg = RunnerRegistry::new();
         let r1 = RunnerRecord::new(
             "node-a",
@@ -440,8 +531,8 @@ mod tests {
             vec!["endpoint_agent".into(), "production".into()],
         );
 
-        reg.register(r1);
-        reg.register(r2);
+        reg.register(r1).await.unwrap();
+        reg.register(r2).await.unwrap();
 
         // Exact ID match
         assert_eq!(reg.find_for_target(Some("node-a")).unwrap().id, "node-a");
@@ -461,11 +552,11 @@ mod tests {
         assert!(reg.find_for_target(None).is_some());
     }
 
-    #[test]
-    fn update_heartbeat_and_unresponsive() {
+    #[tokio::test]
+    async fn update_heartbeat_and_unresponsive() {
         let reg = RunnerRegistry::new();
         let r = RunnerRecord::new("probe-1", "Probe", "http://127.0.0.1:8850", vec![]);
-        reg.register(r);
+        reg.register(r).await.unwrap();
 
         reg.update_heartbeat(&reg.begin_probe("probe-1").unwrap(), true, 4, "0.1.0");
         let item = reg.get("probe-1").unwrap();

@@ -131,8 +131,32 @@ def main():
                     text=True, capture_output=True)
                 return json.loads(result.stdout)
 
+            request("POST", prefix + "/runners", {"id":"persistent-probe", "name":"Saved probe",
+                "endpoint":env["ASMODEUS_RUNNER_ENDPOINT"], "tags":["saved-tag"]}, 201)
+            request("PATCH", prefix + "/runners/persistent-probe", {"draining":True})
+            request("POST", prefix + "/runners", {"id":"retired", "endpoint":"http://127.0.0.1:1"}, 201)
+            request("DELETE", prefix + "/runners/retired")
             assert maintenance("drain")["status"] == "draining"
+            stop(cp)
+            original_endpoint = env["ASMODEUS_RUNNER_ENDPOINT"]
+            env["ASMODEUS_RUNNER_ENDPOINT"] = "http://127.0.0.1:1"  # snapshot wins over seed
+            cp = start("asmodeus-control-plane")
+            until(ready)
+            saved = {r["id"]: r for r in request("GET", prefix + "/runners")}
+            assert set(saved) == {"default-runner", "persistent-probe"}
+            assert all(r["status"] == "draining" for r in saved.values())
+            assert saved["default-runner"]["endpoint"] == original_endpoint
+            assert saved["persistent-probe"]["tags"] == ["saved-tag"]
             request("GET", prefix + "/runners/default-runner/ping")
+            registry_path = work / "state" / "runners.json"
+            registry_backup = registry_path.with_suffix(".backup")
+            registry_path.rename(registry_backup)
+            registry_path.mkdir()
+            request("PATCH", prefix + "/runners/default-runner", {"draining":False}, 500)
+            assert next(r for r in request("GET", prefix + "/runners")
+                        if r["id"] == "default-runner")["status"] == "draining"
+            registry_path.rmdir()
+            registry_backup.rename(registry_path)
             request("POST", prefix + "/scenarios/SMOKE-SHORT/run", {}, 502)
             assert request("GET", prefix + "/runs")["total"] == 0
             assert maintenance("resume")["status"] == "unresponsive"
@@ -214,12 +238,26 @@ def main():
             assert not request("GET", prefix + "/schedules/SMOKE-SCHEDULE")["schedule"]["enabled"]
             request("GET", prefix + "/schedules/SCHED-BASE-RANSOMWARE", expected=404)
             assert any(c["id"] == "SMOKE-CAMPAIGN" for c in request("GET", prefix + "/campaigns")["campaigns"])
+            request("GET", prefix + "/runners/default-runner/ping")
             timed_out = launch("SMOKE-LONG", {"timeout_sec": 1})
             assert timed_out["status"] == "TIMED_OUT" and timed_out["evidence"]["cleanup_confirmed"]
             simulated = launch("LATENCY_SPIKE_VM")
             assert simulated["evidence"]["execution_mode"] == "simulated"
             assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 2
-            print("PASS: runner drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
+            for record in request("GET", prefix + "/runners"):
+                request("DELETE", prefix + f"/runners/{record['id']}")
+            stop(cp)
+            env["ASMODEUS_RUNNER_ENDPOINT"] = original_endpoint
+            cp = start("asmodeus-control-plane")
+            until(ready)
+            assert request("GET", prefix + "/runners") == []
+            request("POST", prefix + "/scenarios/SMOKE-SHORT/run", {"background":True}, 502)
+            stop(cp)
+            registry_path.write_text("{corrupt")
+            cp = start("asmodeus-control-plane")
+            assert cp.wait(timeout=8) != 0
+            assert registry_path.read_text() == "{corrupt"
+            print("PASS: persistent runner registry, drain/restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
         except Exception:
             for log in logs:
                 log.flush()
