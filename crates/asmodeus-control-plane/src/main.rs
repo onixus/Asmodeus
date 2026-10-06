@@ -60,8 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         })
         .await?;
-    let _watchdog = watchdog::spawn_watchdog(state.registry.clone(), config.watchdog_interval_sec);
-    let _scheduler = scheduler::spawn_scheduler(state.clone(), config.scheduler_interval_sec);
+    let (_watchdog, initial_probes) =
+        watchdog::spawn_watchdog(state.registry.clone(), config.watchdog_interval_sec);
+    let _scheduler =
+        scheduler::spawn_scheduler(state.clone(), config.scheduler_interval_sec, initial_probes);
     let app = router(state);
 
     tracing::info!(

@@ -150,7 +150,12 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::Stream;
 
 #[derive(Default)]
-struct MockRunner;
+struct MockRunner {
+    probe_gate: Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )>,
+}
 
 #[tonic::async_trait]
 impl RunnerControl for MockRunner {
@@ -206,6 +211,10 @@ impl RunnerControl for MockRunner {
         &self,
         _req: tonic::Request<PbHbReq>,
     ) -> Result<tonic::Response<PbHbReply>, tonic::Status> {
+        if let Some((started, release)) = &self.probe_gate {
+            started.notify_one();
+            release.notified().await;
+        }
         Ok(tonic::Response::new(PbHbReply {
             state: "Idle".into(),
             healthy: true,
@@ -221,7 +230,7 @@ async fn start_mock_runner() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(RunnerControlServer::new(MockRunner))
+            .add_service(RunnerControlServer::new(MockRunner::default()))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -355,7 +364,7 @@ async fn start_mock_mtls_runner(tls: tonic::transport::ServerTlsConfig) -> Strin
         tonic::transport::Server::builder()
             .tls_config(tls)
             .unwrap()
-            .add_service(RunnerControlServer::new(MockRunner))
+            .add_service(RunnerControlServer::new(MockRunner::default()))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -1901,4 +1910,174 @@ async fn devsecops_cannot_enable_stored_red_team_schedule() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["schedule"]["enabled"], false);
+}
+
+#[tokio::test]
+async fn restored_due_schedule_waits_for_initial_runner_probe() {
+    let _lock = DISPATCH_TEST_LOCK.lock().await;
+    let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+    use crate::{registry::RunnerRegistry, scheduler, watchdog};
+    use std::{sync::Arc, time::Duration};
+    let polygon = asmodeus_testkit::Polygon::new("scheduler-initial-probe");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let runner = MockRunner {
+        probe_gate: Some((started.clone(), release.clone())),
+    };
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RunnerControlServer::new(runner))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let path = polygon.dir().join("runners.json");
+    RunnerRegistry::with_default("probe", &endpoint, vec![])
+        .with_persistence(Some(path.clone()))
+        .unwrap();
+    let registry = RunnerRegistry::new().with_persistence(Some(path)).unwrap();
+    assert!(registry.find_for_target(None).is_none());
+    let mut state = AppState::with_registry(Catalog::seeded(), registry).unwrap();
+    state.schedules = crate::persistent::Persistent::load(
+        Some(polygon.dir().join("schedules.json")),
+        scheduler::ScheduleCatalog::seeded,
+    )
+    .unwrap();
+    state
+        .schedules
+        .update(|catalog| {
+            let job = catalog.get_mut("SCHED-BASE-RANSOMWARE").unwrap();
+            job.enabled = true;
+            job.interval_sec = 3600;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (watchdog, initial_probes) = watchdog::spawn_watchdog(state.registry.clone(), 60);
+    let scheduler = scheduler::spawn_scheduler(state.clone(), 60, initial_probes);
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = state
+        .schedules
+        .read()
+        .unwrap()
+        .get("SCHED-BASE-RANSOMWARE")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        before.last_run_epoch_secs, None,
+        "initial health recovery must not consume a due interval"
+    );
+    assert_eq!(before.last_status, None);
+    assert!(state.audit.records().is_empty());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state
+                .schedules
+                .read()
+                .unwrap()
+                .get("SCHED-BASE-RANSOMWARE")
+                .unwrap()
+                .last_status
+                .as_deref()
+                == Some("COMPLETED")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let job = state
+        .schedules
+        .read()
+        .unwrap()
+        .get("SCHED-BASE-RANSOMWARE")
+        .unwrap()
+        .clone();
+    assert!(job.last_run_id.is_some());
+    assert_eq!(job.run_history.len(), 1);
+    assert_eq!(state.audit.records().len(), 1);
+    assert!(state
+        .schedules
+        .update(move |c| Ok(c.claim_due(job.last_run_epoch_secs.unwrap() + 1)))
+        .await
+        .unwrap()
+        .is_empty());
+    scheduler.abort();
+    watchdog.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_initial_probe_releases_scheduler_without_tight_retries() {
+    let _lock = DISPATCH_TEST_LOCK.lock().await;
+    let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+    use std::time::Duration;
+    // Accept TCP but never speak gRPC: exercise the real heartbeat deadline.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = crate::registry::RunnerRegistry::with_default(
+        "probe",
+        &format!("http://{}", listener.local_addr().unwrap()),
+        vec![],
+    );
+    let state =
+        crate::state::AppState::with_registry(crate::catalog::Catalog::seeded(), registry).unwrap();
+    state
+        .schedules
+        .update(|catalog| {
+            let job = catalog.get_mut("SCHED-BASE-RANSOMWARE").unwrap();
+            job.enabled = true;
+            job.interval_sec = 3600;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (watchdog, initial_probes) = crate::watchdog::spawn_watchdog(state.registry.clone(), 60);
+    let scheduler = crate::scheduler::spawn_scheduler(state.clone(), 60, initial_probes);
+    let (_connection, _) = listener.accept().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if state
+                .schedules
+                .read()
+                .unwrap()
+                .get("SCHED-BASE-RANSOMWARE")
+                .unwrap()
+                .last_status
+                .as_deref()
+                == Some("FAILED")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(state.registry.find_for_target(None).is_none());
+    assert!(state.audit.records().is_empty());
+    let job = state
+        .schedules
+        .read()
+        .unwrap()
+        .get("SCHED-BASE-RANSOMWARE")
+        .unwrap()
+        .clone();
+    assert_eq!(job.run_history.len(), 1);
+    assert_eq!(job.last_run_id, None);
+    assert!(state
+        .schedules
+        .update(move |c| Ok(c.claim_due(job.last_run_epoch_secs.unwrap() + 1)))
+        .await
+        .unwrap()
+        .is_empty());
+    scheduler.abort();
+    watchdog.abort();
 }

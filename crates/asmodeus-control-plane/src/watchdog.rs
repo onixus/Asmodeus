@@ -2,10 +2,20 @@
 
 use crate::registry::RunnerRegistry;
 
-/// Spawn a background task periodically pinging registered runners.
-pub fn spawn_watchdog(registry: RunnerRegistry, interval_secs: u64) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+/// Periodically probe runners and signal completion of the first health round.
+/// Each probe has a deadline; failed probes also complete the initial round.
+pub fn spawn_watchdog(
+    registry: RunnerRegistry,
+    interval_secs: u64,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(interval_secs.max(1)));
         loop {
             interval.tick().await;
             let runners = registry.list();
@@ -37,8 +47,12 @@ pub fn spawn_watchdog(registry: RunnerRegistry, interval_secs: u64) -> tokio::ta
                     }
                 }
             }
+            if let Some(ready_tx) = ready_tx.take() {
+                let _ = ready_tx.send(());
+            }
         }
-    })
+    });
+    (handle, ready_rx)
 }
 
 #[cfg(test)]
@@ -48,7 +62,11 @@ mod tests {
     #[tokio::test]
     async fn test_watchdog_spawn_and_abort() {
         let registry = RunnerRegistry::new();
-        let handle = spawn_watchdog(registry, 60);
+        let (handle, ready) = spawn_watchdog(registry, 60);
+        tokio::time::timeout(std::time::Duration::from_secs(1), ready)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!handle.is_finished());
         handle.abort();
     }

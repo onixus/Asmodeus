@@ -226,11 +226,25 @@ def main():
             assert recovered["run_history"][0]["run_id"] == recovered["last_run_id"]
             request("PATCH", prefix + "/schedules/SMOKE-RETRY", {"enabled":False})
             request("DELETE", prefix + "/schedules/SCHED-BASE-RANSOMWARE")
+            request("POST", prefix + "/schedules", {"id":"SMOKE-RESTART", "name":"Restart",
+                    "scenario_id":"SMOKE-SHORT", "interval_sec":3600, "enabled":False}, 201)
             interrupted = background()
             stop(cp)
+            # Prepare an enabled, due schedule while CP is stopped, so no pre-restart
+            # tick can claim it. On startup only the watchdog may establish health.
+            saved_schedules = json.loads(snapshot.read_text())
+            saved_schedules["jobs"]["SMOKE-RESTART"]["enabled"] = True
+            snapshot.write_text(json.dumps(saved_schedules))
             until(lambda: not (canary / interrupted).exists())
             cp = start("asmodeus-control-plane")
             until(ready)
+            restarted_job = until(lambda: j if (j := request("GET",
+                prefix + "/schedules/SMOKE-RESTART")["schedule"])["last_status"] == "COMPLETED" else None)
+            assert restarted_job["last_run_id"] and len(restarted_job["run_history"]) == 1
+            restarted_run = request("GET", prefix + f"/runs/{restarted_job['last_run_id']}")
+            assert restarted_run["evidence"]["execution_mode"] == "runner"
+            assert restarted_run["evidence"]["cleanup_confirmed"]
+            request("PATCH", prefix + "/schedules/SMOKE-RESTART", {"enabled":False})
             restored = request("GET", prefix + f"/runs/{interrupted}")
             assert restored["status"] == "INTERRUPTED" and not restored["evidence"]["cleanup_confirmed"]
             assert request("GET", prefix + f"/runs/{completed['run_id']}/verify")["verified"]
@@ -257,7 +271,7 @@ def main():
             cp = start("asmodeus-control-plane")
             assert cp.wait(timeout=8) != 0
             assert registry_path.read_text() == "{corrupt"
-            print("PASS: persistent runner registry, drain/restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
+            print("PASS: persistent runner registry, drain/restart, due schedule after restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
         except Exception:
             for log in logs:
                 log.flush()
