@@ -175,8 +175,21 @@ impl RunnerRegistry {
             }
             Err(error) => return Err(error),
         };
+        let restored = snapshot.into_data();
+        // The snapshot wins; make an ignored environment seed visible.
+        for seed in self.data.read().unwrap().runners.values() {
+            let kept = restored.runners.get(&seed.record.id);
+            if kept.is_none_or(|r| r.record.endpoint != seed.record.endpoint) {
+                tracing::warn!(
+                    runner_id = %seed.record.id,
+                    endpoint = %seed.record.endpoint,
+                    snapshot = %path.display(),
+                    "ASMODEUS_RUNNER_ENDPOINT seed ignored: runner snapshot is authoritative; register the runner via API/CLI"
+                );
+            }
+        }
         Ok(Self {
-            data: Arc::new(RwLock::new(snapshot.into_data())),
+            data: Arc::new(RwLock::new(restored)),
             writer: Arc::new(Mutex::new(())),
             path: Some(path),
         })
@@ -210,8 +223,16 @@ impl RunnerRegistry {
         .map_err(io::Error::other)?
     }
 
-    pub async fn register(&self, record: RunnerRecord) -> io::Result<RunnerRecord> {
+    pub async fn register(&self, mut record: RunnerRecord) -> io::Result<RunnerRecord> {
         crate::registry_store::validate_identity(&record.id, &record.endpoint)?;
+        // A new (or re-created) runner is routable only after a healthy probe;
+        // existing entries keep their state via RegistryData::register.
+        if record.status != RunnerStatus::Draining {
+            record.status = RunnerStatus::Unresponsive;
+        }
+        record.last_heartbeat_utc = None;
+        record.cpu_usage_pct = 0;
+        record.version.clear();
         self.update(move |data| data.register(record.clone())).await
     }
 
@@ -542,6 +563,9 @@ mod tests {
 
         reg.register(r1).await.unwrap();
         reg.register(r2).await.unwrap();
+        for id in ["node-a", "node-b"] {
+            reg.update_heartbeat(&reg.begin_probe(id).unwrap(), true, 0, "test");
+        }
 
         // Exact ID match
         assert_eq!(reg.find_for_target(Some("node-a")).unwrap().id, "node-a");

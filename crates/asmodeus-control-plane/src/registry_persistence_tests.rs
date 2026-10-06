@@ -117,7 +117,7 @@ async fn failed_write_does_not_publish_and_recovery_retries_safely() {
     assert!(reg.set_draining("probe", true).await.is_err());
     assert!(reg.register(runner("new")).await.is_err());
     assert!(reg.deregister("probe").await.is_err());
-    assert_eq!(reg.get("probe").unwrap().status, RunnerStatus::Active);
+    assert_eq!(reg.get("probe").unwrap().status, RunnerStatus::Unresponsive);
     assert!(reg.get("new").is_none());
     assert_eq!(std::fs::read_dir(polygon.dir()).unwrap().count(), 1); // temp cleanup
     std::fs::remove_dir(&path).unwrap();

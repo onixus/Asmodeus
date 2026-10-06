@@ -623,7 +623,8 @@ async fn runners_lifecycle_and_rbac() {
     let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["id"], "probe-k8s");
-    assert_eq!(body["status"], "active");
+    assert_eq!(body["status"], "unresponsive");
+    assert_eq!(body["last_heartbeat_utc"], Value::Null);
 
     // 3. Auditor can list runners
     let req = Request::builder()
