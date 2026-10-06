@@ -281,17 +281,20 @@ pub fn generate_spec() -> Value {
                     }
                 },
                 "post": {
-                    "summary": "Register a new runner probe",
+                    "summary": "Register or update a runner probe",
+                    "description": "Persisted before success when ASMODEUS_STATE_DIR is configured. An existing snapshot takes precedence over the environment seed on restart.",
                     "responses": {
                         "201": { "description": "Runner registered" },
-                        "403": { "description": "Forbidden" }
+                        "403": { "description": "Forbidden" },
+                        "422": { "description": "Invalid runner ID or HTTP(S) endpoint" },
+                        "500": { "description": "Registry persistence failed; change was not published" }
                     }
                 }
             },
             "/api/v1/asmodeus/runners/{id}": {
                 "patch": {
                     "summary": "Drain a runner or resume after a fresh healthy heartbeat",
-                    "description": "Admin, Red Team and DevSecOps may set draining. Drain excludes the runner from subsequent routing selections; already selected runs continue. Resume returns unresponsive until a new successful healthy heartbeat. Repeated requests are idempotent. Registry and maintenance state are process-local and lost on restart.",
+                    "description": "Admin, Red Team and DevSecOps may set draining. Drain excludes the runner from subsequent routing selections; already selected runs continue. Resume returns unresponsive until a new successful healthy heartbeat. Repeated requests are idempotent. With ASMODEUS_STATE_DIR, registrations and maintenance persist in runners.json; restored runners require fresh health checks. Without it, state is process-local. A single writer process is required.",
                     "requestBody": {"required":true,"content":{"application/json":{"schema":{
                         "type":"object","additionalProperties":false,"required":["draining"],
                         "properties":{"draining":{"type":"boolean"}}
@@ -301,14 +304,16 @@ pub fn generate_spec() -> Value {
                         "401": {"description":"Missing or invalid identity"},
                         "403": {"description":"Role may not change runner maintenance"},
                         "404": {"description":"Runner not found"},
-                        "422": {"description":"Invalid maintenance payload"}
+                        "422": {"description":"Invalid maintenance payload"},
+                        "500": {"description":"Registry persistence failed; change was not published"}
                     }
                 },
                 "delete": {
                     "summary": "Deregister an execution runner probe",
                     "responses": {
-                        "200": { "description": "Runner removed" },
-                        "404": { "description": "Runner not found" }
+                        "200": { "description": "Runner removed; an empty configured registry does not enable simulation or static fallback" },
+                        "404": { "description": "Runner not found" },
+                        "500": { "description": "Registry persistence failed; change was not published" }
                     }
                 }
             },

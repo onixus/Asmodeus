@@ -65,7 +65,7 @@ def main():
             base = f"http://127.0.0.1:{api_port}"
             env.update({
                 "ASMODEUS_RUNNER_LISTEN": f"127.0.0.1:{runner_port}",
-                "ASMODEUS_RUNNER_ENDPOINT": f"http://127.0.0.1:{runner_port}",
+                "ASMODEUS_RUNNER_ENDPOINT": f"127.0.0.1:{runner_port}",
                 "ASMODEUS_LISTEN": f"127.0.0.1:{api_port}",
                 "ASMODEUS_RUNNER_TRUSTED_KEY": str(work / "operator.pub"),
                 "ASMODEUS_SCENARIO_SIGNING_KEY": str(work / "operator.key"),
@@ -131,8 +131,32 @@ def main():
                     text=True, capture_output=True)
                 return json.loads(result.stdout)
 
+            request("POST", prefix + "/runners", {"id":"persistent-probe", "name":"Saved probe",
+                "endpoint":f"http://127.0.0.1:{runner_port}", "tags":["saved-tag"]}, 201)
+            request("PATCH", prefix + "/runners/persistent-probe", {"draining":True})
+            request("POST", prefix + "/runners", {"id":"retired", "endpoint":"http://127.0.0.1:1"}, 201)
+            request("DELETE", prefix + "/runners/retired")
             assert maintenance("drain")["status"] == "draining"
+            stop(cp)
+            original_endpoint = f"http://127.0.0.1:{runner_port}"
+            env["ASMODEUS_RUNNER_ENDPOINT"] = "http://127.0.0.1:1"  # snapshot wins over seed
+            cp = start("asmodeus-control-plane")
+            until(ready)
+            saved = {r["id"]: r for r in request("GET", prefix + "/runners")}
+            assert set(saved) == {"default-runner", "persistent-probe"}
+            assert all(r["status"] == "draining" for r in saved.values())
+            assert saved["default-runner"]["endpoint"] == original_endpoint
+            assert saved["persistent-probe"]["tags"] == ["saved-tag"]
             request("GET", prefix + "/runners/default-runner/ping")
+            registry_path = work / "state" / "runners.json"
+            registry_backup = registry_path.with_suffix(".backup")
+            registry_path.rename(registry_backup)
+            registry_path.mkdir()
+            request("PATCH", prefix + "/runners/default-runner", {"draining":False}, 500)
+            assert next(r for r in request("GET", prefix + "/runners")
+                        if r["id"] == "default-runner")["status"] == "draining"
+            registry_path.rmdir()
+            registry_backup.rename(registry_path)
             request("POST", prefix + "/scenarios/SMOKE-SHORT/run", {}, 502)
             assert request("GET", prefix + "/runs")["total"] == 0
             assert maintenance("resume")["status"] == "unresponsive"
@@ -202,11 +226,25 @@ def main():
             assert recovered["run_history"][0]["run_id"] == recovered["last_run_id"]
             request("PATCH", prefix + "/schedules/SMOKE-RETRY", {"enabled":False})
             request("DELETE", prefix + "/schedules/SCHED-BASE-RANSOMWARE")
+            request("POST", prefix + "/schedules", {"id":"SMOKE-RESTART", "name":"Restart",
+                    "scenario_id":"SMOKE-SHORT", "interval_sec":3600, "enabled":False}, 201)
             interrupted = background()
             stop(cp)
+            # Prepare an enabled, due schedule while CP is stopped, so no pre-restart
+            # tick can claim it. On startup only the watchdog may establish health.
+            saved_schedules = json.loads(snapshot.read_text())
+            saved_schedules["jobs"]["SMOKE-RESTART"]["enabled"] = True
+            snapshot.write_text(json.dumps(saved_schedules))
             until(lambda: not (canary / interrupted).exists())
             cp = start("asmodeus-control-plane")
             until(ready)
+            restarted_job = until(lambda: j if (j := request("GET",
+                prefix + "/schedules/SMOKE-RESTART")["schedule"])["last_status"] == "COMPLETED" else None)
+            assert restarted_job["last_run_id"] and len(restarted_job["run_history"]) == 1
+            restarted_run = request("GET", prefix + f"/runs/{restarted_job['last_run_id']}")
+            assert restarted_run["evidence"]["execution_mode"] == "runner"
+            assert restarted_run["evidence"]["cleanup_confirmed"]
+            request("PATCH", prefix + "/schedules/SMOKE-RESTART", {"enabled":False})
             restored = request("GET", prefix + f"/runs/{interrupted}")
             assert restored["status"] == "INTERRUPTED" and not restored["evidence"]["cleanup_confirmed"]
             assert request("GET", prefix + f"/runs/{completed['run_id']}/verify")["verified"]
@@ -214,12 +252,26 @@ def main():
             assert not request("GET", prefix + "/schedules/SMOKE-SCHEDULE")["schedule"]["enabled"]
             request("GET", prefix + "/schedules/SCHED-BASE-RANSOMWARE", expected=404)
             assert any(c["id"] == "SMOKE-CAMPAIGN" for c in request("GET", prefix + "/campaigns")["campaigns"])
+            request("GET", prefix + "/runners/default-runner/ping")
             timed_out = launch("SMOKE-LONG", {"timeout_sec": 1})
             assert timed_out["status"] == "TIMED_OUT" and timed_out["evidence"]["cleanup_confirmed"]
             simulated = launch("LATENCY_SPIKE_VM")
             assert simulated["evidence"]["execution_mode"] == "simulated"
             assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 2
-            print("PASS: runner drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
+            for record in request("GET", prefix + "/runners"):
+                request("DELETE", prefix + f"/runners/{record['id']}")
+            stop(cp)
+            env["ASMODEUS_RUNNER_ENDPOINT"] = original_endpoint
+            cp = start("asmodeus-control-plane")
+            until(ready)
+            assert request("GET", prefix + "/runners") == []
+            request("POST", prefix + "/scenarios/SMOKE-SHORT/run", {"background":True}, 502)
+            stop(cp)
+            registry_path.write_text("{corrupt")
+            cp = start("asmodeus-control-plane")
+            assert cp.wait(timeout=8) != 0
+            assert registry_path.read_text() == "{corrupt"
+            print("PASS: persistent runner registry, drain/restart, due schedule after restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
         except Exception:
             for log in logs:
                 log.flush()

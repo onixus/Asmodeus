@@ -84,13 +84,10 @@ pub(crate) async fn start_scenario(
             return Err(ExecutionError::TargetNotFound(target.into()));
         }
     }
-    if selected.is_none() && !state.registry.is_empty() {
+    if selected.is_none() && state.registry.requires_runner() {
         return Err(ExecutionError::NoActiveRunner);
     }
-    let endpoint = selected
-        .as_ref()
-        .map(|r| r.endpoint.clone())
-        .or_else(|| state.runner_endpoint.clone());
+    let endpoint = selected.as_ref().map(|r| r.endpoint.clone());
     let mode = if endpoint.is_some() {
         "runner"
     } else {

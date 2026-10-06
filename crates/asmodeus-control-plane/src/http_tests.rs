@@ -150,7 +150,12 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::Stream;
 
 #[derive(Default)]
-struct MockRunner;
+struct MockRunner {
+    probe_gate: Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )>,
+}
 
 #[tonic::async_trait]
 impl RunnerControl for MockRunner {
@@ -206,6 +211,10 @@ impl RunnerControl for MockRunner {
         &self,
         _req: tonic::Request<PbHbReq>,
     ) -> Result<tonic::Response<PbHbReply>, tonic::Status> {
+        if let Some((started, release)) = &self.probe_gate {
+            started.notify_one();
+            release.notified().await;
+        }
         Ok(tonic::Response::new(PbHbReply {
             state: "Idle".into(),
             healthy: true,
@@ -221,7 +230,7 @@ async fn start_mock_runner() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(RunnerControlServer::new(MockRunner))
+            .add_service(RunnerControlServer::new(MockRunner::default()))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -355,7 +364,7 @@ async fn start_mock_mtls_runner(tls: tonic::transport::ServerTlsConfig) -> Strin
         tonic::transport::Server::builder()
             .tls_config(tls)
             .unwrap()
-            .add_service(RunnerControlServer::new(MockRunner))
+            .add_service(RunnerControlServer::new(MockRunner::default()))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -623,7 +632,8 @@ async fn runners_lifecycle_and_rbac() {
     let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["id"], "probe-k8s");
-    assert_eq!(body["status"], "active");
+    assert_eq!(body["status"], "unresponsive");
+    assert_eq!(body["last_heartbeat_utc"], Value::Null);
 
     // 3. Auditor can list runners
     let req = Request::builder()
@@ -832,7 +842,9 @@ async fn dispatch_with_target_override_and_ping() {
         "Targeted K8s Probe",
         &runner_url,
         vec!["k8s_workload".into()],
-    ));
+    ))
+    .await
+    .unwrap();
 
     let app = router(AppState::with_registry(Catalog::seeded(), reg).unwrap());
 
@@ -1639,12 +1651,16 @@ async fn schedule_detail_toggle_and_alerts() {
 async fn unavailable_registry_does_not_fall_back_to_simulation_or_static_runner() {
     for endpoint in [None, Some("http://127.0.0.1:1".into())] {
         let state = AppState::with_runner(Catalog::seeded(), endpoint).unwrap();
-        state.registry.register(RunnerRecord::new(
-            "unavailable",
-            "Test",
-            "http://127.0.0.1:1",
-            vec![],
-        ));
+        state
+            .registry
+            .register(RunnerRecord::new(
+                "unavailable",
+                "Test",
+                "http://127.0.0.1:1",
+                vec![],
+            ))
+            .await
+            .unwrap();
         for runner in state.registry.list() {
             state
                 .registry
@@ -1664,6 +1680,101 @@ async fn unavailable_registry_does_not_fall_back_to_simulation_or_static_runner(
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(state.audit.len(), 0);
     }
+}
+
+#[tokio::test]
+async fn deleting_last_runner_never_falls_back_or_admits_another_run() {
+    for endpoint in [None, Some("http://127.0.0.1:1".into())] {
+        let state = AppState::with_runner(Catalog::seeded(), endpoint).unwrap();
+        state
+            .registry
+            .register(RunnerRecord::new(
+                "dynamic",
+                "Dynamic",
+                "http://127.0.0.1:1",
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        for record in state.registry.list() {
+            let (status, _) = feature_request(
+                &app,
+                "DELETE",
+                &format!("/api/v1/asmodeus/runners/{}", record.id),
+                "admin",
+                json!({}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, _) = feature_request(
+            &app,
+            "POST",
+            "/api/v1/asmodeus/scenarios/RANSOMWARE_CANARY_SPIKE/run",
+            "admin",
+            json!({"background":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(state.audit.len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn runner_configuration_write_errors_reach_http_without_changing_state() {
+    let polygon = asmodeus_testkit::Polygon::new("registry-http-failure");
+    let path = polygon.dir().join("runners.json");
+    let registry = RunnerRegistry::new()
+        .with_persistence(Some(path.clone()))
+        .unwrap();
+    registry
+        .register(RunnerRecord::new(
+            "probe",
+            "Probe",
+            "http://127.0.0.1:1",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    registry.set_draining("probe", true).await.unwrap();
+    let app = router(AppState::with_registry(Catalog::seeded(), registry.clone()).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    for (method, url, payload) in [
+        (
+            "PATCH",
+            "/api/v1/asmodeus/runners/probe",
+            json!({"draining":false}),
+        ),
+        ("DELETE", "/api/v1/asmodeus/runners/probe", json!({})),
+        (
+            "POST",
+            "/api/v1/asmodeus/runners",
+            json!({"id":"new","endpoint":"http://127.0.0.1:2"}),
+        ),
+    ] {
+        let (status, body) = feature_request(&app, method, url, "admin", payload).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("persistence failed"));
+    }
+    assert_eq!(
+        registry.get("probe").unwrap().status,
+        crate::registry::RunnerStatus::Draining
+    );
+    assert_eq!(registry.list().len(), 1);
+    let (status, _) = feature_request(
+        &app,
+        "POST",
+        "/api/v1/asmodeus/runners",
+        "admin",
+        json!({"id":"invalid","endpoint":"http://"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 async fn feature_request(
@@ -1799,4 +1910,174 @@ async fn devsecops_cannot_enable_stored_red_team_schedule() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["schedule"]["enabled"], false);
+}
+
+#[tokio::test]
+async fn restored_due_schedule_waits_for_initial_runner_probe() {
+    let _lock = DISPATCH_TEST_LOCK.lock().await;
+    let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+    use crate::{registry::RunnerRegistry, scheduler, watchdog};
+    use std::{sync::Arc, time::Duration};
+    let polygon = asmodeus_testkit::Polygon::new("scheduler-initial-probe");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let runner = MockRunner {
+        probe_gate: Some((started.clone(), release.clone())),
+    };
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RunnerControlServer::new(runner))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let path = polygon.dir().join("runners.json");
+    RunnerRegistry::with_default("probe", &endpoint, vec![])
+        .with_persistence(Some(path.clone()))
+        .unwrap();
+    let registry = RunnerRegistry::new().with_persistence(Some(path)).unwrap();
+    assert!(registry.find_for_target(None).is_none());
+    let mut state = AppState::with_registry(Catalog::seeded(), registry).unwrap();
+    state.schedules = crate::persistent::Persistent::load(
+        Some(polygon.dir().join("schedules.json")),
+        scheduler::ScheduleCatalog::seeded,
+    )
+    .unwrap();
+    state
+        .schedules
+        .update(|catalog| {
+            let job = catalog.get_mut("SCHED-BASE-RANSOMWARE").unwrap();
+            job.enabled = true;
+            job.interval_sec = 3600;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (watchdog, initial_probes) = watchdog::spawn_watchdog(state.registry.clone(), 60);
+    let scheduler = scheduler::spawn_scheduler(state.clone(), 60, initial_probes);
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = state
+        .schedules
+        .read()
+        .unwrap()
+        .get("SCHED-BASE-RANSOMWARE")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        before.last_run_epoch_secs, None,
+        "initial health recovery must not consume a due interval"
+    );
+    assert_eq!(before.last_status, None);
+    assert!(state.audit.records().is_empty());
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state
+                .schedules
+                .read()
+                .unwrap()
+                .get("SCHED-BASE-RANSOMWARE")
+                .unwrap()
+                .last_status
+                .as_deref()
+                == Some("COMPLETED")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let job = state
+        .schedules
+        .read()
+        .unwrap()
+        .get("SCHED-BASE-RANSOMWARE")
+        .unwrap()
+        .clone();
+    assert!(job.last_run_id.is_some());
+    assert_eq!(job.run_history.len(), 1);
+    assert_eq!(state.audit.records().len(), 1);
+    assert!(state
+        .schedules
+        .update(move |c| Ok(c.claim_due(job.last_run_epoch_secs.unwrap() + 1)))
+        .await
+        .unwrap()
+        .is_empty());
+    scheduler.abort();
+    watchdog.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_initial_probe_releases_scheduler_without_tight_retries() {
+    let _lock = DISPATCH_TEST_LOCK.lock().await;
+    let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+    use std::time::Duration;
+    // Accept TCP but never speak gRPC: exercise the real heartbeat deadline.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry = crate::registry::RunnerRegistry::with_default(
+        "probe",
+        &format!("http://{}", listener.local_addr().unwrap()),
+        vec![],
+    );
+    let state =
+        crate::state::AppState::with_registry(crate::catalog::Catalog::seeded(), registry).unwrap();
+    state
+        .schedules
+        .update(|catalog| {
+            let job = catalog.get_mut("SCHED-BASE-RANSOMWARE").unwrap();
+            job.enabled = true;
+            job.interval_sec = 3600;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (watchdog, initial_probes) = crate::watchdog::spawn_watchdog(state.registry.clone(), 60);
+    let scheduler = crate::scheduler::spawn_scheduler(state.clone(), 60, initial_probes);
+    let (_connection, _) = listener.accept().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if state
+                .schedules
+                .read()
+                .unwrap()
+                .get("SCHED-BASE-RANSOMWARE")
+                .unwrap()
+                .last_status
+                .as_deref()
+                == Some("FAILED")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(state.registry.find_for_target(None).is_none());
+    assert!(state.audit.records().is_empty());
+    let job = state
+        .schedules
+        .read()
+        .unwrap()
+        .get("SCHED-BASE-RANSOMWARE")
+        .unwrap()
+        .clone();
+    assert_eq!(job.run_history.len(), 1);
+    assert_eq!(job.last_run_id, None);
+    assert!(state
+        .schedules
+        .update(move |c| Ok(c.claim_due(job.last_run_epoch_secs.unwrap() + 1)))
+        .await
+        .unwrap()
+        .is_empty());
+    scheduler.abort();
+    watchdog.abort();
 }

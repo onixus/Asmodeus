@@ -363,8 +363,15 @@ async fn flush_outcomes(
 pub fn spawn_scheduler(
     state: crate::state::AppState,
     poll_secs: u64,
+    initial_probes: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Restored health is unknown until the watchdog's first bounded round.
+        // Do not persist claims while recovery alone makes runners unavailable.
+        if initial_probes.await.is_err() {
+            tracing::error!("initial runner health round interrupted; scheduler stopped");
+            return;
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(5)));
         let mut pending = VecDeque::new();
         loop {
@@ -560,6 +567,46 @@ impl ScheduleCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn enable_startup_job(state: &crate::state::AppState) {
+        state
+            .schedules
+            .update(|catalog| {
+                let job = catalog.get_mut("SCHED-BASE-RANSOMWARE").unwrap();
+                job.enabled = true;
+                job.interval_sec = 3600;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_initial_probe_round_does_not_claim_schedules() {
+        let state = crate::state::AppState::with_registry(
+            crate::catalog::Catalog::seeded(),
+            crate::registry::RunnerRegistry::new(),
+        )
+        .unwrap();
+        enable_startup_job(&state).await;
+        let (sender, initial_probes) = tokio::sync::oneshot::channel();
+        let scheduler = spawn_scheduler(state.clone(), 60, initial_probes);
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(1), scheduler)
+            .await
+            .unwrap()
+            .unwrap();
+        let job = state
+            .schedules
+            .read()
+            .unwrap()
+            .get("SCHED-BASE-RANSOMWARE")
+            .unwrap()
+            .clone();
+        assert_eq!(job.last_run_epoch_secs, None);
+        assert_eq!(job.last_status, None);
+        assert!(state.audit.records().is_empty());
+    }
 
     #[tokio::test]
     async fn outcome_retries_after_storage_recovers_without_duplicate_history() {

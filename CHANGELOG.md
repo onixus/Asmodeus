@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+### Добавлено — постоянный реестр раннеров, 2026-10-06
+
+- `ASMODEUS_STATE_DIR/runners.json`: сохранение конфигурации, drain/resume и
+  удалений; после рестарта здоровье узлов подтверждается новым heartbeat.
+- Snapshot имеет приоритет над начальным `ASMODEUS_RUNNER_ENDPOINT`; удалённый
+  default-runner не появляется повторно. Удаление последнего узла не включает
+  fallback к симуляции или статическому endpoint.
+- Persist-before-publish, ошибки записи в HTTP, commit после отмены ожидания,
+  сохранение параллельных heartbeat; fail-fast при повреждённом snapshot.
+- Регрессии concurrency/I/O/restart и двухпроцессная приёмка реального API/CLI.
+
+
 ### Добавлено — обслуживание раннеров, 2026-10-06
 
 - `PATCH /api/v1/asmodeus/runners/:id` с `{"draining":true|false}` и CLI

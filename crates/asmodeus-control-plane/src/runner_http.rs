@@ -43,6 +43,8 @@ pub(crate) async fn set_runner_maintenance(
     let record = state
         .registry
         .set_draining(&id, payload.draining)
+        .await
+        .map_err(registry_error)?
         .ok_or_else(|| ApiError::NotFound(format!("runner not found: {id}")))?;
     Ok(Json(json!(record)))
 }
@@ -84,7 +86,11 @@ pub(crate) async fn register_runner(
 
     let name = payload.name.unwrap_or_else(|| id.to_string());
     let record = RunnerRecord::new(id, name, endpoint, payload.tags);
-    let record = state.registry.register(record);
+    let record = state
+        .registry
+        .register(record)
+        .await
+        .map_err(registry_error)?;
 
     Ok((StatusCode::CREATED, Json(json!(record))))
 }
@@ -101,10 +107,23 @@ pub(crate) async fn deregister_runner(
         return Err(ApiError::Forbidden("role may not deregister runners"));
     }
 
-    if state.registry.deregister(&id) {
+    if state
+        .registry
+        .deregister(&id)
+        .await
+        .map_err(registry_error)?
+    {
         Ok(Json(json!({ "status": "DEREGISTERED", "id": id })))
     } else {
         Err(ApiError::NotFound(format!("runner not found: {id}")))
+    }
+}
+
+fn registry_error(error: std::io::Error) -> ApiError {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        ApiError::Unprocessable(error.to_string())
+    } else {
+        ApiError::Internal(format!("runner registry persistence failed: {error}"))
     }
 }
 
