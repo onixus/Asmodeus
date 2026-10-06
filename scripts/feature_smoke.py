@@ -125,6 +125,20 @@ def main():
                 until(lambda: (canary / run_id / "canary_000.docx").exists())
                 return run_id
 
+            def maintenance(action):
+                result = subprocess.run([BIN / "asmodeus", "runners", action,
+                    "--id", "default-runner", "--url", base], env=env, check=True,
+                    text=True, capture_output=True)
+                return json.loads(result.stdout)
+
+            assert maintenance("drain")["status"] == "draining"
+            request("GET", prefix + "/runners/default-runner/ping")
+            request("POST", prefix + "/scenarios/SMOKE-SHORT/run", {}, 502)
+            assert request("GET", prefix + "/runs")["total"] == 0
+            assert maintenance("resume")["status"] == "unresponsive"
+            request("GET", prefix + "/runners/default-runner/ping")
+            assert request("GET", prefix + "/runners")[0]["status"] == "active"
+
             run_id = background()
             request("POST", prefix + f"/runs/{run_id}/cancel", {}, 202)
             result = until(lambda: (r if r["status"] == "CANCELLED" else None)
@@ -205,7 +219,7 @@ def main():
             simulated = launch("LATENCY_SPIKE_VM")
             assert simulated["evidence"]["execution_mode"] == "simulated"
             assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 2
-            print("PASS: signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
+            print("PASS: runner drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
         except Exception:
             for log in logs:
                 log.flush()

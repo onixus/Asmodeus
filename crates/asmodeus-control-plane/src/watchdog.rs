@@ -10,10 +10,13 @@ pub fn spawn_watchdog(registry: RunnerRegistry, interval_secs: u64) -> tokio::ta
             interval.tick().await;
             let runners = registry.list();
             for runner in runners {
-                match crate::dispatch::ping(&runner.endpoint).await {
+                let Some(probe) = registry.begin_probe(&runner.id) else {
+                    continue;
+                };
+                match crate::dispatch::ping(&probe.record.endpoint).await {
                     Ok(reply) => {
                         registry.update_heartbeat(
-                            &runner.id,
+                            &probe,
                             reply.healthy,
                             reply.cpu_usage_pct,
                             &reply.version,
@@ -25,11 +28,11 @@ pub fn spawn_watchdog(registry: RunnerRegistry, interval_secs: u64) -> tokio::ta
                         );
                     }
                     Err(e) => {
-                        registry.mark_unresponsive(&runner.id);
+                        registry.mark_unresponsive(&probe);
                         tracing::warn!(
                             runner_id = %runner.id,
                             error = %e,
-                            "Runner heartbeat probe failed; marked unresponsive"
+                            "Runner heartbeat probe failed"
                         );
                     }
                 }
