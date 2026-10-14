@@ -14,7 +14,7 @@ path = "src/main.rs"
 # Real eBPF/TC network-chaos backend via `aya` — Linux stand only. Off by
 # default so the workspace builds and tests on every platform (macOS included);
 # without it the runner uses the in-process SimBackend. See src/aya_backend.rs.
-ebpf = []
+ebpf = ["dep:aya"]
 
 [dependencies]
 asmodeus-common = { workspace = true }
@@ -22,6 +22,13 @@ asmodeus-crypto = { workspace = true }
 asmodeus-dsl = { workspace = true }
 asmodeus-safety = { workspace = true }
 asmodeus-proto = { workspace = true }
+# Shared map ABI for the eBPF/TC datapath. A tiny no_std lib that builds on the
+# stable host toolchain, so it is an ordinary dependency; `aya` below is the
+# part gated behind `ebpf`.
+asmodeus-netchaos-ebpf = { workspace = true }
+# Linked only under `--features ebpf` (Linux stand). The default build carries
+# neither aya nor the kernel attach; the aya-backend module is cfg'd out.
+aya = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }

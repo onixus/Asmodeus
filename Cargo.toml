@@ -8,6 +8,7 @@ members = [
     "crates/asmodeus-crypto",
     "crates/asmodeus-dsl",
     "crates/asmodeus-safety",
+    "crates/asmodeus-netchaos-ebpf",
     "crates/asmodeus-runner",
     "crates/asmodeus-control-plane",
     "crates/asmodeus-telemetry",
@@ -31,6 +32,7 @@ asmodeus-proto        = { path = "crates/asmodeus-proto" }
 asmodeus-crypto       = { path = "crates/asmodeus-crypto" }
 asmodeus-dsl          = { path = "crates/asmodeus-dsl" }
 asmodeus-safety       = { path = "crates/asmodeus-safety" }
+asmodeus-netchaos-ebpf= { path = "crates/asmodeus-netchaos-ebpf" }
 asmodeus-runner       = { path = "crates/asmodeus-runner" }
 asmodeus-control-plane= { path = "crates/asmodeus-control-plane" }
 asmodeus-telemetry    = { path = "crates/asmodeus-telemetry" }
@@ -55,6 +57,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# Real eBPF/TC net-chaos attach — Linux stand only, behind the runner's `ebpf`
+# feature. Pinned to the exact stack vetted on the node (same LLVM/bpf-linker
+# recipe as Ferrum). The default workspace build never enables the feature, so
+# aya is resolved in Cargo.lock but linked into nothing.
+aya = { version = "=0.12.0", default-features = false }
 
 [profile.release]
 opt-level = "z"

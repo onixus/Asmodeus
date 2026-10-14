@@ -89,6 +89,13 @@ pipeline {
                                 cargo test --workspace --locked > cargo-test.log 2>&1 || {
                                     cat cargo-test.log; exit 1
                                 }
+                                # Юнит-тесты aya-backend (разбор CIDR, масштаб
+                                # потерь) живут под cfg(ebpf) и в обычный прогон
+                                # не попадают. Они чистые — CAP_BPF не нужен.
+                                cargo test -p asmodeus-runner --features ebpf --bins \
+                                    >> cargo-test.log 2>&1 || {
+                                    cat cargo-test.log; exit 1
+                                }
                                 cat cargo-test.log
                             '''
                         }
@@ -99,6 +106,100 @@ pipeline {
                 always {
                     archiveArtifacts artifacts: 'cargo-test.log', allowEmptyArchive: true
                 }
+            }
+        }
+
+        // Компиляция ядерной части net-chaos (asmodeus-netchaos-ebpf) под
+        // bpfel-unknown-none. Это и есть «компилируемый BPF-объект» из роадмапа:
+        // стадия краснеет, если программа не проходит bpf-linker. Рецепт —
+        // тот же, что в Ferrum/Jenkinsfile.linux (nightly, LLVM 23, bpf-linker,
+        // build-std=core, --btf), и гоняется на той же ноде, где он уже обкатан.
+        // Отдельный root-контейнер: установка nightly/LLVM/bpf-linker пишет за
+        // пределы воркспейса, под uid агента этого нельзя; кэши — свои
+        // (.cargo-root-*), чтобы не мешать каталогам стадии тестов под её uid.
+        stage('netchaos BPF ELF') {
+            agent {
+                docker {
+                    label 'gaming'
+                    image 'rust:1-bookworm'
+                    args '-u 0:0'
+                    reuseNode true
+                }
+            }
+            steps {
+                deleteDir()
+                unstash 'src'
+                sh '''
+                    set -eu
+                    export CARGO_HOME="$WORKSPACE/.cargo-root-home"
+                    export RUSTUP_HOME="$WORKSPACE/.cargo-root-rustup"
+                    export CARGO_TARGET_DIR="$WORKSPACE/.cargo-root-target"
+                    export PATH="$CARGO_HOME/bin:$PATH"
+                    # Свежий воркспейс: CARGO_HOME пуст, и `rustup toolchain install`
+                    # образа rust:1-bookworm отказывает «rustup is not installed».
+                    # Засев из образа один раз; дальше каталог живёт в воркспейсе.
+                    if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+                        mkdir -p "$CARGO_HOME"
+                        cp -a /usr/local/cargo/. "$CARGO_HOME/"
+                    fi
+                    rustup toolchain install nightly --profile minimal --component rust-src
+                    if ! command -v bpf-linker >/dev/null 2>&1; then
+                        # Мажор LLVM nightly и устанавливаемого llvm-dev должны
+                        # совпадать: иначе линкер сойдётся на сборке и разойдётся
+                        # в работе. Значение то же, что обкатано на ноде в Ferrum.
+                        llvm_major=23
+                        have=$(rustc +nightly --version --verbose \
+                               | awk '/^LLVM version:/{split($3, v, "."); print v[1]}')
+                        if [ "$have" != "$llvm_major" ]; then
+                            echo "nightly несёт LLVM $have, стадия ждёт $llvm_major" >&2
+                            exit 1
+                        fi
+                        if ! command -v llvm-config >/dev/null 2>&1; then
+                            apt-get update
+                            apt-get install -y --no-install-recommends \
+                                curl gnupg ca-certificates
+                            curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+                                -o /tmp/llvm.asc
+                            fpr=$(gpg --show-keys --with-colons /tmp/llvm.asc \
+                                  | awk -F: '/^fpr/{print $10; exit}')
+                            if [ "$fpr" != 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421 ]; then
+                                echo "ключ apt.llvm.org не тот: $fpr" >&2
+                                exit 1
+                            fi
+                            gpg --dearmor < /tmp/llvm.asc \
+                                > /usr/share/keyrings/asmodeus-llvm.gpg
+                            echo "deb [signed-by=/usr/share/keyrings/asmodeus-llvm.gpg]" \
+                                 "https://apt.llvm.org/bookworm/" \
+                                 "llvm-toolchain-bookworm-$llvm_major main" \
+                                > /etc/apt/sources.list.d/asmodeus-llvm.list
+                            apt-get update
+                            apt-get install -y --no-install-recommends "llvm-$llvm_major-dev"
+                            ln -sf "/usr/lib/llvm-$llvm_major/bin/llvm-config" \
+                                /usr/local/bin/llvm-config
+                        fi
+                        sysroot="$(rustc +nightly --print sysroot)"
+                        shim=/tmp/asmodeus-llvm-shim
+                        mkdir -p "$shim"
+                        ln -sf "$sysroot"/lib/libLLVM-*.so "$shim/libLLVM.so"
+                        RUSTFLAGS="-L $shim -L $sysroot/lib -C link-arg=-Wl,-rpath,$sysroot/lib" \
+                            cargo +nightly install bpf-linker --locked
+                    fi
+                    # --btf нужен верификатору; target-специфичный RUSTFLAGS, иначе
+                    # флаг достанется build.rs зависимостей и уронит их сборку под cc.
+                    export CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS="-C debuginfo=2 -C link-arg=--btf"
+                    # Override opt-level for this build only: the workspace
+                    # profile.release uses opt-level "z" (host binary size), but
+                    # bpf-linker rejects -Oz ("use O2 with the minsize attribute").
+                    # O2 is the conventional level for a verifiable BPF object.
+                    cargo +nightly build -p asmodeus-netchaos-ebpf \
+                        --target bpfel-unknown-none -Z build-std=core --release \
+                        --config 'profile.release.opt-level=2'
+                    elf="$CARGO_TARGET_DIR/bpfel-unknown-none/release/asmodeus-netchaos-ebpf"
+                    mkdir -p dist
+                    cp "$elf" dist/asmodeus-netchaos.bpf.o
+                    ls -l dist/asmodeus-netchaos.bpf.o
+                '''
+                archiveArtifacts artifacts: 'dist/asmodeus-netchaos.bpf.o', fingerprint: true
             }
         }
 
