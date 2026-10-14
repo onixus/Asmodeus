@@ -423,13 +423,43 @@ pub fn generate_spec() -> Value {
             },
             "/api/v1/asmodeus/campaigns/{id}/run": {
                 "post": {
-                    "summary": "Execute multi-stage attack campaign and compute composite resilience score",
+                    "summary": "Execute a durable campaign; background launch returns 202",
+                    "requestBody": {"required":false,"content":{"application/json":{"schema":{"type":"object","properties":{
+                        "background":{"type":"boolean","default":false},
+                        "target_override":{"type":["string","null"]},
+                        "timeout_sec":{"type":["integer","null"],"minimum":1}
+                    }}}}},
                     "responses": {
-                        "200": { "description": "Campaign execution result" },
+                        "200": { "description": "Campaign execution result with durable id and status" },
+                        "202": { "description": "Background campaign admitted" },
+                        "500": { "description": "Snapshot persistence failed" },
                         "403": { "description": "Role forbidden from running campaigns" },
                         "404": { "description": "Campaign not found" }
                     }
                 }
+            },
+            "/api/v1/asmodeus/campaign-runs": {
+                "get": {
+                    "summary": "List durable campaign runs, newest first",
+                    "parameters": [
+                        {"name":"limit","in":"query","schema":{"type":"integer","minimum":0}},
+                        {"name":"campaign_id","in":"query","schema":{"type":"string"}},
+                        {"name":"status","in":"query","schema":{"type":"string"}}
+                    ],
+                    "responses": {"200":{"description":"Campaign run history"},"403":{"description":"Role forbidden"}}
+                }
+            },
+            "/api/v1/asmodeus/campaign-runs/{id}": {
+                "get": {"summary":"Get campaign progress, snapshotted plan and report",
+                    "responses":{"200":{"description":"Campaign run details"},"404":{"description":"Run not found"},"403":{"description":"Role forbidden"}}}
+            },
+            "/api/v1/asmodeus/campaign-runs/{id}/cancel": {
+                "post": {"summary":"Request cancellation of the current stage; stop subsequent stages",
+                    "responses":{"202":{"description":"Cancellation requested; cleanup not yet confirmed"},"200":{"description":"Worker inactive"},"404":{"description":"Run not found"},"403":{"description":"Role forbidden"}}}
+            },
+            "/api/v1/asmodeus/campaign-runs/{id}/resume": {
+                "post": {"summary":"Explicitly resume interrupted or cancelled runs, with confirmed prior cleanup",
+                    "responses":{"202":{"description":"Resume admitted"},"409":{"description":"Run not resumable, worker active or prior cleanup unconfirmed"},"404":{"description":"Run not found"},"403":{"description":"Role forbidden"},"500":{"description":"Snapshot persistence failed"}}}
             },
             "/api/v1/asmodeus/reports/compliance": {
                 "get": {

@@ -11,7 +11,9 @@
 mod api;
 mod audit_store;
 mod campaign;
+mod campaign_execution;
 mod campaign_http;
+mod campaign_run;
 mod catalog;
 mod config;
 mod dispatch;
@@ -60,6 +62,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         })
         .await?;
+    let interrupted = state
+        .campaign_runs
+        .update(|store| Ok(store.recover_interrupted()))
+        .await?;
+    if interrupted > 0 {
+        tracing::warn!(
+            interrupted,
+            "campaign runs interrupted by restart; resume explicitly"
+        );
+    }
     let (_watchdog, initial_probes) =
         watchdog::spawn_watchdog(state.registry.clone(), config.watchdog_interval_sec);
     let _scheduler =

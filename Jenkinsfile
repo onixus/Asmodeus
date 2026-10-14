@@ -21,7 +21,7 @@ def RUST_IMAGE = 'rust:1-bookworm'
 // registry — кэш крейтов; target — под VirtioFS обязан быть томом; tools —
 // под cargo-audit/cargo-deny, т.к. /usr/local/cargo/bin трогать нельзя.
 def RUST_DOCKER_ARGS = '-v asmodeus-cargo-home:/usr/local/cargo/registry' +
-                       ' -v asmodeus-cargo-target:/build-target' +
+                       ' -v ' + env.JOB_NAME.replaceAll('[^a-zA-Z0-9_.-]', '-') + '-cargo-target:/build-target' +
                        ' -v asmodeus-cargo-tools:/cargo-tools'
 
 pipeline {
@@ -120,6 +120,20 @@ pipeline {
                         '''
                     }
                 }
+                stage('Feature acceptance') {
+                    steps {
+                        sh '''
+                            set -eu
+                            command -v python3 >/dev/null 2>&1 || {
+                                apt-get update -qq && apt-get install -y -qq python3
+                            }
+                            cargo build --workspace --locked
+                            python3 scripts/feature_smoke.py
+                            python3 scripts/campaign_smoke.py
+                        '''
+                    }
+                }
+
             }
         }
 

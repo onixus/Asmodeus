@@ -23,6 +23,8 @@ use crate::webhook::WebhookDispatcher;
 pub struct AppState {
     pub catalog: Arc<Catalog>,
     pub runs: Arc<Mutex<HashMap<RunId, crate::run_control::ActiveRun>>>,
+    pub campaign_runs: crate::persistent::Persistent<crate::campaign_run::CampaignRunStore>,
+    pub campaign_controls: Arc<Mutex<HashMap<String, crate::run_control::CampaignControl>>>,
     counter: Arc<AtomicU64>,
     run_namespace: String,
     pub audit_public_key: [u8; 32],
@@ -102,9 +104,16 @@ impl AppState {
             .fill(&mut namespace)
             .map_err(|_| io::Error::other("run ID entropy unavailable"))?;
         let run_namespace = namespace.iter().map(|byte| format!("{byte:02x}")).collect();
+        let campaign_runs = crate::persistent::Persistent::load(
+            state_dir.as_ref().map(|p| p.join("campaign_runs.json")),
+            crate::campaign_run::CampaignRunStore::default,
+        )?;
+        campaign_runs.read().unwrap().validate()?;
         Ok(AppState {
             catalog: Arc::new(catalog),
             runs: Arc::new(Mutex::new(HashMap::new())),
+            campaign_runs,
+            campaign_controls: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(AtomicU64::new(1)),
             run_namespace,
             audit_public_key,
@@ -126,6 +135,11 @@ impl AppState {
     pub(crate) fn next_run_id(&self) -> RunId {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         RunId::new(format!("run_{}_{n:016x}", self.run_namespace))
+    }
+
+    pub(crate) fn next_campaign_run_id(&self) -> String {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        format!("crun_{}_{n:016x}", self.run_namespace)
     }
 }
 

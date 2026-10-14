@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 
 use crate::api::{caller_role, ApiError};
 use crate::dto::RunScenarioPayload;
-use crate::execution::start_scenario;
 use crate::state::AppState;
 
 pub(crate) async fn register_campaign(
@@ -123,20 +122,14 @@ pub(crate) async fn run_campaign(
     Path(id): Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let role = caller_role(&headers)?;
-    if !role.can(asmodeus_common::Capability::RunRedTeam)
-        && !role.can(asmodeus_common::Capability::InjectChaos)
-    {
-        return Err(ApiError::Forbidden("role may not launch attack campaigns"));
-    }
     let payload: RunScenarioPayload = if body.is_empty() {
         RunScenarioPayload::default()
     } else {
         serde_json::from_slice(&body)
             .map_err(|e| ApiError::Unprocessable(format!("invalid JSON body: {e}")))?
     };
-
     let campaign = state
         .campaigns
         .read()
@@ -144,131 +137,117 @@ pub(crate) async fn run_campaign(
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("campaign not found: {id}")))?
         .clone();
-
-    if payload.background {
-        return Err(ApiError::Unprocessable(
-            "background campaigns are unsupported; use background scenario runs".into(),
-        ));
-    }
-    for step in &campaign.steps {
-        if let Some(entry) = state.catalog.get(&step.scenario_id) {
-            if !role.can(entry.category.required_capability()) {
-                return Err(ApiError::Forbidden(
-                    "role may not execute every campaign category",
-                ));
-            }
-        }
-    }
-
-    let mut step_results = Vec::new();
-    let mut aggregate = asmodeus_telemetry::Aggregate::default();
-    let total_steps = campaign.steps.len();
-
-    // Execute the kill-chain stage by stage. A failing stage stops the chain
-    // (later stages typically depend on earlier ones) but never discards the
-    // work already done: the stage is recorded as failed and the partial
-    // report is returned to the caller instead of a bare error.
-    for step in &campaign.steps {
-        let entry = match state.catalog.get(&step.scenario_id) {
-            Some(entry) => entry,
-            None => {
-                step_results.push(crate::campaign::CampaignStepResult {
-                    step_order: step.order,
-                    scenario_id: step.scenario_id.clone(),
-                    run_id: String::new(),
-                    status: "SCENARIO_NOT_FOUND".to_string(),
-                    mttd_ms: 0,
-                    mttr_ms: 0,
-                    detected: false,
-                    evidence: None,
-                });
-                break;
-            }
-        };
-
-        let mut admitted_id = String::new();
-        let result = async {
-            let started = start_scenario(
-                &state,
-                entry,
-                role,
-                payload.target_override.as_deref(),
-                payload.timeout_sec,
-            )
-            .await?;
-            admitted_id = started.id.to_string();
-            started
-                .completion
-                .await
-                .map_err(|e| crate::execution::ExecutionError::Dispatch(e.to_string()))?
-        }
-        .await;
-        match result {
-            Ok((run_id, _exec, audit_rec)) => {
-                aggregate.record_run(&audit_rec);
-
-                let completed = audit_rec.status == "COMPLETED";
-                step_results.push(crate::campaign::CampaignStepResult {
-                    step_order: step.order,
-                    scenario_id: step.scenario_id.clone(),
-                    run_id: run_id.to_string(),
-                    status: audit_rec.status,
-                    mttd_ms: audit_rec.measurements.mttd_ms,
-                    mttr_ms: audit_rec.measurements.mttr_ms,
-                    detected: audit_rec.measurements.blue_team_detected,
-                    evidence: audit_rec.evidence,
-                });
-                if !completed {
-                    break;
-                }
-            }
-            Err(_) => {
-                step_results.push(crate::campaign::CampaignStepResult {
-                    step_order: step.order,
-                    scenario_id: step.scenario_id.clone(),
-                    run_id: admitted_id,
-                    status: "FAILED".to_string(),
-                    mttd_ms: 0,
-                    mttr_ms: 0,
-                    detected: false,
-                    evidence: None,
-                });
-                break;
-            }
-        }
-    }
-
-    // Aggregate only over the stages that actually completed, so a partial
-    // chain does not dilute the means with zero-valued failed stages.
-    let successful_steps = step_results
-        .iter()
-        .filter(|r| r.status == "COMPLETED")
-        .count();
-    let mean_mttd = aggregate.mean_mttd_ms();
-    let mean_mttr = aggregate.mean_mttr_ms();
-    let detection_rate_pct = aggregate.detection_rate_pct();
-    let recovery_speed_pct = aggregate.recovery_speed_pct();
-    let resilience_score =
-        asmodeus_telemetry::resilience_score(detection_rate_pct, recovery_speed_pct);
-
-    let result = crate::campaign::CampaignRunResult {
+    let now = asmodeus_telemetry::current_utc_iso8601();
+    let run = crate::campaign_run::CampaignRun {
+        id: state.next_campaign_run_id(),
         campaign_id: campaign.id,
         campaign_name: campaign.name,
-        initiator: role.as_str().to_string(),
+        initiator: role.as_str().into(),
         target_override: payload.target_override,
-        total_steps,
-        successful_steps,
-        step_results,
-        mean_mttd_ms: mean_mttd,
-        mean_mttr_ms: mean_mttr,
-        detection_rate_pct,
-        recovery_speed_pct,
-        resilience_score,
-        confirmed_feedback_runs: aggregate.feedback_received,
-        simulated_runs: aggregate.simulated_runs,
-        pending_feedback_runs: aggregate.pending_feedback,
-        timestamp_utc: asmodeus_telemetry::current_utc_iso8601(),
+        timeout_sec: payload.timeout_sec,
+        steps: campaign.steps,
+        status: crate::campaign_run::QUEUED.into(),
+        step_results: Vec::new(),
+        superseded_results: Vec::new(),
+        resume_count: 0,
+        created_utc: now.clone(),
+        updated_utc: now,
     };
+    crate::campaign_execution::authorize(&state, &run, role)?;
+    let (admitted, worker) =
+        crate::campaign_execution::launch(state.clone(), run, role, false).await?;
+    if payload.background {
+        return Ok((StatusCode::ACCEPTED, Json(json!(admitted))));
+    }
+    let finished = worker
+        .await
+        .map_err(|e| ApiError::Internal(format!("campaign worker: {e}")))??;
+    let mut report = json!(crate::campaign_execution::report(&state, &finished));
+    report["id"] = json!(finished.id);
+    report["status"] = json!(finished.status);
+    Ok((StatusCode::OK, Json(report)))
+}
 
-    Ok(Json(json!(result)))
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct ListCampaignRunsQuery {
+    limit: Option<usize>,
+    campaign_id: Option<String>,
+    status: Option<String>,
+}
+
+pub(crate) async fn list_campaign_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<ListCampaignRunsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !caller_role(&headers)?.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view campaign runs"));
+    }
+    let store = state.campaign_runs.read().unwrap();
+    let runs = store.list(
+        query.limit,
+        query.campaign_id.as_deref(),
+        query.status.as_deref(),
+    );
+    Ok(Json(
+        json!({"total": store.len(), "returned": runs.len(), "runs": runs}),
+    ))
+}
+
+fn get_campaign_run(
+    state: &AppState,
+    id: &str,
+) -> Result<crate::campaign_run::CampaignRun, ApiError> {
+    state
+        .campaign_runs
+        .read()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("campaign run not found: {id}")))
+}
+
+pub(crate) async fn campaign_run_details(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    if !caller_role(&headers)?.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view campaign runs"));
+    }
+    let run = get_campaign_run(&state, &id)?;
+    let mut value = json!(run);
+    value["worker_active"] = json!(state.campaign_controls.lock().unwrap().contains_key(&id));
+    value["report"] = json!(crate::campaign_execution::report(&state, &run));
+    Ok(Json(value))
+}
+
+pub(crate) async fn cancel_campaign_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let role = caller_role(&headers)?;
+    let run = get_campaign_run(&state, &id)?;
+    crate::campaign_execution::authorize(&state, &run, role)?;
+    if crate::campaign_execution::request_cancel(&state, &id) {
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"id": id, "status": "CANCELLATION_REQUESTED", "cleanup_confirmed": false})),
+        ))
+    } else {
+        Ok((StatusCode::OK, Json(json!(run))))
+    }
+}
+
+pub(crate) async fn resume_campaign_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let role = caller_role(&headers)?;
+    let run = get_campaign_run(&state, &id)?;
+    crate::campaign_execution::authorize(&state, &run, role)?;
+    let (admitted, _worker) = crate::campaign_execution::launch(state, run, role, true).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!(admitted))))
 }

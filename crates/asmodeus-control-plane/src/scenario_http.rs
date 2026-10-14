@@ -232,8 +232,26 @@ pub(crate) async fn abort_all(
         active.cancel();
         requested.push(id.to_string());
     }
+    drop(runs);
+    // Stop campaign admission as well, including the gap between two stages.
+    let campaign_ids: Vec<_> = state
+        .campaign_controls
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let mut campaigns = Vec::new();
+    for id in campaign_ids {
+        let run = state.campaign_runs.read().unwrap().get(&id).cloned();
+        if run.is_some_and(|r| crate::campaign_execution::authorize(&state, &r, role).is_ok())
+            && crate::campaign_execution::request_cancel(&state, &id)
+        {
+            campaigns.push(id);
+        }
+    }
     Ok(Json(
-        json!({ "status":"CANCELLATION_REQUESTED", "run_ids":requested, "runs_cleared":0 }),
+        json!({ "status":"CANCELLATION_REQUESTED", "run_ids":requested, "campaign_run_ids":campaigns, "runs_cleared":0 }),
     ))
 }
 
