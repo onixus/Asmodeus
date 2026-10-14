@@ -1,0 +1,19 @@
+[package]
+name = "asmodeus-netchaos-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Net-chaos eBPF/TC datapath. Forbidden on the syscall path: alloc, tokio, String."
+
+[[bin]]
+name = "asmodeus-netchaos-ebpf"
+path = "src/main.rs"
+
+# aya-ebpf is linked ONLY for the bpf target (bpfel/bpfeb, nightly + build-std).
+# The stable host build — the default `cargo build --workspace`, on macOS
+# included — compiles `main.rs` to an empty stub and never touches aya-ebpf, so
+# the whole workspace stays offline and green off a Linux stand. See src/main.rs.
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = { version = "=0.1.1", default-features = false }

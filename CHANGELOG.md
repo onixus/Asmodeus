@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+### Добавлено — eBPF/TC net-chaos бэкенд, 2026-10-14
+
+- Крейт `asmodeus-netchaos-ebpf`: ядерная программа egress-`SchedClassifier`
+  (bpfel-unknown-none) и общий map-ABI `ChaosRule`. Собирается только под
+  `target_arch = "bpf"`; хост-сборка — пустой stub, стабильный workspace зелёный.
+- `AyaTcBackend` (`asmodeus-runner`, фича `ebpf`): реальный aya/TC attach вместо
+  заглушки. Поднимает `RLIMIT_MEMLOCK`, грузит объект из
+  `ASMODEUS_NETCHAOS_BPF_OBJECT`, навешивает `clsact` + классификатор на egress,
+  пишет один вооружённый `ChaosRule`; `revert` разоружает map и отцепляет
+  программу. Пакет роняется (`TC_ACT_SHOT`) только для цели в тест-блоке по
+  жребию `bpf_get_prandom_u32`, иначе `TC_ACT_OK` (fail-open).
+- Jenkins (`Jenkinsfile.linux`): стадия `netchaos BPF ELF` собирает и
+  фингерпринтит `dist/asmodeus-netchaos.bpf.o` (nightly, bpf-linker, LLVM 23);
+  `clippy --features ebpf` и юнит-тесты разбора CIDR идут на Linux-ноде.
+- На macOS бэкенд не компилируется по построению; живой attach проверяется на
+  стенде с `CAP_BPF`/`CAP_NET_ADMIN`.
+- Датапут разбирает Ethernet II (untagged IPv4): aya-бэкенд требует тест-интерфейс
+  с L2 (veth/dummy) и отклоняет loopback с внятной ошибкой до attach (у `lo` нет
+  L2-заголовка, а дроп на нём задел бы посторонний localhost-трафик). Loopback
+  остаётся только для off-stand демо на `SimBackend`.
+
+
 ### Добавлено — постоянный реестр раннеров, 2026-10-06
 
 - `ASMODEUS_STATE_DIR/runners.json`: сохранение конфигурации, drain/resume и

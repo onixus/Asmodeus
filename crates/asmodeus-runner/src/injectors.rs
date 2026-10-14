@@ -517,7 +517,10 @@ mod tests {
 
     #[test]
     fn all_scenarios_inject_and_clean_up() {
-        let scenario_ids = [
+        // `mut` is used by the cfg'd push below; under `ebpf` that push is
+        // compiled out, so the binding would look unused.
+        #[allow(unused_mut)]
+        let mut scenario_ids = vec![
             "RANSOMWARE_CANARY_SPIKE",
             "K8S_ESCAPE_SIMULATION",
             "C2_BEACONING_SIMULATION",
@@ -526,10 +529,16 @@ mod tests {
             "PERSISTENCE_CRON_CANARY",
             "DATA_EXFILTRATION_CANARY",
             "DEFENSE_IMPAIRMENT_CANARY",
-            "LATENCY_SPIKE_VM",
             "AGENT_CRASH_ENDPOINT",
-            "DNS_RPZ_SINKHOLE_DROP",
         ];
+        // LATENCY_SPIKE_VM and DNS_RPZ_SINKHOLE_DROP drive the platform
+        // net-chaos backend. On the default build that is the in-process
+        // SimBackend, which injects synthetically and satisfies the assertions
+        // below. Under `--features ebpf` it is the real aya/TC backend, which
+        // needs a compiled BPF object and CAP_BPF on a Linux stand — exercised
+        // there, not in this unit test.
+        #[cfg(not(feature = "ebpf"))]
+        scenario_ids.extend(["LATENCY_SPIKE_VM", "DNS_RPZ_SINKHOLE_DROP"]);
 
         for id in scenario_ids {
             let poly = Polygon::new(&format!("inj-{id}"));

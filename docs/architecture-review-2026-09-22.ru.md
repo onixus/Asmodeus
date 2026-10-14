@@ -71,7 +71,7 @@ lease/deadline, blocking worker, один активный run, отдельны
 | P1 | JWT tenant/permissions не разделяют глобальное состояние | Tenant isolation до multi-tenant deployment |
 | P1 | Webhooks best-effort, registry временный, нет idempotency key и HA | Outbox, идемпотентность и транзакционное хранилище при масштабировании |
 | P1 | Кампания — синхронная цепочка отдельных runs | Durable campaign workflow для resume/background целой цепочки |
-| P2 | Linux eBPF attach — заглушка; ClickHouse только экспорт; feedback заявлен отправителем | Linux/CAP_BPF acceptance, доставка телеметрии и аттестация внешних датчиков |
+| P2 | Linux eBPF/TC attach реализован на aya (egress-классификатор `asmodeus-netchaos-ebpf`, synthetic loss в тест-блоке) и собирается в CI; живой прогон под `CAP_BPF`/`CAP_NET_ADMIN` подтверждается на стенде, а не в этом обзоре. ClickHouse только экспорт; feedback заявлен отправителем | Приёмка attach на ноде с CAP_BPF, доставка телеметрии и аттестация внешних датчиков |
 
 ## Проверки первоначального этапа
 

@@ -214,7 +214,12 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
   тест-сегменте. INV-0 blast radius для сети (`net_target_in_scope` в DSL:
   только loopback + RFC 5737 TEST-NET), бюджетные лимиты и `NetChaosSession` с
   обязательным откатом через `Drop` (D7). Кросс-платформенный `SimBackend`
-  покрыт тестами; aya/TC-бэкенд — за фича-флагом `ebpf` на Linux-стенде.
+  покрыт тестами; `AyaTcBackend` (фича-флаг `ebpf`, Linux) грузит компилируемый
+  объект `asmodeus-netchaos-ebpf` через `aya::Bpf`, навешивает `clsact` +
+  egress-`SchedClassifier` и пишет вооружённый `ChaosRule` в map. Ядерная
+  программа роняет пакет только для цели внутри тест-блока по жребию
+  `bpf_get_prandom_u32` (synthetic loss), иначе пропускает (fail-open); `revert`
+  разоружает правило и отцепляет классификатор.
 
 - **Реестр раннеров и gRPC Heartbeat** (`asmodeus-control-plane::registry`, `asmodeus-runner::service`):
   потокобезопасный `RunnerRegistry` для управления распределёнными зондами с поддержкой
@@ -238,6 +243,8 @@ Toolchain закреплён в `rust-toolchain.toml` (1.90, с `rustfmt` и `cl
   - Отчётность кибер-устойчивости NIST CSF 2.0 (Govern, Identify, Protect, Detect, Respond, Recover) с расчётом SLA (`TARGET_MTTR_MS`), тактическим анализом и генерацией документов в форматах Markdown и JSON (`GET /reports/resilience`, `GET /runs/:id/report`, `asmodeus report`).
   - Политика защиты цепочки поставок (`deny.toml`) для строгой проверки лицензий и безопасности зависимостей в CI. 110 тестов green.
 
-Осталось (только на Linux-стенде): собрать компилируемый BPF-объект и подключить
-его к aya/TC-бэкенду (`clsact` + `SchedClassifier`, `--features ebpf`) — на
-macOS не проверяется (§8).
+eBPF/TC-бэкенд реализован: крейт `asmodeus-netchaos-ebpf` (bpfel-unknown-none)
+собирается и фингерпринтится в CI как `dist/asmodeus-netchaos.bpf.o`, aya/TC
+attach подключён под `--features ebpf`. Живой прогон требует `CAP_BPF`/
+`CAP_NET_ADMIN` и проверяется на стенде; на macOS модуль не компилируется по
+построению (§8) — сборка по умолчанию использует `SimBackend`.
