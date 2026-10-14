@@ -1,0 +1,79 @@
+name: asmodeus-apex
+
+x-asmodeus: &asmodeus
+  image: asmodeus-stand:local
+  build:
+    context: ..
+    dockerfile: stand/Dockerfile
+  restart: unless-stopped
+  networks: [stand]
+
+services:
+  # Ключи Ed25519: сценарные (control-plane подписывает план, runner пинит
+  # публичный ключ) и аудитные. Генерируются один раз в постоянный том и
+  # переживают передеплои — иначе журнал аудита, подписанный прежним ключом,
+  # перестал бы проверяться и control-plane отказался бы стартовать.
+  asmodeus-keys:
+    <<: *asmodeus
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        for k in scenario audit; do
+          [ -f "/secrets/$$k.key" ] || asmodeus keygen --name "/secrets/$$k"
+        done
+        mkdir -p /data/audit /data/state
+    volumes:
+      - asmodeus-secrets:/secrets
+      - asmodeus-data:/data
+
+  asmodeus-runner:
+    <<: *asmodeus
+    command: ["asmodeus-runner"]
+    environment:
+      ASMODEUS_RUNNER_LISTEN: 0.0.0.0:8850
+      ASMODEUS_RUNNER_TRUSTED_KEY: /secrets/scenario.pub
+    volumes:
+      - asmodeus-secrets:/secrets:ro
+    depends_on:
+      asmodeus-keys:
+        condition: service_completed_successfully
+
+  asmodeus-control-plane:
+    <<: *asmodeus
+    command: ["asmodeus-control-plane"]
+    environment:
+      APEX_GATEWAY_URL: ${APEX_GATEWAY_URL:?required}
+      APEX_SERVICE_URL: ${APEX_SERVICE_URL:?required}
+      ASMODEUS_LISTEN: 0.0.0.0:8842
+      ASMODEUS_RUNNER_ENDPOINT: http://asmodeus-runner:8850
+      ASMODEUS_SCENARIO_SIGNING_KEY: /secrets/scenario.key
+      # Новый путь, а не /data/audit.jsonl: тот журнал подписан временным
+      # demo-ключом прежних версий, и с постоянным ключом его не проверить.
+      ASMODEUS_AUDIT_LOG: /data/audit/audit.jsonl
+      ASMODEUS_AUDIT_SIGNING_KEY: /secrets/audit.key
+      ASMODEUS_STATE_DIR: /data/state
+      ASMODEUS_JWT_SECRET: ${STAND_JWT_SECRET:?STAND_JWT_SECRET не задан}
+    volumes:
+      - asmodeus-data:/data
+      - asmodeus-secrets:/secrets:ro
+    ports:
+      - "127.0.0.1:8842:8842"
+    depends_on:
+      asmodeus-runner:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8842/healthz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 6
+
+
+networks:
+  stand:
+
+volumes:
+  asmodeus-data:
+  asmodeus-secrets:
