@@ -51,6 +51,7 @@ def main():
         })
         log = (work / "control-plane.log").open("w+")
         process = None
+        processes = []
         prefix = "/api/v1/asmodeus"
 
         def request(method, path, body=None, expected=200):
@@ -74,7 +75,15 @@ def main():
 
         def start():
             proc = subprocess.Popen([BIN / "asmodeus-control-plane"], env=env, stdout=log, stderr=log)
-            until(ready)
+            # Retain ownership before readiness checks can fail, so a slow
+            # startup never leaves a daemon behind after the temporary directory
+            # is removed. Distinguish process exit from an HTTP timeout.
+            processes.append(proc)
+            def process_ready():
+                if proc.poll() is not None:
+                    raise RuntimeError(f"control-plane exited before readiness: {proc.returncode}")
+                return ready()
+            until(process_ready, seconds=20)
             return proc
 
         def cli(action, *args):
@@ -129,6 +138,7 @@ def main():
             data["version"] = 999
             snapshot.write_text(json.dumps(data))
             process = subprocess.Popen([BIN / "asmodeus-control-plane"], env=env, stdout=log, stderr=log)
+            processes.append(process)
             assert process.wait(timeout=3) != 0
             print("PASS: durable campaign process death/restart, signed audit, explicit single resume, no completed-stage replay, immutable campaign plan, CLI history/status, rejected unsupported snapshot")
         except Exception:
@@ -137,9 +147,14 @@ def main():
             print(log.read())
             raise
         finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                process.wait(timeout=3)
+            for proc in processes:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
             log.close()
 
 
