@@ -20,9 +20,22 @@ pub(crate) enum ApiError {
     Unauthorized(&'static str),
     Forbidden(&'static str),
     NotFound(String),
+    Conflict(String),
     Unprocessable(String),
     Internal(String),
     BadGateway(String),
+}
+
+impl From<crate::campaign_execution::CampaignError> for ApiError {
+    fn from(error: crate::campaign_execution::CampaignError) -> Self {
+        use crate::campaign_execution::CampaignError;
+        match error {
+            CampaignError::NotFound(message) => Self::NotFound(message),
+            CampaignError::Forbidden(message) => Self::Forbidden(message),
+            CampaignError::Conflict(message) => Self::Conflict(message),
+            CampaignError::Persistence(message) => Self::Internal(message),
+        }
+    }
 }
 
 impl From<crate::execution::ExecutionError> for ApiError {
@@ -53,6 +66,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Unauthorized(m) => write!(f, "Unauthorized: {m}"),
             ApiError::Forbidden(m) => write!(f, "Forbidden: {m}"),
             ApiError::NotFound(m) => write!(f, "Not Found: {m}"),
+            ApiError::Conflict(m) => write!(f, "Conflict: {m}"),
             ApiError::Unprocessable(m) => write!(f, "Unprocessable: {m}"),
             ApiError::Internal(m) => write!(f, "Internal: {m}"),
             ApiError::BadGateway(m) => write!(f, "Bad Gateway: {m}"),
@@ -68,6 +82,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.to_string()),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.to_string()),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),

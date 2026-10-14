@@ -21,7 +21,7 @@ def RUST_IMAGE = 'rust:1-bookworm'
 // registry — кэш крейтов; target — под VirtioFS обязан быть томом; tools —
 // под cargo-audit/cargo-deny, т.к. /usr/local/cargo/bin трогать нельзя.
 def RUST_DOCKER_ARGS = '-v asmodeus-cargo-home:/usr/local/cargo/registry' +
-                       ' -v asmodeus-cargo-target:/build-target' +
+                       ' -v ' + env.JOB_NAME.replaceAll('[^a-zA-Z0-9_.-]', '-') + '-cargo-target:/build-target' +
                        ' -v asmodeus-cargo-tools:/cargo-tools'
 
 pipeline {
@@ -120,6 +120,20 @@ pipeline {
                         '''
                     }
                 }
+                stage('Feature acceptance') {
+                    steps {
+                        sh '''
+                            set -eu
+                            command -v python3 >/dev/null 2>&1 || {
+                                apt-get update -qq && apt-get install -y -qq python3
+                            }
+                            cargo build --workspace --locked
+                            python3 scripts/feature_smoke.py
+                            python3 scripts/campaign_smoke.py
+                        '''
+                    }
+                }
+
             }
         }
 
@@ -137,6 +151,13 @@ pipeline {
             steps {
                 sh '''
                     set -eu
+                    # Audit tools use the toolchain already bundled in the image.
+                    # Build/format/test still use the repository's pinned 1.90;
+                    # metadata-only auditing must not reinstall that toolchain
+                    # (including clippy/rustfmt) in a new stage container.
+                    RUSTUP_TOOLCHAIN=$(cd /tmp && rustup default | cut -d' ' -f1)
+                    export RUSTUP_TOOLCHAIN
+                    rustc --version
                     export PATH=/cargo-tools/bin:$PATH
                     # Сборка инструментов не должна пачкать общий /build-target.
                     CARGO_TARGET_DIR=/tmp/asmodeus-tools-target

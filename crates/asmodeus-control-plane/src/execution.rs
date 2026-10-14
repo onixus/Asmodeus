@@ -55,6 +55,19 @@ pub(crate) async fn start_scenario(
     target: Option<&str>,
     timeout_sec: Option<u32>,
 ) -> Result<StartedRun, ExecutionError> {
+    start_scenario_identified(state, entry, role, target, timeout_sec, state.next_run_id()).await
+}
+
+/// Campaigns persist this ID before admission, linking even interrupted stages
+/// to their authoritative signed scenario audit.
+pub(crate) async fn start_scenario_identified(
+    state: &AppState,
+    entry: &ScenarioEntry,
+    role: Role,
+    target: Option<&str>,
+    timeout_sec: Option<u32>,
+    id: RunId,
+) -> Result<StartedRun, ExecutionError> {
     if !role.can(entry.category.required_capability()) {
         return Err(ExecutionError::Forbidden);
     }
@@ -100,7 +113,6 @@ pub(crate) async fn start_scenario(
             "in-process-sim".into()
         }
     });
-    let id = state.next_run_id();
     let record = AuditRecord {
         run_id: id.to_string(),
         scenario_id: entry.id.clone(),

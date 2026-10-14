@@ -315,6 +315,50 @@ enum CampaignsAction {
         /// Optional target override or environment tag (e.g. k8s_workload)
         #[arg(long)]
         target: Option<String>,
+        #[arg(long)]
+        background: bool,
+        #[arg(long)]
+        timeout_sec: Option<u32>,
+        #[arg(long, default_value = "red_team")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Query durable campaign run history.
+    Runs {
+        #[arg(long)]
+        campaign_id: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Show a durable campaign run and its report.
+    Status {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Cancel a campaign's current stage and stop subsequent stages.
+    Cancel {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "red_team")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
+    /// Explicitly resume an interrupted or cancelled campaign.
+    Resume {
+        #[arg(long)]
+        id: String,
         #[arg(long, default_value = "red_team")]
         role: String,
         #[arg(long, default_value = "http://127.0.0.1:8842")]
@@ -845,16 +889,63 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             CampaignsAction::Run {
                 id,
                 target,
+                background,
+                timeout_sec,
                 role,
                 url,
             } => {
                 let endpoint = format!("{url}/api/v1/asmodeus/campaigns/{id}/run");
                 let client = reqwest::blocking::Client::new();
-                let mut req = client.post(&endpoint).header("X-Apex-Role", &role);
-                if let Some(t) = target {
-                    req = req.json(&json!({ "target_override": t }));
-                }
+                let req = client.post(&endpoint).header("X-Apex-Role", &role)
+                    .json(&json!({"target_override": target, "background": background, "timeout_sec": timeout_sec}));
                 call(req, "campaigns run")?;
+            }
+            CampaignsAction::Runs {
+                campaign_id,
+                status,
+                limit,
+                role,
+                url,
+            } => {
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client
+                        .get(format!("{url}/api/v1/asmodeus/campaign-runs"))
+                        .header("X-Apex-Role", &role)
+                        .query(&[
+                            ("campaign_id", campaign_id),
+                            ("status", status),
+                            ("limit", limit.map(|l| l.to_string())),
+                        ]),
+                    "campaigns runs",
+                )?;
+            }
+            CampaignsAction::Status { id, role, url } => {
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client
+                        .get(format!("{url}/api/v1/asmodeus/campaign-runs/{id}"))
+                        .header("X-Apex-Role", &role),
+                    "campaigns status",
+                )?;
+            }
+            CampaignsAction::Cancel { id, role, url } => {
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client
+                        .post(format!("{url}/api/v1/asmodeus/campaign-runs/{id}/cancel"))
+                        .header("X-Apex-Role", &role),
+                    "campaigns cancel",
+                )?;
+            }
+            CampaignsAction::Resume { id, role, url } => {
+                let client = reqwest::blocking::Client::new();
+                call(
+                    client
+                        .post(format!("{url}/api/v1/asmodeus/campaign-runs/{id}/resume"))
+                        .header("X-Apex-Role", &role),
+                    "campaigns resume",
+                )?;
             }
         },
     }

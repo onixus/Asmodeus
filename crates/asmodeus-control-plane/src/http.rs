@@ -2,7 +2,10 @@
 //! enforced here from `asmodeus_common::rbac` — never delegated to the gateway
 //! (D5). Signature verification and the INV-0 gate run before any execution.
 
-use crate::campaign_http::{delete_campaign, list_campaigns, register_campaign, run_campaign};
+use crate::campaign_http::{
+    campaign_run_details, cancel_campaign_run, delete_campaign, list_campaign_runs, list_campaigns,
+    register_campaign, resume_campaign_run, run_campaign,
+};
 use crate::reporting::{
     export_audit_trail, get_compliance_report, get_resilience_report, get_run_report,
 };
@@ -73,6 +76,19 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/asmodeus/campaigns/:id", delete(delete_campaign))
         .route("/api/v1/asmodeus/campaigns/:id/run", post(run_campaign))
+        .route("/api/v1/asmodeus/campaign-runs", get(list_campaign_runs))
+        .route(
+            "/api/v1/asmodeus/campaign-runs/:id",
+            get(campaign_run_details),
+        )
+        .route(
+            "/api/v1/asmodeus/campaign-runs/:id/cancel",
+            post(cancel_campaign_run),
+        )
+        .route(
+            "/api/v1/asmodeus/campaign-runs/:id/resume",
+            post(resume_campaign_run),
+        )
         .route(
             "/api/v1/asmodeus/schedules",
             get(list_schedules).post(create_schedule),

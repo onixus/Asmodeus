@@ -110,11 +110,18 @@ def main():
                 except (OSError, AssertionError):
                     return False
 
+            def runner_ready():
+                # The control plane can become ready before the runner binds.
+                try:
+                    return request("GET", "/api/v1/asmodeus/runners/default-runner/ping").get("healthy", False)
+                except (OSError, AssertionError):
+                    return False
+
             prefix = "/api/v1/asmodeus"
             start("asmodeus-runner")
             cp = start("asmodeus-control-plane")
             until(ready)
-            until(lambda: request("GET", prefix + "/runners/default-runner/ping").get("healthy", False))
+            until(runner_ready)
 
             def launch(scenario, options=None):
                 return request("POST", prefix + f"/scenarios/{scenario}/run", options or {})
@@ -179,6 +186,49 @@ def main():
             assert request("GET", prefix + "/telemetry/mttd")["mean_mttr_ms"] == 80
             request("POST", prefix + "/campaigns", {"id": "SMOKE-CAMPAIGN", "name": "Smoke", "description": "smoke",
                     "steps": [{"order": 1, "scenario_id": "SMOKE-SHORT"}]}, 201)
+            # Durable campaigns cancel the live runner, preserve its signed audit,
+            # then resume with a new stage ID after confirmed cleanup.
+            request("POST", prefix + "/campaigns", {"id": "SMOKE-DURABLE", "name": "Durable", "description": "smoke",
+                    "steps": [{"order": 1, "scenario_id": "SMOKE-LONG"}, {"order": 2, "scenario_id": "SMOKE-SHORT"}]}, 201)
+            admitted = request("POST", prefix + "/campaigns/SMOKE-DURABLE/run", {"background": True}, 202)
+            campaign_path = prefix + f"/campaign-runs/{admitted['id']}"
+            current = until(lambda: r if (r := request("GET", campaign_path))["step_results"] else None)
+            stage_id = current["step_results"][0]["run_id"]
+            until(lambda: (canary / stage_id / "canary_000.docx").exists())
+            request("POST", campaign_path + "/cancel", {}, 202)
+            cancelled = until(lambda: r if (r := request("GET", campaign_path))["status"] == "CANCELLED" and not r["worker_active"] else None)
+            assert cancelled["step_results"][0]["evidence"]["cleanup_confirmed"]
+            assert not (canary / stage_id).exists()
+            request("DELETE", prefix + "/campaigns/SMOKE-DURABLE")
+            request("POST", campaign_path + "/resume", {}, 202)
+            finished = until(lambda: r if (r := request("GET", campaign_path))["status"] == "COMPLETED" else None)
+            assert finished["step_results"][0]["run_id"] != stage_id
+            assert finished["superseded_results"][0]["run_id"] == stage_id
+            assert finished["report"]["successful_steps"] == 2
+            feedback_stage = finished["step_results"][0]["run_id"]
+            request("POST", prefix + f"/runs/{feedback_stage}/feedback",
+                    {"detected": True, "contained": True, "mttd_ms": 40, "mttr_ms": 80})
+
+            def assert_campaign_feedback():
+                details = request("GET", campaign_path)
+                report = details["report"]
+                assert report["mean_mttd_ms"] == 40 and report["mean_mttr_ms"] == 80
+                assert report["confirmed_feedback_runs"] == 1
+                stage = report["step_results"][0]
+                assert stage["mttd_ms"] == 40 and stage["mttr_ms"] == 80
+                assert stage["detected"] and stage["evidence"]["feedback_received"]
+                assert stage["evidence"]["contained"]
+                assert details["step_results"] == report["step_results"]
+
+            assert_campaign_feedback()
+            for action in ["status", "runs"]:
+                args = [BIN / "asmodeus", "campaigns", action, "--url", base]
+                if action == "status":
+                    args += ["--id", admitted["id"]]
+                else:
+                    args += ["--campaign-id", "SMOKE-DURABLE", "--status", "COMPLETED", "--limit", "1"]
+                reply = json.loads(subprocess.run(args, env=env, check=True, capture_output=True, text=True).stdout)
+                assert reply["status"] == "COMPLETED" if action == "status" else reply["returned"] == 1
             request("POST", prefix + "/schedules", {"id": "SMOKE-SCHEDULE", "name": "Smoke", "scenario_id": "SMOKE-SHORT",
                     "interval_sec": 600, "baseline_mttd_ms":20, "enabled": True}, 201)
             job = until(lambda: (j if j["last_run_id"] else None)
@@ -249,6 +299,7 @@ def main():
             assert restored["status"] == "INTERRUPTED" and not restored["evidence"]["cleanup_confirmed"]
             assert request("GET", prefix + f"/runs/{completed['run_id']}/verify")["verified"]
             assert request("GET", prefix + "/telemetry/mttd")["mean_mttr_ms"] == 80
+            assert_campaign_feedback()  # fresh report survives a real control-plane restart
             assert not request("GET", prefix + "/schedules/SMOKE-SCHEDULE")["schedule"]["enabled"]
             request("GET", prefix + "/schedules/SCHED-BASE-RANSOMWARE", expected=404)
             assert any(c["id"] == "SMOKE-CAMPAIGN" for c in request("GET", prefix + "/campaigns")["campaigns"])
@@ -257,7 +308,7 @@ def main():
             assert timed_out["status"] == "TIMED_OUT" and timed_out["evidence"]["cleanup_confirmed"]
             simulated = launch("LATENCY_SPIKE_VM")
             assert simulated["evidence"]["execution_mode"] == "simulated"
-            assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 2
+            assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 3
             for record in request("GET", prefix + "/runners"):
                 request("DELETE", prefix + f"/runners/{record['id']}")
             stop(cp)
@@ -271,7 +322,7 @@ def main():
             cp = start("asmodeus-control-plane")
             assert cp.wait(timeout=8) != 0
             assert registry_path.read_text() == "{corrupt"
-            print("PASS: persistent runner registry, drain/restart, due schedule after restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
+            print("PASS: persistent runner registry, drain/restart, due schedule after restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, campaign feedback report/restart, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
         except Exception:
             for log in logs:
                 log.flush()

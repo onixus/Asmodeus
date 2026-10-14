@@ -2081,3 +2081,115 @@ async fn failed_initial_probe_releases_scheduler_without_tight_retries() {
     scheduler.abort();
     watchdog.abort();
 }
+
+#[tokio::test]
+async fn campaign_report_uses_feedback_revisions_after_reload() {
+    let _lock = DISPATCH_TEST_LOCK.lock().await;
+    let _guard = EnvGuard::clear(ALL_CLIENT_TLS_VARS);
+    let polygon = asmodeus_testkit::Polygon::new("campaign-feedback-report");
+    std::fs::create_dir_all(polygon.dir()).unwrap();
+    let audit_path = polygon.dir().join("audit.jsonl");
+    let campaign_path = polygon.dir().join("campaign_runs.json");
+    let endpoint = start_mock_runner().await;
+    let mut state = AppState::with_runner(Catalog::seeded(), Some(endpoint)).unwrap();
+    state.audit = crate::audit_store::AuditStore::load(Some(audit_path.clone())).unwrap();
+    state.campaign_runs =
+        crate::persistent::Persistent::load(Some(campaign_path.clone()), Default::default).unwrap();
+    let app = router(state.clone());
+    let prefix = "/api/v1/asmodeus";
+    let (status, _) = feature_request(
+        &app,
+        "POST",
+        &format!("{prefix}/campaigns"),
+        "red_team",
+        json!({
+            "id":"REPORT-FEEDBACK", "name":"Report feedback", "description":"regression",
+            "steps":[{"order":1,"scenario_id":"RANSOMWARE_CANARY_SPIKE"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, launched) = feature_request(
+        &app,
+        "POST",
+        &format!("{prefix}/campaigns/REPORT-FEEDBACK/run"),
+        "red_team",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let campaign_id = launched["id"].as_str().unwrap();
+    let scenario_id = launched["step_results"][0]["run_id"].as_str().unwrap();
+    let persisted = state
+        .campaign_runs
+        .read()
+        .unwrap()
+        .get(campaign_id)
+        .unwrap()
+        .clone();
+    assert!(!persisted.step_results[0].detected);
+    let details_path = format!("{prefix}/campaign-runs/{campaign_id}");
+    let feedback_path = format!("{prefix}/runs/{scenario_id}/feedback");
+    let (status, _) = feature_request(
+        &app,
+        "POST",
+        &feedback_path,
+        "secops",
+        json!({
+            "detected":true,"contained":true,"mttd_ms":42,"mttr_ms":84
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    async fn assert_report(app: &Router, path: &str, detected: bool) {
+        let (status, details) = feature_request(app, "GET", path, "auditor", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let expected_mttd = if detected { 42 } else { 0 };
+        let expected_mttr = if detected { 84 } else { 0 };
+        let report = &details["report"];
+        assert_eq!(report["confirmed_feedback_runs"], 1);
+        assert_eq!(report["mean_mttd_ms"], expected_mttd);
+        assert_eq!(report["mean_mttr_ms"], expected_mttr);
+        assert_eq!(report["successful_steps"], 1);
+        let step = &report["step_results"][0];
+        assert_eq!(step["mttd_ms"], expected_mttd);
+        assert_eq!(step["mttr_ms"], expected_mttr);
+        assert_eq!(step["detected"], detected);
+        assert_eq!(step["evidence"]["feedback_received"], true);
+        assert_eq!(step["evidence"]["contained"], detected);
+        assert_eq!(details["step_results"], report["step_results"]);
+    }
+    assert_report(&app, &details_path, true).await;
+    // Preserve the execution checkpoint: feedback must never rewrite orchestration.
+    assert_eq!(
+        state
+            .campaign_runs
+            .read()
+            .unwrap()
+            .get(campaign_id)
+            .unwrap(),
+        &persisted
+    );
+    let mut restored = state.clone();
+    restored.audit = crate::audit_store::AuditStore::load(Some(audit_path)).unwrap();
+    restored.campaign_runs =
+        crate::persistent::Persistent::load(Some(campaign_path), Default::default).unwrap();
+    assert!(restored
+        .audit
+        .get(scenario_id)
+        .unwrap()
+        .verify_with_key(&restored.audit_public_key));
+    assert_report(&router(restored), &details_path, true).await;
+    // A corrected negative feedback revision must also replace the prior report.
+    let (status, _) = feature_request(
+        &app,
+        "POST",
+        &feedback_path,
+        "secops",
+        json!({"detected":false,"contained":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_report(&app, &details_path, false).await;
+}
