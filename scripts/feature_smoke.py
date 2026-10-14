@@ -205,6 +205,22 @@ def main():
             assert finished["step_results"][0]["run_id"] != stage_id
             assert finished["superseded_results"][0]["run_id"] == stage_id
             assert finished["report"]["successful_steps"] == 2
+            feedback_stage = finished["step_results"][0]["run_id"]
+            request("POST", prefix + f"/runs/{feedback_stage}/feedback",
+                    {"detected": True, "contained": True, "mttd_ms": 40, "mttr_ms": 80})
+
+            def assert_campaign_feedback():
+                details = request("GET", campaign_path)
+                report = details["report"]
+                assert report["mean_mttd_ms"] == 40 and report["mean_mttr_ms"] == 80
+                assert report["confirmed_feedback_runs"] == 1
+                stage = report["step_results"][0]
+                assert stage["mttd_ms"] == 40 and stage["mttr_ms"] == 80
+                assert stage["detected"] and stage["evidence"]["feedback_received"]
+                assert stage["evidence"]["contained"]
+                assert details["step_results"] == report["step_results"]
+
+            assert_campaign_feedback()
             for action in ["status", "runs"]:
                 args = [BIN / "asmodeus", "campaigns", action, "--url", base]
                 if action == "status":
@@ -283,6 +299,7 @@ def main():
             assert restored["status"] == "INTERRUPTED" and not restored["evidence"]["cleanup_confirmed"]
             assert request("GET", prefix + f"/runs/{completed['run_id']}/verify")["verified"]
             assert request("GET", prefix + "/telemetry/mttd")["mean_mttr_ms"] == 80
+            assert_campaign_feedback()  # fresh report survives a real control-plane restart
             assert not request("GET", prefix + "/schedules/SMOKE-SCHEDULE")["schedule"]["enabled"]
             request("GET", prefix + "/schedules/SCHED-BASE-RANSOMWARE", expected=404)
             assert any(c["id"] == "SMOKE-CAMPAIGN" for c in request("GET", prefix + "/campaigns")["campaigns"])
@@ -291,7 +308,7 @@ def main():
             assert timed_out["status"] == "TIMED_OUT" and timed_out["evidence"]["cleanup_confirmed"]
             simulated = launch("LATENCY_SPIKE_VM")
             assert simulated["evidence"]["execution_mode"] == "simulated"
-            assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 2
+            assert request("GET", prefix + "/telemetry/mttd")["confirmed_feedback_runs"] == 3
             for record in request("GET", prefix + "/runners"):
                 request("DELETE", prefix + f"/runners/{record['id']}")
             stop(cp)
@@ -305,7 +322,7 @@ def main():
             cp = start("asmodeus-control-plane")
             assert cp.wait(timeout=8) != 0
             assert registry_path.read_text() == "{corrupt"
-            print("PASS: persistent runner registry, drain/restart, due schedule after restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
+            print("PASS: persistent runner registry, drain/restart, due schedule after restart, storage failure, no fallback after deletion, corrupt startup, drain/resume CLI and live heartbeat, signed DSL parameters, async cancel/cleanup, feedback, campaign feedback report/restart, restart recovery, catalogs, scheduled feedback/drift, missed detection, outcome write recovery, timeout, simulation provenance")
         except Exception:
             for log in logs:
                 log.flush()

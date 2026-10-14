@@ -314,9 +314,16 @@ async fn execute(
 
 pub(crate) fn report(state: &AppState, run: &CampaignRun) -> CampaignRunResult {
     let mut aggregate = asmodeus_telemetry::Aggregate::default();
-    for step in &run.step_results {
+    let mut step_results = run.step_results.clone();
+    for step in &mut step_results {
         if let Some(record) = state.audit.get(&step.run_id) {
+            // Use the same signed revision for summary and stage feedback.
+            // The durable execution checkpoint remains independent of feedback.
             aggregate.record_run(&record);
+            step.mttd_ms = record.measurements.mttd_ms;
+            step.mttr_ms = record.measurements.mttr_ms;
+            step.detected = record.measurements.blue_team_detected;
+            step.evidence = record.evidence;
         }
     }
     CampaignRunResult {
@@ -325,12 +332,11 @@ pub(crate) fn report(state: &AppState, run: &CampaignRun) -> CampaignRunResult {
         initiator: run.initiator.clone(),
         target_override: run.target_override.clone(),
         total_steps: run.steps.len(),
-        successful_steps: run
-            .step_results
+        successful_steps: step_results
             .iter()
             .filter(|r| r.status == COMPLETED)
             .count(),
-        step_results: run.step_results.clone(),
+        step_results,
         mean_mttd_ms: aggregate.mean_mttd_ms(),
         mean_mttr_ms: aggregate.mean_mttr_ms(),
         detection_rate_pct: aggregate.detection_rate_pct(),

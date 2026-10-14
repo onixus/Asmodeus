@@ -216,9 +216,11 @@ pub(crate) async fn campaign_run_details(
         return Err(ApiError::Forbidden("role may not view campaign runs"));
     }
     let run = get_campaign_run(&state, &id)?;
+    let report = crate::campaign_execution::report(&state, &run);
     let mut value = json!(run);
+    value["step_results"] = json!(report.step_results);
     value["worker_active"] = json!(state.campaign_controls.lock().unwrap().contains_key(&id));
-    value["report"] = json!(crate::campaign_execution::report(&state, &run));
+    value["report"] = json!(report);
     Ok(Json(value))
 }
 
