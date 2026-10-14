@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "product_id": "asmodeus",
+  "deployment_mode": "docker",
+  "required_environment": [
+    "STAND_JWT_SECRET"
+  ],
+  "gateway_url_variable": "APEX_GATEWAY_URL",
+  "service_url_variable": "APEX_SERVICE_URL",
+  "installation_guide": "docs/APEX_DEPLOYMENT.md",
+  "compose_file": "stand/compose.apex.yml",
+  "health_service": "asmodeus-control-plane"
+}
