@@ -151,6 +151,13 @@ pipeline {
             steps {
                 sh '''
                     set -eu
+                    # Audit tools use the toolchain already bundled in the image.
+                    # Build/format/test still use the repository's pinned 1.90;
+                    # metadata-only auditing must not reinstall that toolchain
+                    # (including clippy/rustfmt) in a new stage container.
+                    RUSTUP_TOOLCHAIN=$(cd /tmp && rustup default | cut -d' ' -f1)
+                    export RUSTUP_TOOLCHAIN
+                    rustc --version
                     export PATH=/cargo-tools/bin:$PATH
                     # Сборка инструментов не должна пачкать общий /build-target.
                     CARGO_TARGET_DIR=/tmp/asmodeus-tools-target
