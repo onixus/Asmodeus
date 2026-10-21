@@ -362,7 +362,7 @@ pub(crate) async fn validate_scenario_manifest(
                 "category": manifest.metadata.category,
                 "api_version": manifest.api_version,
                 "legacy": manifest.is_legacy(),
-                "mitre_technique": manifest.metadata.mitre_technique,
+                "mitre_technique": manifest.primary_technique().map(|t| t.id),
                 // Effective fidelity — a legacy manifest is reported as
                 // `unspecified` no matter what it self-declares.
                 "fidelity": manifest.effective_fidelity().as_str(),

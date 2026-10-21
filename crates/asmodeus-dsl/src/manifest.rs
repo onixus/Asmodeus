@@ -182,11 +182,40 @@ impl ScenarioManifest {
         if self.is_legacy() {
             return Fidelity::Unspecified;
         }
-        self.metadata
+        let declared = self
+            .metadata
             .fidelity
             .as_deref()
             .and_then(Fidelity::parse)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Fidelity describes the executor, not an author-supplied assertion.
+        // All other supported actions only create/read synthetic markers.
+        let implemented = match self.spec.action.action_type.as_str() {
+            "synthetic_canary_encrypt" | "latency_spike" => Fidelity::Behavioral,
+            _ => Fidelity::MarkerOnly,
+        };
+        declared.min(implemented)
+    }
+
+    /// Stable primary projection used by API, dispatch and signed audit records.
+    pub fn primary_technique(&self) -> Option<crate::MitreTechnique> {
+        self.metadata
+            .mitre_techniques
+            .as_ref()
+            .and_then(|refs| refs.first())
+            .map(|r| r.technique_id.as_str())
+            .or(self.metadata.mitre_technique.as_deref())
+            .and_then(lookup_technique)
+    }
+
+    fn technique_fidelity(&self, id: &str, ceiling: Fidelity) -> Fidelity {
+        if self.spec.action.action_type == "synthetic_canary_encrypt"
+            && id.eq_ignore_ascii_case("T1486")
+        {
+            ceiling
+        } else {
+            ceiling.min(Fidelity::MarkerOnly)
+        }
     }
 
     /// The scenario's technique references, resolved to a uniform list.
@@ -201,11 +230,20 @@ impl ScenarioManifest {
         if let Some(ref refs) = self.metadata.mitre_techniques {
             return refs
                 .iter()
-                .map(|r| TechniqueRef::new(r.technique_id.clone(), r.fidelity.min(ceiling)))
+                .map(|r| {
+                    TechniqueRef::new(
+                        r.technique_id.clone(),
+                        r.fidelity
+                            .min(self.technique_fidelity(&r.technique_id, ceiling)),
+                    )
+                })
                 .collect();
         }
         match self.metadata.mitre_technique {
-            Some(ref id) => vec![TechniqueRef::new(id.clone(), ceiling)],
+            Some(ref id) => vec![TechniqueRef::new(
+                id.clone(),
+                self.technique_fidelity(id, ceiling),
+            )],
             None => Vec::new(),
         }
     }
@@ -222,6 +260,7 @@ pub enum ManifestValidationError {
     DurationLimitExceeded(u32),
     UnknownMitreTechnique(String),
     InvalidFidelity(String),
+    InvalidMitreMapping,
     BudgetLimitExceeded(String),
     ParseError(String),
 }
@@ -246,6 +285,7 @@ impl std::fmt::Display for ManifestValidationError {
                 write!(f, "max duration {d}s exceeds maximum limit of 300s")
             }
             Self::UnknownMitreTechnique(t) => write!(f, "unknown MITRE technique '{t}'"),
+            Self::InvalidMitreMapping => write!(f, "mitre_technique must match the first mitre_techniques entry"),
             Self::InvalidFidelity(v) => write!(
                 f,
                 "invalid fidelity '{v}', expected 'marker_only', 'behavioral' or 'unspecified'"
@@ -322,6 +362,18 @@ pub fn validate_manifest(manifest: &ScenarioManifest) -> Result<(), ManifestVali
                     r.technique_id.clone(),
                 ));
             }
+        }
+    }
+
+    if let (Some(primary), Some(refs)) = (
+        &manifest.metadata.mitre_technique,
+        &manifest.metadata.mitre_techniques,
+    ) {
+        if !refs
+            .first()
+            .is_some_and(|r| r.technique_id.eq_ignore_ascii_case(primary))
+        {
+            return Err(ManifestValidationError::InvalidMitreMapping);
         }
     }
 
@@ -592,6 +644,57 @@ spec:
     }"#;
 
     #[test]
+    fn marker_executor_cannot_self_declare_behavioral() {
+        for action in [
+            "c2_beacon",
+            "k8s_escape_probe",
+            "credential_canary",
+            "log_tamper_canary",
+            "persistence_canary",
+            "exfiltration_canary",
+            "watchdog_probe",
+        ] {
+            let mut m = parse_and_validate_manifest(V2_JSON).unwrap();
+            m.spec.action.action_type = action.into();
+            m.spec.action.parameters.clear();
+            validate_manifest(&m).unwrap();
+            assert_eq!(m.effective_fidelity(), Fidelity::MarkerOnly, "{action}");
+            assert!(m
+                .resolved_technique_refs()
+                .iter()
+                .all(|r| !r.fidelity.claims_behavioral()));
+        }
+    }
+
+    #[test]
+    fn behavioral_executor_cannot_promote_unrelated_techniques() {
+        let m = parse_and_validate_manifest(&V2_JSON.replace("T1486", "T1003")).unwrap();
+        assert_eq!(m.effective_fidelity(), Fidelity::Behavioral);
+        assert!(m
+            .resolved_technique_refs()
+            .iter()
+            .all(|r| !r.fidelity.claims_behavioral()));
+    }
+
+    #[test]
+    fn multi_technique_primary_projection_is_consistent() {
+        let mut m = parse_and_validate_manifest(V2_JSON).unwrap();
+        assert_eq!(m.primary_technique().unwrap().id, "T1486");
+        m.metadata.mitre_technique = Some("T1003".into());
+        assert_eq!(
+            validate_manifest(&m),
+            Err(ManifestValidationError::InvalidMitreMapping)
+        );
+        m.metadata.mitre_technique = Some("t1486".into());
+        validate_manifest(&m).unwrap();
+        m.metadata.mitre_techniques = Some(Vec::new());
+        assert_eq!(
+            validate_manifest(&m),
+            Err(ManifestValidationError::InvalidMitreMapping)
+        );
+    }
+
+    #[test]
     fn v1alpha2_is_accepted_and_honours_declared_fidelity() {
         let m = parse_and_validate_manifest(V2_JSON).unwrap();
         assert_eq!(m.api_version, API_VERSION_V1ALPHA2);
@@ -634,7 +737,10 @@ spec:
     fn invalid_declared_fidelity_is_rejected() {
         // Only the metadata-level string field (not the strongly-typed
         // per-technique fidelity, which serde would reject as a parse error).
-        let bad = V2_JSON.replace("\"fidelity\": \"behavioral\",", "\"fidelity\": \"weaponized\",");
+        let bad = V2_JSON.replace(
+            "\"fidelity\": \"behavioral\",",
+            "\"fidelity\": \"weaponized\",",
+        );
         assert!(matches!(
             parse_and_validate_manifest(&bad),
             Err(ManifestValidationError::InvalidFidelity(_))

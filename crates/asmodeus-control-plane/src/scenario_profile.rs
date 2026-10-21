@@ -177,9 +177,7 @@ pub const PROFILES: &[ProfileDef] = &[
         platforms: &[Platform::Linux],
         preconditions: "writable canary directory",
         safety_scope: CANARY_FS_SCOPE,
-        expected_observables: &[
-            "creation then truncation of a synthetic canary audit log",
-        ],
+        expected_observables: &["creation then truncation of a synthetic canary audit log"],
         limitations:
             "creates and truncates its own synthetic canary log; removes NO real indicators or \
              production logs — not behavioural coverage of T1070",

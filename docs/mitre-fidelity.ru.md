@@ -51,7 +51,10 @@ INV-0 (ARCHITECTURE.md §0): Asmodeus **имитирует** технику, а 
 - `asmodeus.io/v1alpha2` — текущая схема. Может нести `fidelity` и список
   `mitre_techniques` (мульти-техника, per-technique fidelity, primary — первый).
   Объявленная per-technique достоверность зажимается сверху эффективной
-  достоверностью манифеста.
+  достоверностью манифеста и фактически реализованным action: marker-инъекторы
+  не повышаются декларацией `behavioral`; behavioral T1486 доступен только
+  `synthetic_canary_encrypt`. Primary-проекция берётся из первого элемента
+  `mitre_techniques`; противоречащий ему `mitre_technique` отклоняется.
 
 Оба значения принимаются валидатором; все ссылки на техники (и одиночная
 `mitre_technique`, и список) обязаны разрешаться в таксономии.
