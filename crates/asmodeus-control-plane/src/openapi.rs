@@ -33,6 +33,20 @@ pub fn generate_spec() -> Value {
                 }
             },
             "schemas": {
+                "ProcedureCorpus": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["version", "attack_version", "denominator", "procedures"],
+                    "properties": {
+                        "version": {"type": "string", "const": asmodeus_dsl::PROCEDURE_CORPUS_VERSION},
+                        "attack_version": {"type": "string", "const": asmodeus_dsl::ATTACK_VERSION},
+                        "denominator": {"type": "integer", "const": asmodeus_dsl::PROCEDURE_SLOT_DENOMINATOR},
+                        "procedures": {
+                            "type": "array", "minItems": 6, "maxItems": 6,
+                            "items": {"$ref": "#/components/schemas/ProcedureDefinition"}
+                        }
+                    }
+                },
                 "RunEvidence": {
                     "type":"object", "properties": {
                         "execution_mode":{"type":"string","enum":["runner","simulated","legacy_unverified"]},
@@ -215,6 +229,20 @@ pub fn generate_spec() -> Value {
                     "summary": "List all attack and chaos scenarios in catalog",
                     "responses": {
                         "200": { "description": "List of scenario metadata entries" }
+                    }
+                }
+            },
+            "/api/v1/asmodeus/procedures": {
+                "get": {
+                    "summary": "Inspect the versioned procedure corpus",
+                    "description": "Requires ViewReports. All six slots remain visible with UNSUPPORTED availability. Planned behavioral mode does not establish runtime execution or coverage. No procedure run endpoint is exposed.",
+                    "responses": {
+                        "200": {
+                            "description": "Fixed-denominator procedure manifest, including unsupported gaps",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProcedureCorpus"}}}
+                        },
+                        "401": {"description": "Missing or invalid authenticated APEX identity"},
+                        "403": {"description": "Role lacks ViewReports"}
                     }
                 }
             },
@@ -525,6 +553,85 @@ pub fn generate_spec() -> Value {
             }
         }
     });
+    let procedure_schemas = json!({
+        "ProcedureDefinition": {
+            "type": "object", "additionalProperties": false,
+            "required": ["id", "revision", "technique_id", "name", "planned_mode", "availability", "unsupported_reason", "gap", "preconditions", "variants", "budget", "scope", "cleanup"],
+            "properties": {
+                "id": {"type": "string"},
+                "revision": {"type": "integer", "minimum": 1},
+                "technique_id": {"type": "string"},
+                "name": {"type": "string"},
+                "planned_mode": {"type": "string", "enum": ["marker", "replay", "behavioral"], "description": "Intended mode only; does not attest runtime execution."},
+                "availability": {"type": "string", "const": "UNSUPPORTED"},
+                "unsupported_reason": {"type": "string", "minLength": 1},
+                "gap": {"type": ["string", "null"]},
+                "preconditions": {"type": "array", "items": {"type": "string"}},
+                "variants": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/components/schemas/ProcedureVariant"}},
+                "budget": {"$ref": "#/components/schemas/ProcedureBudget"},
+                "scope": {"$ref": "#/components/schemas/ProcedureScope"},
+                "cleanup": {"$ref": "#/components/schemas/ProcedureCleanup"},
+            }
+        },
+        "ProcedureVariant": {
+            "type": "object", "additionalProperties": false,
+            "required": ["kind", "behavior", "expected"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["positive", "benign_control"]},
+                "behavior": {"type": "string"},
+                "expected": {"$ref": "#/components/schemas/ProcedureExpectation"},
+            }
+        },
+        "ProcedureExpectation": {
+            "type": "object", "additionalProperties": false,
+            "required": ["observables", "product_effect", "verification"],
+            "properties": {
+                "observables": {"type": "array", "items": {"type": "string"}},
+                "product_effect": {"type": "string"},
+                "verification": {"type": "string"},
+            }
+        },
+        "ProcedureBudget": {
+            "type": "object", "additionalProperties": false,
+            "required": ["timeout_seconds", "max_processes", "max_requests", "max_bytes", "cancellation_required", "kill_switch_required"],
+            "properties": {
+                "timeout_seconds": {"type": "integer", "minimum": 0},
+                "max_processes": {"type": "integer", "minimum": 0},
+                "max_requests": {"type": "integer", "minimum": 0},
+                "max_bytes": {"type": "integer", "minimum": 0},
+                "cancellation_required": {"type": "boolean"},
+                "kill_switch_required": {"type": "boolean"},
+            }
+        },
+        "ProcedureScope": {
+            "type": "object", "additionalProperties": false,
+            "required": ["namespace_prefix", "canary_path", "endpoint_allowlist", "synthetic_data_only", "real_credentials_forbidden"],
+            "properties": {
+                "namespace_prefix": {"type": "string"},
+                "canary_path": {"type": "string"},
+                "endpoint_allowlist": {"type": "array", "items": {"type": "string"}},
+                "synthetic_data_only": {"type": "boolean"},
+                "real_credentials_forbidden": {"type": "boolean"},
+            }
+        },
+        "ProcedureCleanup": {
+            "type": "object", "additionalProperties": false,
+            "required": ["required_after", "requirements"],
+            "properties": {
+                "required_after": {"type": "array", "items": {"type": "string"}},
+                "requirements": {"type": "array", "items": {"type": "string"}},
+            }
+        },
+    });
+    spec["components"]["schemas"]
+        .as_object_mut()
+        .expect("schemas")
+        .extend(
+            procedure_schemas
+                .as_object()
+                .expect("procedure schemas")
+                .clone(),
+        );
     for (path, item) in spec["paths"].as_object_mut().expect("paths schema") {
         if path.contains("{id}") {
             item["parameters"] =
@@ -537,6 +644,68 @@ pub fn generate_spec() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn procedures_document_read_only_versioned_unsupported_manifest() {
+        let spec = generate_spec();
+        let path = &spec["paths"]["/api/v1/asmodeus/procedures"];
+        assert!(path["get"].is_object());
+        assert!(path["post"].is_null());
+        assert_eq!(
+            path["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProcedureCorpus"
+        );
+        assert!(path["get"]["responses"]["401"].is_object());
+        assert!(path["get"]["responses"]["403"].is_object());
+        let corpus = &spec["components"]["schemas"]["ProcedureCorpus"];
+        assert_eq!(corpus["properties"]["denominator"]["const"], 6);
+        assert_eq!(corpus["properties"]["procedures"]["minItems"], 6);
+        assert_eq!(corpus["properties"]["procedures"]["maxItems"], 6);
+        assert_eq!(
+            spec["components"]["schemas"]["ProcedureDefinition"]["properties"]["availability"]
+                ["const"],
+            "UNSUPPORTED"
+        );
+        assert!(spec["paths"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|path| !path.starts_with("/api/v1/asmodeus/procedures/")));
+    }
+
+    #[test]
+    fn procedure_manifest_fields_match_openapi_contract() {
+        fn check_fields(spec: &Value, schema: &Value, value: &Value) {
+            if let Some(reference) = schema["$ref"].as_str() {
+                check_fields(spec, spec.pointer(&reference[1..]).unwrap(), value);
+                return;
+            }
+            if let Some(expected) = schema.get("const") {
+                assert_eq!(value, expected);
+            }
+            if let Some(object) = value.as_object() {
+                let properties = schema["properties"].as_object().unwrap();
+                assert_eq!(
+                    object.keys().collect::<Vec<_>>(),
+                    properties.keys().collect::<Vec<_>>()
+                );
+                for (field, value) in object {
+                    check_fields(spec, &properties[field], value);
+                }
+            } else if let Some(items) = value.as_array() {
+                for value in items {
+                    check_fields(spec, &schema["items"], value);
+                }
+            }
+        }
+        let spec = generate_spec();
+        let manifest = serde_json::to_value(asmodeus_dsl::procedure_corpus()).unwrap();
+        check_fields(
+            &spec,
+            &spec["components"]["schemas"]["ProcedureCorpus"],
+            &manifest,
+        );
+    }
 
     #[test]
     fn test_openapi_spec_generation() {

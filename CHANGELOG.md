@@ -7,6 +7,27 @@
 
 ## [Unreleased]
 
+### Добавлено — локальные fixtures S02, 2026-10-21
+
+- Offline CLI `procedure-local` исполняет HTTP beacon, DNS pattern и передачу
+  синтетических данных только к собственным loopback receivers, с парными
+  benign controls, deadline и отменой Ctrl-C.
+- Attempt evidence фиксирует реальные receipts и cleanup; постоянная запись
+  владения запрещает повторное использование ID, экспорт не затирает файл.
+- Evidence локальный и неподписанный; не подтверждает protection и не меняет
+  `UNSUPPORTED` в корпусе v1. SIGKILL cleanup остаётся `NOT_VERIFIED`.
+
+### Добавлено — контракт корпуса процедур S02, 2026-10-21
+
+- Версионированный корпус из шести обязательных procedure slots с парными
+  positive/benign controls, preconditions, ожидаемыми observable, scope,
+  бюджетами и требованиями cleanup; знаменатель не сокращается из-за gaps.
+- Read-only `GET /api/v1/asmodeus/procedures` с RBAC `ViewReports`, OpenAPI
+  и команда CLI `asmodeus procedures`.
+- Все slots явно `UNSUPPORTED`: определения не запускают действий и не
+  подтверждают behavioral/prevention coverage. Исполнительные адаптеры,
+  attempt evidence и runtime/crash acceptance остаются частью #27.
+
 ### Исправлено — независимое ревью S01, 2026-10-21
 
 - Fidelity внешнего манифеста ограничена фактическим action и конкретной

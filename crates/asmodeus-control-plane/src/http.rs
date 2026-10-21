@@ -14,7 +14,8 @@ use crate::runner_http::{
 };
 use crate::runs_http::{cancel_run, get_run, list_runs, run_feedback, verify_run};
 use crate::scenario_http::{
-    abort_all, get_scenario, list_scenarios, mitre_matrix, run_scenario, validate_scenario_manifest,
+    abort_all, get_scenario, list_procedures, list_scenarios, mitre_matrix, run_scenario,
+    validate_scenario_manifest,
 };
 use crate::schedules_http::{
     create_schedule, delete_schedule, get_schedule, list_drift_alerts, list_schedules,
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/api/v1/asmodeus/scenarios", get(list_scenarios))
+        .route("/api/v1/asmodeus/procedures", get(list_procedures))
         .route("/api/v1/asmodeus/scenarios/mitre", get(mitre_matrix))
         .route(
             "/api/v1/asmodeus/scenarios/validate",

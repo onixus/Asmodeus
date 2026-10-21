@@ -130,6 +130,7 @@ pipeline {
                             cargo build --workspace --locked
                             python3 scripts/feature_smoke.py
                             python3 scripts/campaign_smoke.py
+                            python3 scripts/procedure_smoke.py
                         '''
                     }
                 }
