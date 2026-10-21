@@ -11,12 +11,17 @@ pub use execution::*;
 pub mod fidelity;
 pub mod manifest;
 pub mod mitre;
+pub mod procedures;
 
 pub use fidelity::{CoverageClass, Fidelity, Platform, TechniqueRef};
 pub use manifest::*;
 pub use mitre::{
     base_technique, is_known_id, lookup_technique, MitreTechnique, ALL_DEFS, ALL_TECHNIQUES,
     ATTACK_VERSION,
+};
+pub use procedures::{
+    corpus_denominator, BenignControl, CandidateRole, CandidateTechnique, Capabilities,
+    ExecutionMode, ProcedureSlot, Requirement, ResourceBudget, CORPUS_VERSION, PROCEDURE_SLOTS,
 };
 
 use asmodeus_common::{ActionNature, RunState};

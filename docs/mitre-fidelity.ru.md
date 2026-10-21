@@ -100,4 +100,5 @@ Fidelity назначена по инъектору, который сценар
   S04 (вместе с campaign acceptance и моделью evidence).
 - Разделённые detection/prevention/containment и доверенная корреляция Blue Team
   feedback — S03.
-- Шесть фиксированных воспроизводимых procedure-slots — S02.
+- Шесть фиксированных воспроизводимых procedure-slots — S02, реализовано:
+  см. [`docs/mitre-fidelity-s02.ru.md`](./mitre-fidelity-s02.ru.md).
