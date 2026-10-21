@@ -7,6 +7,44 @@
 
 ## [Unreleased]
 
+### Исправлено — независимое ревью S02, 2026-10-21
+
+- Стендовые container/runtime slots используют только явно предоставленные
+  canary-сокеты; без endpoint остаются NOT_RUN, без обоих — local-canary.
+- DNS slot отправляет корректный DNS TXT question вместо текстового маркера;
+  corpus поднят до `asmodeus-mitre-wave1-v2`, DNS procedure revision — 2.
+- Бюджет резервируется до записи/отправки, отказ не создаёт canary-файл.
+- Пустой network capture не даёт PASS; behavioral override не повышает
+  marker-only slot. Добавлены регрессионные проверки.
+
+### Добавлено — воспроизводимые процедуры первой MITRE-волны (S02), 2026-10-21
+
+- Фиксированный versioned corpus из шести synthetic-only procedure-slots
+  (`CORPUS_VERSION = "asmodeus-mitre-wave1-v1"`, `asmodeus-dsl::procedures`):
+  container exec (T1609), shell execution (T1059.004), test runtime-socket
+  (T1611 — только precondition/signal, не escape), HTTP beacon (T1071.001),
+  DNS C2 (T1071.004), synthetic transfer (T1041). Каждый slot несёт роль техники,
+  режим, fidelity-потолок, платформы, preconditions, observables, limitations,
+  benign paired control и ресурсный бюджет.
+- Режимы `marker` / `replay` / `behavioral` различимы и ограничивают заявляемую
+  fidelity (marker/replay → indicator-only; behavioral → поведенческий сигнал на
+  loopback-стенде). Неподдерживаемый slot остаётся `NOT_RUN` и **не** удаляется
+  из знаменателя покрытия.
+- Safety-харнесс исполнения (`asmodeus-runner::procedures`): отклонение
+  out-of-scope destination/path/namespace до создания артефактов, timeout,
+  cancellation, kill switch и ресурсный бюджет (поверх `asmodeus-safety`),
+  гарантированный cleanup на success/failure/crash/cancel, уникальный
+  `attempt_id`/каталог (повторный запуск не присваивает чужие артефакты).
+- Сетевые slots делают реальный loopback-round-trip к in-process test-receiver
+  (127.0.0.1, RFC 5737 в scope) без egress наружу; синтетических credentials,
+  разрушения и внешней эксфильтрации нет (INV-0).
+- Attempt/corpus manifest с environment, start/stop, реальными observables и
+  честным `coverage`; эмиттер `ASMODEUS_MITRE_WAVE1=1` (локально) /
+  `=stand` (runtime-стенд). Подписанный аудит-преимидж не затрагивается (S03).
+- Документ `docs/mitre-fidelity-s02.ru.md`; safety negative / cleanup / crash /
+  cancel / re-run тесты. Закрытие зависит от `onixus/unified-platform#45` и
+  независимого reviewer-а.
+
 ### Исправлено — независимое ревью S01, 2026-10-21
 
 - Fidelity внешнего манифеста ограничена фактическим action и конкретной

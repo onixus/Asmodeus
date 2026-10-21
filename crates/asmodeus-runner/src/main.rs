@@ -12,6 +12,7 @@ mod canary;
 mod cpu_budget;
 mod injectors;
 mod netchaos;
+mod procedures;
 mod sandbox;
 mod service;
 
@@ -32,6 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if std::env::var("ASMODEUS_DRY_RUN").is_ok() {
         return dry_run();
+    }
+
+    if std::env::var("ASMODEUS_MITRE_WAVE1").is_ok() {
+        return mitre_wave1_manifest();
     }
 
     let addr: SocketAddr = std::env::var("ASMODEUS_RUNNER_LISTEN")
@@ -85,6 +90,34 @@ fn dry_run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Synthetic network-chaos pass on the reserved test segment (loopback).
     net_chaos_demo();
+    Ok(())
+}
+
+/// Standalone emitter for the MITRE first-wave procedure corpus (S02). Runs
+/// the six-slot corpus once in a local canary environment and prints the honest
+/// run manifest as JSON — the "manifest of executed local procedures" required
+/// by the acceptance criteria. Unsupported slots stay NOT_RUN in the output and
+/// are never dropped from the denominator.
+fn mitre_wave1_manifest() -> Result<(), Box<dyn std::error::Error>> {
+    // `ASMODEUS_MITRE_WAVE1=stand` runs against a fully provisioned runtime
+    // stand via ASMODEUS_MITRE_ADMIN_SOCKET / ASMODEUS_MITRE_RUNTIME_SOCKET.
+    // Missing endpoints stay NOT_RUN; with neither endpoint the manifest
+    // remains local-canary. No mock stand sockets are fabricated.
+    let on_stand = std::env::var("ASMODEUS_MITRE_WAVE1")
+        .map(|v| v.eq_ignore_ascii_case("stand"))
+        .unwrap_or(false);
+    let (manifest, stand) = if on_stand {
+        let opts = procedures::RunOptions::stand()?;
+        let stand = opts.env.stand.as_str();
+        (
+            procedures::run_corpus(&opts, &procedures::CancelToken::new()),
+            stand,
+        )
+    } else {
+        (procedures::run_local_corpus(), "local-canary")
+    };
+    println!("{EXERCISE_TAG_RED_TEAM} asmodeus-runner MITRE wave-1 corpus ({stand})");
+    println!("{}", serde_json::to_string_pretty(&manifest.to_json())?);
     Ok(())
 }
 
