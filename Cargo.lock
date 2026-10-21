@@ -202,6 +202,7 @@ version = "0.1.0"
 dependencies = [
  "asmodeus-common",
  "asmodeus-crypto",
+ "asmodeus-dsl",
  "serde",
  "serde_json",
 ]

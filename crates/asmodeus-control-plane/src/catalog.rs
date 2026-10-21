@@ -8,9 +8,12 @@
 use std::collections::HashMap;
 
 use asmodeus_common::{ActionNature, Category};
+use asmodeus_dsl::fidelity::{Fidelity, TechniqueRef};
 use asmodeus_dsl::mitre::*;
 use asmodeus_dsl::MitreTechnique;
 use ed25519_compact::KeyPair;
+
+use crate::scenario_profile::{profile_for, ScenarioProfile};
 
 /// One entry in the catalog.
 #[derive(Debug, Clone)]
@@ -20,7 +23,17 @@ pub struct ScenarioEntry {
     pub category: Category,
     pub target_path: String,
     pub detector: String,
+    /// Primary technique, kept as the single-technique projection for the
+    /// stable wire JSON / ClickHouse sort key / signed audit preimage.
     pub mitre: Option<MitreTechnique>,
+    /// S01: fidelity at which this scenario exercises its technique(s).
+    pub fidelity: Fidelity,
+    /// S01: full technique mapping (multi-technique), primary first. Each ref
+    /// carries the fidelity, so a marker-only scenario can never be read as
+    /// behavioural/prevention coverage of its technique.
+    pub technique_refs: Vec<TechniqueRef>,
+    /// S01: pinned procedure profile (built-in scenarios only).
+    pub profile: Option<ScenarioProfile>,
     pub severity: String,
     pub description: String,
     pub manifest: Vec<u8>,
@@ -28,6 +41,14 @@ pub struct ScenarioEntry {
     /// Synthetic, deterministic measurements for the MVP (real runs measure).
     pub sim_mttd_ms: u64,
     pub sim_mttr_ms: u64,
+}
+
+impl ScenarioEntry {
+    /// True iff this scenario may contribute to **behavioural** coverage of its
+    /// technique(s). Marker-only / undeclared scenarios never do.
+    pub fn claims_behavioral_coverage(&self) -> bool {
+        self.fidelity.claims_behavioral()
+    }
 }
 
 /// The scenario catalog plus the trusted signing public key.
@@ -130,6 +151,14 @@ impl Catalog {
                 .as_deref()
                 .and_then(asmodeus_dsl::lookup_technique);
 
+            // S01: fidelity and the full technique mapping come from the
+            // manifest. A legacy (v1alpha1) manifest yields `Unspecified` refs
+            // regardless of what it declares, so external scenarios are never
+            // promoted to behavioural coverage without an explicit v1alpha2
+            // declaration. External manifests carry no pinned procedure profile.
+            let fidelity = manifest.effective_fidelity();
+            let technique_refs = manifest.resolved_technique_refs();
+
             let raw_bytes = content.into_bytes();
             let signature = if let Some(ref sk) = self.secret_key {
                 if let Ok(sk_compact) = ed25519_compact::SecretKey::from_slice(sk) {
@@ -148,6 +177,9 @@ impl Catalog {
                 target_path: plan.target_dir,
                 detector: manifest.spec.expected_outcome.detector,
                 mitre,
+                fidelity,
+                technique_refs,
+                profile: None,
                 severity: manifest.metadata.severity,
                 description: manifest.metadata.description.unwrap_or_default(),
                 manifest: raw_bytes,
@@ -192,6 +224,18 @@ impl Catalog {
             typed.spec.expected_outcome.expected_mttd_max_ms = Some(mttd);
             let manifest = serde_json::to_vec(&typed).expect("built-in manifest");
             let signature = kp.sk.sign(&manifest, None).as_ref().to_vec();
+
+            // S01 fidelity profile: every built-in scenario has a pinned
+            // profile (checked by `all_builtins_have_a_profile`). Technique refs
+            // come from the profile, not from `mitre` — so a marker-only
+            // scenario carries marker-only refs even though it still projects a
+            // primary `mitre` technique for the stable wire/audit contract.
+            let profile_def = profile_for(id);
+            let (fidelity, technique_refs, profile) = match profile_def {
+                Some(def) => (def.fidelity, def.technique_refs(), Some(def.to_profile())),
+                None => (Fidelity::Unspecified, Vec::new(), None),
+            };
+
             entries.insert(
                 id.to_string(),
                 ScenarioEntry {
@@ -201,6 +245,9 @@ impl Catalog {
                     target_path: target_path.to_string(),
                     detector: detector.to_string(),
                     mitre,
+                    fidelity,
+                    technique_refs,
+                    profile,
                     severity: severity.to_string(),
                     description: description.to_string(),
                     manifest,
@@ -436,6 +483,9 @@ spec:
         assert_eq!(entry.name, "Dynamic Loaded Canary");
         assert_eq!(entry.detector, "dynamic_detector");
         assert_eq!(entry.mitre.as_ref().unwrap().id, "T1053");
+        // S01: a legacy (v1alpha1) external manifest is read but never promoted.
+        assert_eq!(entry.fidelity, Fidelity::Unspecified);
+        assert!(!entry.claims_behavioral_coverage());
 
         // Parsing alone must never authorize or sign an unsafe manifest.
         for (name, content) in [
@@ -467,5 +517,120 @@ spec:
         }
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    // ---- S01: fidelity model wiring ----
+
+    #[test]
+    fn every_builtin_scenario_has_a_profile_and_declared_fidelity() {
+        let cat = Catalog::seeded();
+        for entry in cat.entries() {
+            assert!(
+                entry.profile.is_some(),
+                "built-in {} is missing an S01 profile",
+                entry.id
+            );
+            // No built-in is left at Unspecified — each is explicitly classified.
+            assert_ne!(
+                entry.fidelity,
+                Fidelity::Unspecified,
+                "built-in {} has undeclared fidelity",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_primary_ref_matches_mitre_projection() {
+        // Semantic parity: the primary technique ref must equal the single
+        // `mitre` projection used by the wire JSON / signed audit.
+        let cat = Catalog::seeded();
+        for entry in cat.entries() {
+            match entry.mitre {
+                Some(m) => {
+                    assert_eq!(
+                        entry.technique_refs.first().map(|r| r.technique_id.as_str()),
+                        Some(m.id),
+                        "{}: primary ref != mitre projection",
+                        entry.id
+                    );
+                }
+                None => assert!(
+                    entry.technique_refs.is_empty(),
+                    "{}: has refs but no mitre projection",
+                    entry.id
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn marker_only_builtins_never_claim_behavioral_coverage() {
+        let cat = Catalog::seeded();
+        for id in [
+            "K8S_ESCAPE_SIMULATION",
+            "CREDENTIAL_ACCESS_CANARY",
+            "C2_BEACONING_SIMULATION",
+            "LOG_TAMPER_CANARY",
+            "PERSISTENCE_CRON_CANARY",
+            "DATA_EXFILTRATION_CANARY",
+            "DEFENSE_IMPAIRMENT_CANARY",
+        ] {
+            let e = cat.get(id).unwrap();
+            assert_eq!(e.fidelity, Fidelity::MarkerOnly, "{id}");
+            assert!(!e.claims_behavioral_coverage(), "{id}");
+            for r in &e.technique_refs {
+                assert!(!r.fidelity.claims_behavioral(), "{id}:{}", r.technique_id);
+            }
+        }
+    }
+
+    #[test]
+    fn every_catalog_technique_id_is_known_to_the_taxonomy() {
+        // CI gate: a stale/mistyped technique anywhere in the catalog fails here.
+        let cat = Catalog::seeded();
+        for entry in cat.entries() {
+            if let Some(m) = entry.mitre {
+                assert!(asmodeus_dsl::is_known_id(m.id), "{}: {}", entry.id, m.id);
+            }
+            for r in &entry.technique_refs {
+                assert!(
+                    asmodeus_dsl::is_known_id(&r.technique_id),
+                    "{}: {}",
+                    entry.id,
+                    r.technique_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v1alpha2_external_manifest_honours_behavioral_fidelity() {
+        let mut cat = Catalog::seeded();
+        let dir = std::env::temp_dir().join(format!("asmo-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{
+            "apiVersion": "asmodeus.io/v1alpha2",
+            "kind": "AttackScenario",
+            "metadata": {
+                "id": "DYN-V2-001", "name": "V2 Behavioral", "category": "red_team",
+                "fidelity": "behavioral", "severity": "high",
+                "mitre_techniques": [{"technique_id": "T1486", "fidelity": "behavioral"}]
+            },
+            "spec": {
+                "target_scope": {"type": "fs", "target_path": "/tmp/asmodeus-canary/x"},
+                "safety": {"max_duration_sec": 30, "cpu_limit_percent": 10},
+                "action": {"nature": "synthetic", "type": "synthetic_canary_encrypt",
+                           "parameters": {"file_count": 10, "chunk_size_kb": 4}},
+                "expected_outcome": {"detector": "ferrum"}
+            }
+        }"#;
+        std::fs::write(dir.join("v2.json"), json).unwrap();
+        assert_eq!(cat.load_from_dir(&dir).unwrap(), 1);
+        let e = cat.get("DYN-V2-001").unwrap();
+        assert_eq!(e.fidelity, Fidelity::Behavioral);
+        assert!(e.claims_behavioral_coverage());
+        assert_eq!(e.technique_refs[0].technique_id, "T1486");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -7,6 +7,31 @@
 
 ## [Unreleased]
 
+### Добавлено — модель fidelity MITRE и честное покрытие (S01), 2026-10-21
+
+- Закреплённая (pinned) таксономия ATT&CK (`ATTACK_VERSION`): техники несут
+  полный набор тактик (`tactics`) и ссылку на родителя (`parent`); добавлены
+  суб-техники (`T1059.004`, `T1071.001`, `T1071.004`, `T1562.001`) и `T1609`.
+  Любой неизвестный ID не проходит валидацию и ловится CI.
+- Модель достоверности сценариев `Fidelity` (`marker_only` / `behavioral` /
+  `unspecified`): marker-only и legacy **никогда** не дают behavioral/prevention
+  покрытия. Семь из восьми атакующих сценариев классифицированы как marker-only
+  по фактическому инъектору.
+- Таблица перехода «старый → новый mapping» с ограничениями и profile каждого
+  built-in сценария (procedure id/revision, платформы, preconditions, scope,
+  observable, limitations) — `scenario_profile.rs`, `docs/mitre-fidelity.ru.md`.
+- Версионирование манифестов: `asmodeus.io/v1alpha2` несёт `fidelity` и
+  мульти-технику `mitre_techniques`; `v1alpha1` читается, но не повышается в
+  доверии (эффективная fidelity — `unspecified`). Изменение подписанного
+  аудит-преимиджа не затрагивается.
+- `/scenarios/mitre` больше не выдаёт упоминание техники за покрытие: добавлены
+  `behavioral_coverage_count`, `marker_only_techniques_count`, per-scenario
+  `fidelity`/`limitations`, `attack_version`. `/scenarios` и `/scenarios/:id`
+  отдают fidelity, профиль и `technique_refs`; CLI `validate` печатает fidelity;
+  отчёт соответствия помечает marker-only контроли (`prevention_eligible`).
+- Границы: реальный protection-gate исполнительного отчёта и приёмка кампаний
+  (S04), корреляция feedback (S03), procedure-slots (S02) — отдельными задачами.
+
 ### Исправлено — безопасность TLS, 2026-10-14
 
 - Обновлён только `rustls` в lockfile: 0.23.45 → 0.23.46, исправляющий

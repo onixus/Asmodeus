@@ -33,6 +33,7 @@ mod run_control;
 mod runner_http;
 mod runs_http;
 mod scenario_http;
+mod scenario_profile;
 mod scheduler;
 mod schedules_http;
 mod state;

@@ -64,6 +64,17 @@ pub(crate) async fn get_compliance_report(
             name: entry.name.to_string(),
             category: entry.category.as_str().to_string(),
             mitre_technique: entry.mitre.map(|m| m.id.to_string()).unwrap_or_default(),
+            fidelity: entry.fidelity.as_str().to_string(),
+            // Per-technique fidelity so a control's prevention eligibility is
+            // judged on the matched technique, not the scenario ceiling.
+            technique_refs: entry
+                .technique_refs
+                .iter()
+                .map(|r| asmodeus_telemetry::ScenarioTechniqueFidelity {
+                    technique_id: r.technique_id.clone(),
+                    fidelity: r.fidelity.as_str().to_string(),
+                })
+                .collect(),
         })
         .collect();
     let report = asmodeus_telemetry::ComplianceReport::generate(&scenario_metas, &records);

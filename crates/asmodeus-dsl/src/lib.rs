@@ -8,11 +8,16 @@
 
 pub mod execution;
 pub use execution::*;
+pub mod fidelity;
 pub mod manifest;
 pub mod mitre;
 
+pub use fidelity::{CoverageClass, Fidelity, Platform, TechniqueRef};
 pub use manifest::*;
-pub use mitre::{lookup_technique, MitreTechnique, ALL_TECHNIQUES};
+pub use mitre::{
+    base_technique, is_known_id, lookup_technique, MitreTechnique, ALL_DEFS, ALL_TECHNIQUES,
+    ATTACK_VERSION,
+};
 
 use asmodeus_common::{ActionNature, RunState};
 

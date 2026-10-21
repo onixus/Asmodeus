@@ -9,7 +9,20 @@ use std::collections::HashMap;
 use asmodeus_common::{ActionNature, Category};
 use serde::{Deserialize, Serialize};
 
+use crate::fidelity::{Fidelity, TechniqueRef};
 use crate::{lookup_technique, net_target_in_scope, path_in_scope};
+
+/// Legacy manifest schema. Read for backward compatibility but never promoted:
+/// any fidelity it self-declares is ignored and capped at
+/// [`Fidelity::Unspecified`] (see [`ScenarioManifest::effective_fidelity`]).
+pub const API_VERSION_V1ALPHA1: &str = "asmodeus.io/v1alpha1";
+
+/// Current manifest schema. May carry a declared `fidelity` and a
+/// `mitre_techniques` list (multi-technique / multi-tactic).
+pub const API_VERSION_V1ALPHA2: &str = "asmodeus.io/v1alpha2";
+
+/// Every manifest `apiVersion` this build accepts.
+pub const SUPPORTED_API_VERSIONS: [&str; 2] = [API_VERSION_V1ALPHA1, API_VERSION_V1ALPHA2];
 
 /// Supported manifest kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +36,12 @@ fn default_severity() -> String {
 }
 
 /// Metadata section of the manifest.
+///
+/// `mitre_technique`/`mitre_tactic` remain the stable single-technique
+/// projection (wire JSON, ClickHouse sort key, signed audit preimage). The
+/// S01 fields — `fidelity` and `mitre_techniques` — are optional and only
+/// honoured for [`API_VERSION_V1ALPHA2`]; in a `v1alpha1` manifest they are
+/// read but never raise trust (see [`ScenarioManifest::effective_fidelity`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestMetadata {
@@ -33,6 +52,14 @@ pub struct ManifestMetadata {
     pub mitre_technique: Option<String>,
     #[serde(default)]
     pub mitre_tactic: Option<String>,
+    /// Declared fidelity string (`marker_only` | `behavioral` | `unspecified`).
+    /// Only honoured for `v1alpha2`; ignored for legacy manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<String>,
+    /// Multi-technique mapping with per-technique fidelity. Only honoured for
+    /// `v1alpha2`. When present the first entry is the primary technique.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mitre_techniques: Option<Vec<TechniqueRef>>,
     #[serde(default = "default_severity")]
     pub severity: String,
     #[serde(default)]
@@ -138,6 +165,52 @@ pub struct ScenarioManifest {
     pub spec: ManifestSpec,
 }
 
+impl ScenarioManifest {
+    /// Whether this manifest uses the legacy (`v1alpha1`) schema.
+    pub fn is_legacy(&self) -> bool {
+        self.api_version == API_VERSION_V1ALPHA1
+    }
+
+    /// The fidelity this manifest's results may be trusted at.
+    ///
+    /// A legacy (`v1alpha1`) manifest is **never** promoted: whatever it may
+    /// self-declare, its effective fidelity is [`Fidelity::Unspecified`] — the
+    /// lowest trust — so old results read without gaining behavioural or
+    /// prevention coverage. A `v1alpha2` manifest honours its declared
+    /// `fidelity`, defaulting to `Unspecified` when none is given.
+    pub fn effective_fidelity(&self) -> Fidelity {
+        if self.is_legacy() {
+            return Fidelity::Unspecified;
+        }
+        self.metadata
+            .fidelity
+            .as_deref()
+            .and_then(Fidelity::parse)
+            .unwrap_or_default()
+    }
+
+    /// The scenario's technique references, resolved to a uniform list.
+    ///
+    /// Prefers the explicit `mitre_techniques` list; otherwise falls back to the
+    /// single `mitre_technique`. Every entry carries the manifest's effective
+    /// fidelity (legacy manifests therefore yield only `Unspecified` refs). An
+    /// entry's own declared fidelity is clamped so it can never exceed the
+    /// manifest-level effective fidelity.
+    pub fn resolved_technique_refs(&self) -> Vec<TechniqueRef> {
+        let ceiling = self.effective_fidelity();
+        if let Some(ref refs) = self.metadata.mitre_techniques {
+            return refs
+                .iter()
+                .map(|r| TechniqueRef::new(r.technique_id.clone(), r.fidelity.min(ceiling)))
+                .collect();
+        }
+        match self.metadata.mitre_technique {
+            Some(ref id) => vec![TechniqueRef::new(id.clone(), ceiling)],
+            None => Vec::new(),
+        }
+    }
+}
+
 /// Reason a manifest fails declarative validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestValidationError {
@@ -148,6 +221,7 @@ pub enum ManifestValidationError {
     CpuLimitExceeded(u32),
     DurationLimitExceeded(u32),
     UnknownMitreTechnique(String),
+    InvalidFidelity(String),
     BudgetLimitExceeded(String),
     ParseError(String),
 }
@@ -157,7 +231,7 @@ impl std::fmt::Display for ManifestValidationError {
         match self {
             Self::InvalidApiVersion(v) => write!(
                 f,
-                "unsupported apiVersion '{v}', expected 'asmodeus.io/v1alpha1'"
+                "unsupported apiVersion '{v}', expected one of 'asmodeus.io/v1alpha1', 'asmodeus.io/v1alpha2'"
             ),
             Self::NotSynthetic => write!(f, "INV-0 violation: action nature must be 'synthetic'"),
             Self::InvalidCanaryPath(p) => {
@@ -172,6 +246,10 @@ impl std::fmt::Display for ManifestValidationError {
                 write!(f, "max duration {d}s exceeds maximum limit of 300s")
             }
             Self::UnknownMitreTechnique(t) => write!(f, "unknown MITRE technique '{t}'"),
+            Self::InvalidFidelity(v) => write!(
+                f,
+                "invalid fidelity '{v}', expected 'marker_only', 'behavioral' or 'unspecified'"
+            ),
             Self::BudgetLimitExceeded(msg) => write!(f, "resource budget exceeded: {msg}"),
             Self::ParseError(msg) => write!(f, "manifest parse error: {msg}"),
         }
@@ -182,8 +260,8 @@ impl std::error::Error for ManifestValidationError {}
 
 /// Validates a declarative manifest against INV-0 safety and budget limits.
 pub fn validate_manifest(manifest: &ScenarioManifest) -> Result<(), ManifestValidationError> {
-    // 1. API version check
-    if manifest.api_version != "asmodeus.io/v1alpha1" {
+    // 1. API version check — accept the legacy and current schema.
+    if !SUPPORTED_API_VERSIONS.contains(&manifest.api_version.as_str()) {
         return Err(ManifestValidationError::InvalidApiVersion(
             manifest.api_version.clone(),
         ));
@@ -227,12 +305,30 @@ pub fn validate_manifest(manifest: &ScenarioManifest) -> Result<(), ManifestVali
         }
     }
 
-    // 5. MITRE technique lookup
+    // 5. MITRE technique lookup. Every referenced ID — the single primary and
+    //    every entry of the multi-technique list — must resolve in the pinned
+    //    taxonomy, so a stale or mistyped technique fails validation (S01).
     if let Some(ref technique_id) = manifest.metadata.mitre_technique {
         if lookup_technique(technique_id).is_none() {
             return Err(ManifestValidationError::UnknownMitreTechnique(
                 technique_id.clone(),
             ));
+        }
+    }
+    if let Some(ref refs) = manifest.metadata.mitre_techniques {
+        for r in refs {
+            if lookup_technique(&r.technique_id).is_none() {
+                return Err(ManifestValidationError::UnknownMitreTechnique(
+                    r.technique_id.clone(),
+                ));
+            }
+        }
+    }
+
+    // 6. Declared fidelity string, if any, must be recognised.
+    if let Some(ref f) = manifest.metadata.fidelity {
+        if Fidelity::parse(f).is_none() {
+            return Err(ManifestValidationError::InvalidFidelity(f.clone()));
         }
     }
 
@@ -467,6 +563,90 @@ spec:
         assert!(matches!(
             parse_and_validate_manifest(&over_budget),
             Err(ManifestValidationError::BudgetLimitExceeded(_))
+        ));
+    }
+
+    // ---- S01: fidelity / versioning / multi-technique ----
+
+    const V2_JSON: &str = r#"{
+        "apiVersion": "asmodeus.io/v1alpha2",
+        "kind": "AttackScenario",
+        "metadata": {
+            "id": "SCN-V2-001",
+            "name": "Behavioral canary",
+            "category": "red_team",
+            "fidelity": "behavioral",
+            "mitre_techniques": [
+                {"technique_id": "T1486", "fidelity": "behavioral"},
+                {"technique_id": "T1071.001", "fidelity": "marker_only"}
+            ],
+            "severity": "high"
+        },
+        "spec": {
+            "target_scope": {"type": "fs", "target_path": "/tmp/asmodeus-canary/d"},
+            "safety": {"max_duration_sec": 30, "cpu_limit_percent": 10},
+            "action": {"nature": "synthetic", "type": "synthetic_canary_encrypt",
+                       "parameters": {"file_count": 10, "chunk_size_kb": 4}},
+            "expected_outcome": {"detector": "ferrum"}
+        }
+    }"#;
+
+    #[test]
+    fn v1alpha2_is_accepted_and_honours_declared_fidelity() {
+        let m = parse_and_validate_manifest(V2_JSON).unwrap();
+        assert_eq!(m.api_version, API_VERSION_V1ALPHA2);
+        assert!(!m.is_legacy());
+        assert_eq!(m.effective_fidelity(), Fidelity::Behavioral);
+        let refs = m.resolved_technique_refs();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].technique_id, "T1486");
+        assert_eq!(refs[0].fidelity, Fidelity::Behavioral);
+        // Second ref self-declares marker_only; stays marker_only (<= ceiling).
+        assert_eq!(refs[1].fidelity, Fidelity::MarkerOnly);
+    }
+
+    #[test]
+    fn legacy_manifest_is_never_promoted_even_if_it_declares_behavioral() {
+        // A v1alpha1 doc that tries to claim behavioral fidelity.
+        let legacy = V2_JSON.replace("v1alpha2", "v1alpha1");
+        let m = parse_and_validate_manifest(&legacy).unwrap();
+        assert!(m.is_legacy());
+        // Effective fidelity is clamped to the lowest trust regardless.
+        assert_eq!(m.effective_fidelity(), Fidelity::Unspecified);
+        for r in m.resolved_technique_refs() {
+            assert_eq!(r.fidelity, Fidelity::Unspecified);
+            assert!(!r.fidelity.claims_behavioral());
+        }
+    }
+
+    #[test]
+    fn unknown_technique_in_multi_list_is_rejected() {
+        let bad = V2_JSON.replace("T1071.001", "T9999.999");
+        assert_eq!(
+            parse_and_validate_manifest(&bad),
+            Err(ManifestValidationError::UnknownMitreTechnique(
+                "T9999.999".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn invalid_declared_fidelity_is_rejected() {
+        // Only the metadata-level string field (not the strongly-typed
+        // per-technique fidelity, which serde would reject as a parse error).
+        let bad = V2_JSON.replace("\"fidelity\": \"behavioral\",", "\"fidelity\": \"weaponized\",");
+        assert!(matches!(
+            parse_and_validate_manifest(&bad),
+            Err(ManifestValidationError::InvalidFidelity(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_api_version_is_rejected() {
+        let bad = V2_JSON.replace("v1alpha2", "v9beta9");
+        assert!(matches!(
+            parse_and_validate_manifest(&bad),
+            Err(ManifestValidationError::InvalidApiVersion(_))
         ));
     }
 
