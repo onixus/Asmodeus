@@ -520,6 +520,72 @@ async fn list_scenarios_returns_all_entries_with_mitre_metadata() {
 }
 
 #[tokio::test]
+async fn procedures_preserve_fixed_denominator_and_unsupported_status() {
+    let (status, body) = send("GET", "/api/v1/asmodeus/procedures", Some("auditor")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["version"], "asmodeus.procedure-corpus.v1");
+    assert_eq!(body["attack_version"], asmodeus_dsl::ATTACK_VERSION);
+    assert_eq!(body["denominator"], 6);
+    let procedures = body["procedures"].as_array().unwrap();
+    assert_eq!(procedures.len(), 6, "unsupported slots must remain visible");
+    for procedure in procedures {
+        assert_eq!(procedure["availability"], "UNSUPPORTED");
+        assert!(!procedure["unsupported_reason"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(
+        body,
+        serde_json::to_value(asmodeus_dsl::procedure_corpus()).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn procedures_require_authenticated_report_viewer() {
+    for role in [None, Some("unknown")] {
+        let (status, _) = send("GET", "/api/v1/asmodeus/procedures", role).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // Every currently defined role has ViewReports; do not accidentally require
+    // launch privileges from the three report-only roles.
+    for role in [
+        "admin",
+        "red_team",
+        "devsecops",
+        "ciso",
+        "secops",
+        "auditor",
+    ] {
+        let (status, _) = send("GET", "/api/v1/asmodeus/procedures", Some(role)).await;
+        assert_eq!(status, StatusCode::OK, "report viewer {role}");
+    }
+}
+
+#[tokio::test]
+async fn procedures_have_no_write_or_run_route() {
+    let (status, _) = send("POST", "/api/v1/asmodeus/procedures", Some("admin")).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let corpus = asmodeus_dsl::procedure_corpus();
+    let procedure_id = serde_json::to_value(&corpus).unwrap()["procedures"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _) = send(
+        "POST",
+        &format!("/api/v1/asmodeus/procedures/{procedure_id}/run"),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Corpus metadata must not admit a procedure through the scenario route.
+    let (status, _) = send(
+        "POST",
+        &format!("/api/v1/asmodeus/scenarios/{procedure_id}/run"),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn get_scenario_returns_single_scenario_details() {
     let app = router(AppState::new(Catalog::seeded()).unwrap());
     let req = Request::builder()

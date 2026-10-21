@@ -123,6 +123,18 @@ def main():
             until(ready)
             until(runner_ready)
 
+            # S02 preparation is read-only: CLI and API expose the same fixed
+            # denominator without creating an attempt or claiming execution.
+            corpus = request("GET", prefix + "/procedures")
+            cli_corpus = json.loads(subprocess.run(
+                [BIN / "asmodeus", "procedures", "--url", base],
+                env=env, check=True, capture_output=True, text=True,
+            ).stdout)
+            assert cli_corpus == corpus
+            assert corpus["denominator"] == len(corpus["procedures"]) == 6
+            assert all(slot["availability"] == "UNSUPPORTED" for slot in corpus["procedures"])
+            assert request("GET", prefix + "/runs")["total"] == 0
+
             def launch(scenario, options=None):
                 return request("POST", prefix + f"/scenarios/{scenario}/run", options or {})
 

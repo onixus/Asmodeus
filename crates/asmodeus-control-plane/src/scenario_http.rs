@@ -94,6 +94,18 @@ pub(crate) async fn run_scenario(
     .into_response())
 }
 
+/// Inspect the fixed procedure corpus; availability is planning metadata only.
+/// This handler does not admit or execute procedure runs.
+pub(crate) async fn list_procedures(
+    headers: HeaderMap,
+) -> Result<Json<asmodeus_dsl::ProcedureCorpus>, ApiError> {
+    let role = caller_role(&headers)?;
+    if !role.can(asmodeus_common::Capability::ViewReports) {
+        return Err(ApiError::Forbidden("role may not view procedures"));
+    }
+    Ok(Json(asmodeus_dsl::procedure_corpus()))
+}
+
 pub(crate) async fn list_scenarios(
     State(state): State<AppState>,
     headers: HeaderMap,

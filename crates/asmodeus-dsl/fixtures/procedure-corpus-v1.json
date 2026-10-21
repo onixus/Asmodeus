@@ -1,0 +1,427 @@
+{
+  "version": "asmodeus.procedure-corpus.v1",
+  "attack_version": "ATT&CK Enterprise v15.1",
+  "denominator": 6,
+  "procedures": [
+    {
+      "id": "container-exec",
+      "revision": 1,
+      "technique_id": "T1609",
+      "name": "Container exec",
+      "planned_mode": "behavioral",
+      "availability": "UNSUPPORTED",
+      "unsupported_reason": "NOT_RUN: this revision defines contracts only; a scoped runtime adapter, lifecycle/cleanup proof and correlated product evidence are not implemented.",
+      "gap": null,
+      "preconditions": [
+        "Disposable Linux/container fixture explicitly owned by this attempt; no production workload or host runtime socket.",
+        "Unique attempt ID, environment manifest and pinned procedure/policy revisions recorded before start.",
+        "Provisioned local fixtures, sensor readiness and explicit product policy with expected positive/benign decisions.",
+        "Preflight rejects destinations, paths or namespaces outside the attempt scope; cancellation and kill switch must be operational."
+      ],
+      "variants": [
+        {
+          "kind": "positive",
+          "behavior": "Invoke a fixed harmless canary helper through the disposable container runtime exec API.",
+          "expected": {
+            "observables": [
+              "Runtime exec audit event plus helper process lineage and canary receipt"
+            ],
+            "product_effect": "Under the declared fixture policy, produce the configured procedure-specific detection; prevention requires separate observed enforcement evidence.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        },
+        {
+          "kind": "benign_control",
+          "behavior": "Invoke the identical helper through the container's declared normal entrypoint.",
+          "expected": {
+            "observables": [
+              "Normal entrypoint/helper process lineage and matching canary receipt; no runtime exec audit event for this attempt"
+            ],
+            "product_effect": "Under the same policy, permit the benign control and produce no attack-specific alert; routine audit events may remain.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        }
+      ],
+      "budget": {
+        "timeout_seconds": 10,
+        "max_processes": 2,
+        "max_requests": 4,
+        "max_bytes": 4096,
+        "cancellation_required": true,
+        "kill_switch_required": true
+      },
+      "scope": {
+        "namespace_prefix": "asmodeus-canary-",
+        "canary_path": "/tmp/asmodeus-canary/",
+        "endpoint_allowlist": [
+          "127.0.0.1"
+        ],
+        "synthetic_data_only": true,
+        "real_credentials_forbidden": true
+      },
+      "cleanup": {
+        "required_after": [
+          "success",
+          "failure",
+          "crash",
+          "cancel"
+        ],
+        "requirements": [
+          "Stop and reap only attempt-owned processes and fixture receivers; prove no process or socket remains.",
+          "Remove only this attempt's namespace, sockets and canary files; verify their absence and preserve signed evidence separately.",
+          "Persist ownership before execution so crash recovery cannot claim or remove a previous attempt's artifacts; reruns require fresh IDs."
+        ]
+      }
+    },
+    {
+      "id": "shell-execution",
+      "revision": 1,
+      "technique_id": "T1059.004",
+      "name": "Shell execution",
+      "planned_mode": "behavioral",
+      "availability": "UNSUPPORTED",
+      "unsupported_reason": "NOT_RUN: this revision defines contracts only; a scoped runtime adapter, lifecycle/cleanup proof and correlated product evidence are not implemented.",
+      "gap": null,
+      "preconditions": [
+        "Disposable Linux/container fixture explicitly owned by this attempt; no production workload or host runtime socket.",
+        "Unique attempt ID, environment manifest and pinned procedure/policy revisions recorded before start.",
+        "Provisioned local fixtures, sensor readiness and explicit product policy with expected positive/benign decisions.",
+        "Preflight rejects destinations, paths or namespaces outside the attempt scope; cancellation and kill switch must be operational."
+      ],
+      "variants": [
+        {
+          "kind": "positive",
+          "behavior": "Use the disposable container's shell to write a fixed synthetic canary token.",
+          "expected": {
+            "observables": [
+              "Shell process lineage, fixed invocation metadata and canary file receipt"
+            ],
+            "product_effect": "Under the declared fixture policy, produce the configured procedure-specific detection; prevention requires separate observed enforcement evidence.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        },
+        {
+          "kind": "benign_control",
+          "behavior": "Write the same token with the fixed helper directly, without a shell.",
+          "expected": {
+            "observables": [
+              "Direct helper process lineage and matching canary file receipt; no shell process in this attempt lineage"
+            ],
+            "product_effect": "Under the same policy, permit the benign control and produce no attack-specific alert; routine audit events may remain.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        }
+      ],
+      "budget": {
+        "timeout_seconds": 10,
+        "max_processes": 2,
+        "max_requests": 4,
+        "max_bytes": 4096,
+        "cancellation_required": true,
+        "kill_switch_required": true
+      },
+      "scope": {
+        "namespace_prefix": "asmodeus-canary-",
+        "canary_path": "/tmp/asmodeus-canary/",
+        "endpoint_allowlist": [
+          "127.0.0.1"
+        ],
+        "synthetic_data_only": true,
+        "real_credentials_forbidden": true
+      },
+      "cleanup": {
+        "required_after": [
+          "success",
+          "failure",
+          "crash",
+          "cancel"
+        ],
+        "requirements": [
+          "Stop and reap only attempt-owned processes and fixture receivers; prove no process or socket remains.",
+          "Remove only this attempt's namespace, sockets and canary files; verify their absence and preserve signed evidence separately.",
+          "Persist ownership before execution so crash recovery cannot claim or remove a previous attempt's artifacts; reruns require fresh IDs."
+        ]
+      }
+    },
+    {
+      "id": "runtime-socket-prerequisite",
+      "revision": 1,
+      "technique_id": "T1611",
+      "name": "Test runtime socket prerequisite",
+      "planned_mode": "behavioral",
+      "availability": "UNSUPPORTED",
+      "unsupported_reason": "NOT_RUN: this revision defines contracts only; a scoped runtime adapter, lifecycle/cleanup proof and correlated product evidence are not implemented.",
+      "gap": "Socket accessibility is only a measured prerequisite/signal. This procedure does not escape a container or establish T1611 behavioural coverage; host/runtime sockets must never be mounted.",
+      "preconditions": [
+        "Disposable Linux/container fixture explicitly owned by this attempt; no production workload or host runtime socket.",
+        "Unique attempt ID, environment manifest and pinned procedure/policy revisions recorded before start.",
+        "Provisioned local fixtures, sensor readiness and explicit product policy with expected positive/benign decisions.",
+        "Preflight rejects destinations, paths or namespaces outside the attempt scope; cancellation and kill switch must be operational."
+      ],
+      "variants": [
+        {
+          "kind": "positive",
+          "behavior": "Contact only an attempt-owned mock runtime socket and request its fixed read-only fixture metadata.",
+          "expected": {
+            "observables": [
+              "Unix socket connect and fixture request audit correlated with process identity"
+            ],
+            "product_effect": "Under the declared fixture policy, produce the configured procedure-specific detection; prevention requires separate observed enforcement evidence.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        },
+        {
+          "kind": "benign_control",
+          "behavior": "Read the same fixture metadata from an ordinary canary file without opening a socket.",
+          "expected": {
+            "observables": [
+              "Canary metadata file read receipt correlated with helper identity; no Unix socket connect or runtime fixture request for this attempt"
+            ],
+            "product_effect": "Under the same policy, permit the benign control and produce no attack-specific alert; routine audit events may remain.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        }
+      ],
+      "budget": {
+        "timeout_seconds": 10,
+        "max_processes": 2,
+        "max_requests": 4,
+        "max_bytes": 4096,
+        "cancellation_required": true,
+        "kill_switch_required": true
+      },
+      "scope": {
+        "namespace_prefix": "asmodeus-canary-",
+        "canary_path": "/tmp/asmodeus-canary/",
+        "endpoint_allowlist": [
+          "127.0.0.1"
+        ],
+        "synthetic_data_only": true,
+        "real_credentials_forbidden": true
+      },
+      "cleanup": {
+        "required_after": [
+          "success",
+          "failure",
+          "crash",
+          "cancel"
+        ],
+        "requirements": [
+          "Stop and reap only attempt-owned processes and fixture receivers; prove no process or socket remains.",
+          "Remove only this attempt's namespace, sockets and canary files; verify their absence and preserve signed evidence separately.",
+          "Persist ownership before execution so crash recovery cannot claim or remove a previous attempt's artifacts; reruns require fresh IDs."
+        ]
+      }
+    },
+    {
+      "id": "http-beacon",
+      "revision": 1,
+      "technique_id": "T1071.001",
+      "name": "HTTP beacon",
+      "planned_mode": "behavioral",
+      "availability": "UNSUPPORTED",
+      "unsupported_reason": "NOT_RUN: this revision defines contracts only; a scoped runtime adapter, lifecycle/cleanup proof and correlated product evidence are not implemented.",
+      "gap": "No command retrieval or remote control is implemented; this is a bounded synthetic protocol pattern.",
+      "preconditions": [
+        "Disposable Linux/container fixture explicitly owned by this attempt; no production workload or host runtime socket.",
+        "Unique attempt ID, environment manifest and pinned procedure/policy revisions recorded before start.",
+        "Provisioned local fixtures, sensor readiness and explicit product policy with expected positive/benign decisions.",
+        "Preflight rejects destinations, paths or namespaces outside the attempt scope; cancellation and kill switch must be operational."
+      ],
+      "variants": [
+        {
+          "kind": "positive",
+          "behavior": "Send at most four fixed synthetic HTTP beacon messages to the attempt-owned loopback receiver.",
+          "expected": {
+            "observables": [
+              "Receiver receipts and HTTP connection timing for the bounded beacon pattern"
+            ],
+            "product_effect": "Under the declared fixture policy, produce the configured procedure-specific detection; prevention requires separate observed enforcement evidence.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        },
+        {
+          "kind": "benign_control",
+          "behavior": "Send one ordinary health-check request to the same receiver.",
+          "expected": {
+            "observables": [
+              "One ordinary HTTP health-check receiver receipt; no repeated beacon message pattern for this attempt"
+            ],
+            "product_effect": "Under the same policy, permit the benign control and produce no attack-specific alert; routine audit events may remain.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        }
+      ],
+      "budget": {
+        "timeout_seconds": 10,
+        "max_processes": 2,
+        "max_requests": 4,
+        "max_bytes": 4096,
+        "cancellation_required": true,
+        "kill_switch_required": true
+      },
+      "scope": {
+        "namespace_prefix": "asmodeus-canary-",
+        "canary_path": "/tmp/asmodeus-canary/",
+        "endpoint_allowlist": [
+          "127.0.0.1"
+        ],
+        "synthetic_data_only": true,
+        "real_credentials_forbidden": true
+      },
+      "cleanup": {
+        "required_after": [
+          "success",
+          "failure",
+          "crash",
+          "cancel"
+        ],
+        "requirements": [
+          "Stop and reap only attempt-owned processes and fixture receivers; prove no process or socket remains.",
+          "Remove only this attempt's namespace, sockets and canary files; verify their absence and preserve signed evidence separately.",
+          "Persist ownership before execution so crash recovery cannot claim or remove a previous attempt's artifacts; reruns require fresh IDs."
+        ]
+      }
+    },
+    {
+      "id": "dns-pattern",
+      "revision": 1,
+      "technique_id": "T1071.004",
+      "name": "DNS pattern",
+      "planned_mode": "behavioral",
+      "availability": "UNSUPPORTED",
+      "unsupported_reason": "NOT_RUN: this revision defines contracts only; a scoped runtime adapter, lifecycle/cleanup proof and correlated product evidence are not implemented.",
+      "gap": "No functional C2 channel, recursive resolver forwarding or external DNS is permitted.",
+      "preconditions": [
+        "Disposable Linux/container fixture explicitly owned by this attempt; no production workload or host runtime socket.",
+        "Unique attempt ID, environment manifest and pinned procedure/policy revisions recorded before start.",
+        "Provisioned local fixtures, sensor readiness and explicit product policy with expected positive/benign decisions.",
+        "Preflight rejects destinations, paths or namespaces outside the attempt scope; cancellation and kill switch must be operational."
+      ],
+      "variants": [
+        {
+          "kind": "positive",
+          "behavior": "Send at most four deterministic synthetic query labels under the fixture's .test zone to the loopback DNS fixture.",
+          "expected": {
+            "observables": [
+              "DNS fixture query receipts, labels and bounded query timing"
+            ],
+            "product_effect": "Under the declared fixture policy, produce the configured procedure-specific detection; prevention requires separate observed enforcement evidence.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        },
+        {
+          "kind": "benign_control",
+          "behavior": "Send one fixed service lookup under the same .test zone.",
+          "expected": {
+            "observables": [
+              "One ordinary fixture service query receipt; no synthetic C2-pattern labels or repeated query pattern for this attempt"
+            ],
+            "product_effect": "Under the same policy, permit the benign control and produce no attack-specific alert; routine audit events may remain.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        }
+      ],
+      "budget": {
+        "timeout_seconds": 10,
+        "max_processes": 2,
+        "max_requests": 4,
+        "max_bytes": 4096,
+        "cancellation_required": true,
+        "kill_switch_required": true
+      },
+      "scope": {
+        "namespace_prefix": "asmodeus-canary-",
+        "canary_path": "/tmp/asmodeus-canary/",
+        "endpoint_allowlist": [
+          "127.0.0.1"
+        ],
+        "synthetic_data_only": true,
+        "real_credentials_forbidden": true
+      },
+      "cleanup": {
+        "required_after": [
+          "success",
+          "failure",
+          "crash",
+          "cancel"
+        ],
+        "requirements": [
+          "Stop and reap only attempt-owned processes and fixture receivers; prove no process or socket remains.",
+          "Remove only this attempt's namespace, sockets and canary files; verify their absence and preserve signed evidence separately.",
+          "Persist ownership before execution so crash recovery cannot claim or remove a previous attempt's artifacts; reruns require fresh IDs."
+        ]
+      }
+    },
+    {
+      "id": "synthetic-transfer",
+      "revision": 1,
+      "technique_id": "T1041",
+      "name": "Synthetic transfer",
+      "planned_mode": "behavioral",
+      "availability": "UNSUPPORTED",
+      "unsupported_reason": "NOT_RUN: this revision defines contracts only; a scoped runtime adapter, lifecycle/cleanup proof and correlated product evidence are not implemented.",
+      "gap": "No real data collection or external exfiltration; this bounded transfer does not establish whole-technique T1041 coverage.",
+      "preconditions": [
+        "Disposable Linux/container fixture explicitly owned by this attempt; no production workload or host runtime socket.",
+        "Unique attempt ID, environment manifest and pinned procedure/policy revisions recorded before start.",
+        "Provisioned local fixtures, sensor readiness and explicit product policy with expected positive/benign decisions.",
+        "Preflight rejects destinations, paths or namespaces outside the attempt scope; cancellation and kill switch must be operational."
+      ],
+      "variants": [
+        {
+          "kind": "positive",
+          "behavior": "Transmit at most 4096 bytes of generated canary data to the attempt-owned loopback receiver.",
+          "expected": {
+            "observables": [
+              "Sender byte count and receiver payload digest for synthetic data"
+            ],
+            "product_effect": "Under the declared fixture policy, produce the configured procedure-specific detection; prevention requires separate observed enforcement evidence.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        },
+        {
+          "kind": "benign_control",
+          "behavior": "Send a fixed small health-status payload to the same receiver.",
+          "expected": {
+            "observables": [
+              "One small fixed health-status receiver receipt and payload digest; no canary-data transfer payload for this attempt"
+            ],
+            "product_effect": "Under the same policy, permit the benign control and produce no attack-specific alert; routine audit events may remain.",
+            "verification": "Correlate sensor events, product decisions and actual fixture state by unique attempt ID, procedure revision and start/stop window; compare positive and benign results. Missing telemetry or policy is NOT_RUN, never PASS."
+          }
+        }
+      ],
+      "budget": {
+        "timeout_seconds": 10,
+        "max_processes": 2,
+        "max_requests": 4,
+        "max_bytes": 4096,
+        "cancellation_required": true,
+        "kill_switch_required": true
+      },
+      "scope": {
+        "namespace_prefix": "asmodeus-canary-",
+        "canary_path": "/tmp/asmodeus-canary/",
+        "endpoint_allowlist": [
+          "127.0.0.1"
+        ],
+        "synthetic_data_only": true,
+        "real_credentials_forbidden": true
+      },
+      "cleanup": {
+        "required_after": [
+          "success",
+          "failure",
+          "crash",
+          "cancel"
+        ],
+        "requirements": [
+          "Stop and reap only attempt-owned processes and fixture receivers; prove no process or socket remains.",
+          "Remove only this attempt's namespace, sockets and canary files; verify their absence and preserve signed evidence separately.",
+          "Persist ownership before execution so crash recovery cannot claim or remove a previous attempt's artifacts; reruns require fresh IDs."
+        ]
+      }
+    }
+  ]
+}

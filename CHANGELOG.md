@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+### Добавлено — контракт корпуса процедур S02, 2026-10-21
+
+- Версионированный корпус из шести обязательных procedure slots с парными
+  positive/benign controls, preconditions, ожидаемыми observable, scope,
+  бюджетами и требованиями cleanup; знаменатель не сокращается из-за gaps.
+- Read-only `GET /api/v1/asmodeus/procedures` с RBAC `ViewReports`, OpenAPI
+  и команда CLI `asmodeus procedures`.
+- Все slots явно `UNSUPPORTED`: определения не запускают действий и не
+  подтверждают behavioral/prevention coverage. Исполнительные адаптеры,
+  attempt evidence и runtime/crash acceptance остаются частью #27.
+
 ### Исправлено — независимое ревью S01, 2026-10-21
 
 - Fidelity внешнего манифеста ограничена фактическим action и конкретной

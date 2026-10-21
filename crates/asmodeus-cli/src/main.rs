@@ -82,6 +82,13 @@ enum Cmd {
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
     },
+    /// Inspect the versioned procedure corpus and unsupported runtime gaps.
+    Procedures {
+        #[arg(long, default_value = "auditor")]
+        role: String,
+        #[arg(long, default_value = "http://127.0.0.1:8842")]
+        url: String,
+    },
     /// Display MITRE ATT&CK Enterprise Matrix coverage report.
     Mitre {
         #[arg(long, default_value = "auditor")]
@@ -595,6 +602,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "scenarios",
             )?;
         }
+        Cmd::Procedures { role, url } => {
+            let endpoint = format!("{url}/api/v1/asmodeus/procedures");
+            let client = reqwest::blocking::Client::new();
+            call(
+                client.get(&endpoint).header("X-Apex-Role", &role),
+                "procedures",
+            )?;
+        }
         Cmd::Mitre { role, url } => {
             let endpoint = format!("{url}/api/v1/asmodeus/scenarios/mitre");
             let client = reqwest::blocking::Client::new();
@@ -969,6 +984,35 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn procedures_is_read_only_with_auditor_defaults() {
+        let cli = Cli::try_parse_from(["asmodeus", "procedures"]).unwrap();
+        match cli.cmd {
+            Cmd::Procedures { role, url } => {
+                assert_eq!(role, "auditor");
+                assert_eq!(url, "http://127.0.0.1:8842");
+            }
+            _ => panic!("unexpected command"),
+        }
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "procedures",
+            "--role",
+            "secops",
+            "--url",
+            "http://example.test",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Procedures { role, url } => {
+                assert_eq!(role, "secops");
+                assert_eq!(url, "http://example.test");
+            }
+            _ => panic!("unexpected command"),
+        }
+        assert!(Cli::try_parse_from(["asmodeus", "procedures", "run"]).is_err());
+    }
 
     #[test]
     fn test_cli_parsing_runs_and_campaigns() {

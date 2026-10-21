@@ -11,6 +11,8 @@ pub use execution::*;
 pub mod fidelity;
 pub mod manifest;
 pub mod mitre;
+pub mod procedure;
+pub use procedure::*;
 
 pub use fidelity::{CoverageClass, Fidelity, Platform, TechniqueRef};
 pub use manifest::*;
