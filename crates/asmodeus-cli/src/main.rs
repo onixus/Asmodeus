@@ -105,6 +105,18 @@ enum Cmd {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Run all six local slots with both controls; gaps prevent a green fixture gate.
+    ProcedureLocalSuite {
+        /// Unique suite name (at most 48 ASCII letters, digits, hyphens or underscores).
+        #[arg(long, value_parser = parse_suite_id)]
+        suite_id: String,
+        /// Per-variant deadline; the fixed suite contains twelve variants.
+        #[arg(long, default_value_t = 10000, value_parser = clap::value_parser!(u64).range(1..=10000))]
+        timeout_ms: u64,
+        /// Export unsigned JSON; an existing file is never overwritten.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Display MITRE ATT&CK Enterprise Matrix coverage report.
     Mitre {
         #[arg(long, default_value = "auditor")]
@@ -551,16 +563,20 @@ fn parse_attempt_id(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+fn parse_suite_id(value: &str) -> Result<String, String> {
+    let id = parse_attempt_id(value)?;
+    if id.len() > 48 {
+        return Err("suite ID must contain at most 48 characters".into());
+    }
+    Ok(id)
+}
+
 fn run_local_fixture(
     procedure: LocalProcedure,
     variant: LocalVariant,
     attempt_id: String,
     timeout_ms: u64,
 ) -> Result<asmodeus_runner::LocalProcedureAttempt, Box<dyn std::error::Error>> {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
     let config = asmodeus_runner::LocalProcedureConfig {
         procedure_id: procedure.id().into(),
         attempt_id,
@@ -569,6 +585,18 @@ fn run_local_fixture(
             LocalVariant::BenignControl => asmodeus_dsl::ProcedureVariantKind::BenignControl,
         },
         timeout_ms,
+    };
+    run_cancellable_local(move |cancel| asmodeus_runner::run_local_procedure(config, cancel))
+}
+
+fn run_cancellable_local<T: Send + 'static>(
+    execute: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<T>
+        + Send
+        + 'static,
+) -> Result<T, Box<dyn std::error::Error>> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -591,9 +619,7 @@ fn run_local_fixture(
             Ok::<(), std::io::Error>(())
         };
         let worker_cancel = cancel.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            asmodeus_runner::run_local_procedure(config, worker_cancel)
-        });
+        let mut worker = tokio::task::spawn_blocking(move || execute(worker_cancel));
         tokio::select! {
             result = &mut worker => Ok(result??),
             signal_result = signal => {
@@ -762,6 +788,28 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(
                     format!("local fixture ended with status {:?}", evidence.status).into(),
                 );
+            }
+        }
+        Cmd::ProcedureLocalSuite {
+            suite_id,
+            timeout_ms,
+            output,
+        } => {
+            let mut export = output.as_deref().map(reserve_local_evidence).transpose()?;
+            let report = run_cancellable_local(move |cancel| {
+                asmodeus_runner::run_local_procedure_suite(&suite_id, timeout_ms, cancel)
+            })?;
+            let bytes = serde_json::to_vec_pretty(&report)?;
+            if let Some(file) = export.as_mut() {
+                export_local_evidence(file, &bytes)?;
+            }
+            println!("{}", std::str::from_utf8(&bytes)?);
+            if report.fixture_gate != asmodeus_runner::LocalSuiteGate::Pass {
+                return Err(format!(
+                    "local fixture suite gate {:?}; protection remains INCONCLUSIVE",
+                    report.fixture_gate
+                )
+                .into());
             }
         }
         Cmd::Mitre { role, url } => {
@@ -1229,6 +1277,37 @@ mod tests {
         assert!(error.to_string().contains("exist"));
         assert_eq!(std::fs::read(&output).unwrap(), original);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_suite_parsing_is_fixed_and_bounded() {
+        let args = [
+            "asmodeus",
+            "procedure-local-suite",
+            "--suite-id",
+            "suite-01",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(args).unwrap().cmd,
+            Cmd::ProcedureLocalSuite {
+                timeout_ms: 10000,
+                ..
+            }
+        ));
+        assert!(parse_suite_id(&"a".repeat(48)).is_ok());
+        assert!(parse_suite_id(&"a".repeat(49)).is_err());
+        for id in ["../escape", "", "a/b"] {
+            assert!(parse_suite_id(id).is_err());
+        }
+        for (flag, value) in [
+            ("--timeout-ms", "0"),
+            ("--timeout-ms", "10001"),
+            ("--procedure", "http-beacon"),
+            ("--destination", "example.com"),
+            ("--command", "sh"),
+        ] {
+            assert!(Cli::try_parse_from(args.into_iter().chain([flag, value])).is_err());
+        }
     }
 
     #[test]

@@ -73,6 +73,57 @@ shell и runtime socket этой командой не исполняются.
 script удаляет только созданные им attempts после проверок. Этот smoke включён
 в основной `Jenkinsfile`, а его локальный запуск не заменяет Jenkins на точном SHA.
 
+## Полный локальный набор с парными контролями
+
+```sh
+asmodeus procedure-local-suite --suite-id local-suite-001 --output local-suite-001.json
+```
+
+Команда последовательно запускает все шесть slots с `positive` и
+`benign_control`: знаменатели всегда `slot_denominator=6` и
+`variant_denominator=12`. Параметров исключения процедур или произвольных
+адресов нет. `--timeout-ms` задаёт deadline каждого варианта (1–10000 мс);
+максимальный суммарный бюджет исполнения — 12 таких deadlines плюс локальный
+filesystem/export overhead. Suite ID содержит до 48 ASCII-букв, цифр, `-`, `_`.
+Attempt ID имеет вид `<suite-id>-<slot-index>-positive|benign`; резервирование
+каждого attempt использует существующие проверки эксклюзивного владения.
+Повторное использование suite ID не переисполняет уже зарезервированные
+attempts: их записи остаются неизменными, а ошибки попадают в отчёт.
+
+Отчёт содержит версии и SHA-256 корпуса, ATT&CK release, scope, все пары,
+вложенные receipts/cleanup/ownership references и причины gaps. Показатели
+`executed_variants` и `complete_local_pairs` учитывают только `EXECUTED`
+с непустыми receipts и `cleanup=VERIFIED`.
+
+| `fixture_gate` | Условие |
+| --- | --- |
+| `PASS` | Выполнены все шесть пар с receipts и проверенной штатной очисткой |
+| `INCONCLUSIVE` | Ошибок нет, но остались неподдерживаемые варианты |
+| `FAILED` | Ошибка запуска, timeout, cancellation, отсутствуют receipts у выполненного варианта либо не подтверждена штатная очистка |
+
+Текущие адаптеры дают **3 полные локальные пары из 6**, то есть
+`INCONCLUSIVE`. CLI печатает JSON и возвращает ненулевой exit code для
+`INCONCLUSIVE` и `FAILED`. Это позволяет использовать команду как строгий
+локальный gate без исключения обязательных slots. `protection_result`
+всегда `INCONCLUSIVE`: даже будущий локальный `PASS` не подтверждает detection,
+prevention или containment. Неподписанный suite не является APEX validation
+manifest или trusted audit campaign report из S03/S04.
+
+При Ctrl-C активный вариант завершает штатную очистку, остальные остаются
+в отчёте с `NOT_RUN: suite cancelled`. При ошибке одного варианта остальные
+выполняются в пределах своих бюджетов; общий gate сохраняет `FAILED`.
+Отчёт экспортируется целиком после завершения и не перезаписывает файлы;
+конфликт `--output` отклоняется до резервирования attempts. SIGKILL может
+оставить пустой зарезервированный output и не даёт готового отчёта или
+подтверждения cleanup. Автоматического resume/retry suite нет; сохранённый
+JSON читается без повторного исполнения, но не имеет гарантий доверенного
+хранилища подписанных campaign runs.
+
+`procedure_smoke.py` проверяет полный denominator, текущие gaps, экспорт,
+отказ повторного ID, timeout и отмену suite отдельным процессом. Jenkins
+архивирует `procedure-evidence.json` с попытками и suite-отчётами smoke.
+Зелёный CI подтверждает эти проверки, а не protection gate.
+
 ## Следующий этап S02
 
 Исполнитель должен сохранить существующие проверки подписи, deadline,

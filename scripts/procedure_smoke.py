@@ -25,6 +25,7 @@ def main():
     owned = []
     processes = []
     evidence = []
+    suites = []
     prefix = "smoke-" + uuid.uuid4().hex[:16]
 
     def args(slot, variant="positive", timeout=10000):
@@ -88,6 +89,30 @@ def main():
             invoke(command, successful=False)
         return attempt
 
+    def suite_command(label, timeout=10000):
+        suite_id = f"{prefix}-{label}"
+        owned.extend(f"{suite_id}-{index}-{variant}" for index in range(6)
+                     for variant in ("positive", "benign"))
+        return suite_id, [str(BIN), "procedure-local-suite", "--suite-id", suite_id,
+                          "--timeout-ms", str(timeout)]
+
+    def check_suite(doc, gate):
+        assert doc["fixture_gate"] == gate, doc
+        assert doc["protection_result"] == "INCONCLUSIVE"
+        assert doc["signature_status"] == "UNSIGNED"
+        assert doc["slot_denominator"] == 6
+        assert doc["variant_denominator"] == 12
+        assert len(doc["entries"]) == 12
+        assert doc["corpus_sha256"] == hashlib.sha256(
+            (ROOT / "crates/asmodeus-dsl/fixtures/procedure-corpus-v1.json").read_bytes()
+        ).hexdigest()
+        assert len({entry["attempt_id"] for entry in doc["entries"]}) == 12
+        assert len({entry["procedure_id"] for entry in doc["entries"]}) == 6
+        for entry in doc["entries"]:
+            if entry["evidence"] is not None:
+                check_manifest(entry["evidence"], entry["attempt_id"], entry["evidence"]["status"])
+        suites.append(doc)
+
     try:
         with tempfile.TemporaryDirectory(prefix="asmodeus-procedures-") as directory:
             output = Path(directory) / "attempt.json"
@@ -128,12 +153,60 @@ def main():
                 start_and_signal(signal.SIGINT)
                 start_and_signal(signal.SIGKILL)
 
+            suite_id, command = suite_command("suite")
+            # Export rejection must happen before any attempt is reserved.
+            saved = output.read_bytes()
+            invoke(command + ["--output", str(output)], successful=False)
+            assert output.read_bytes() == saved
+            assert not (CANARY / f"{suite_id}-0-positive.ownership.json").exists()
+            suite_output = Path(directory) / "suite.json"
+            suite = json.loads(invoke(command + ["--output", str(suite_output)], successful=False).stdout)
+            check_suite(suite, "INCONCLUSIVE")
+            assert json.loads(suite_output.read_text()) == suite
+            assert suite["executed_variants"] == 6
+            assert suite["complete_local_pairs"] == 3
+            assert sum(e["gap"] is not None for e in suite["entries"]) == 6
+            before = {entry["attempt_id"]: (CANARY / f'{entry["attempt_id"]}.ownership.json').read_bytes()
+                      for entry in suite["entries"]}
+            repeated = json.loads(invoke(command, successful=False).stdout)
+            check_suite(repeated, "FAILED")
+            assert all(entry["evidence"] is None and entry["gap"] for entry in repeated["entries"])
+            for attempt, reservation in before.items():
+                assert (CANARY / f"{attempt}.ownership.json").read_bytes() == reservation
+
+            _, command = suite_command("deadline", timeout=1)
+            check_suite(json.loads(invoke(command, successful=False).stdout), "FAILED")
+            if os.name == "posix":
+                suite_id, command = suite_command("interrupt")
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                processes.append(process)
+                ledger = CANARY / f"{suite_id}-3-positive.ownership.json"
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        if json.loads(ledger.read_text()).get("state") == "RESERVED":
+                            break
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        pass
+                    assert process.poll() is None, process.communicate()
+                    assert time.monotonic() < deadline
+                    time.sleep(0.002)
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=5)
+                assert process.returncode != 0, stderr
+                interrupted = json.loads(stdout)
+                check_suite(interrupted, "FAILED")
+                assert any(entry["evidence"] is None and "cancelled" in entry["gap"]
+                           for entry in interrupted["entries"])
+                assert any(entry["evidence"] and entry["evidence"]["status"] == "CANCELLED"
+                           for entry in interrupted["entries"])
+
             if os.environ.get("ASMODEUS_PROCEDURE_EVIDENCE_OUT"):
                 Path(os.environ["ASMODEUS_PROCEDURE_EVIDENCE_OUT"]).write_text(json.dumps({
                     "context": "owned_loopback_fixture", "protection_result": "INCONCLUSIVE",
-                    "attempts": evidence,
+                    "attempts": evidence, "suites": suites,
                 }, indent=2) + "\n")
-        print("PASS: local HTTP/DNS/transfer paired receipts, unsigned evidence, exclusive attempts, non-overwriting export, timeout, SIGINT cleanup and SIGKILL non-acceptance")
+        print("PASS: local HTTP/DNS/transfer paired receipts, unsigned evidence, exclusive attempts, non-overwriting export, timeout, SIGINT cleanup and SIGKILL non-acceptance; six-slot suite denominator, gaps, export, retry rejection, timeout and cancellation")
     finally:
         for process in processes:
             if process.poll() is None:

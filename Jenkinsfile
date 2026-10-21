@@ -130,8 +130,13 @@ pipeline {
                             cargo build --workspace --locked
                             python3 scripts/feature_smoke.py
                             python3 scripts/campaign_smoke.py
-                            python3 scripts/procedure_smoke.py
+                            ASMODEUS_PROCEDURE_EVIDENCE_OUT="$WORKSPACE/procedure-evidence.json" python3 scripts/procedure_smoke.py
                         '''
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'procedure-evidence.json', allowEmptyArchive: true
+                        }
                     }
                 }
 

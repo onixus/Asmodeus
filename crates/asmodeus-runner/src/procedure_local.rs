@@ -94,7 +94,7 @@ fn unix_ms() -> u64 {
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
         .iter()
@@ -161,7 +161,7 @@ pub fn run_local_procedure(
     run_in_root(config, cancel, Path::new(LOCAL_PROCEDURE_ROOT))
 }
 
-fn run_in_root(
+pub(crate) fn run_in_root(
     config: LocalProcedureConfig,
     cancel: Arc<AtomicBool>,
     root: &Path,
