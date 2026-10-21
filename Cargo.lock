@@ -92,10 +92,12 @@ dependencies = [
  "asmodeus-common",
  "asmodeus-crypto",
  "asmodeus-dsl",
+ "asmodeus-runner",
  "clap",
  "ed25519-compact",
  "reqwest",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -181,6 +183,8 @@ dependencies = [
  "aya",
  "libc",
  "prost",
+ "ring",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",

@@ -7,7 +7,7 @@ mod ops;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -88,6 +88,22 @@ enum Cmd {
         role: String,
         #[arg(long, default_value = "http://127.0.0.1:8842")]
         url: String,
+    },
+    /// Run a bounded offline local fixture; unsigned evidence is not protection proof.
+    ProcedureLocal {
+        #[arg(long, value_enum)]
+        procedure: LocalProcedure,
+        #[arg(long, value_enum)]
+        variant: LocalVariant,
+        /// Unique attempt name: ASCII letters, digits, hyphen or underscore.
+        #[arg(long, value_parser = parse_attempt_id)]
+        attempt_id: String,
+        /// Shorten the fixed local fixture deadline (milliseconds).
+        #[arg(long, default_value_t = 10000, value_parser = clap::value_parser!(u64).range(1..=10000))]
+        timeout_ms: u64,
+        /// Export unsigned JSON; an existing file is never overwritten.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Display MITRE ATT&CK Enterprise Matrix coverage report.
     Mitre {
@@ -492,6 +508,123 @@ fn call(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LocalProcedure {
+    ContainerExec,
+    ShellExecution,
+    RuntimeSocketPrerequisite,
+    HttpBeacon,
+    DnsPattern,
+    SyntheticTransfer,
+}
+
+impl LocalProcedure {
+    fn id(self) -> &'static str {
+        match self {
+            Self::ContainerExec => "container-exec",
+            Self::ShellExecution => "shell-execution",
+            Self::RuntimeSocketPrerequisite => "runtime-socket-prerequisite",
+            Self::HttpBeacon => "http-beacon",
+            Self::DnsPattern => "dns-pattern",
+            Self::SyntheticTransfer => "synthetic-transfer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LocalVariant {
+    Positive,
+    BenignControl,
+}
+
+fn parse_attempt_id(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(
+            "attempt ID must contain 1..=64 ASCII letters, digits, hyphens or underscores".into(),
+        );
+    }
+    Ok(value.to_owned())
+}
+
+fn run_local_fixture(
+    procedure: LocalProcedure,
+    variant: LocalVariant,
+    attempt_id: String,
+    timeout_ms: u64,
+) -> Result<asmodeus_runner::LocalProcedureAttempt, Box<dyn std::error::Error>> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let config = asmodeus_runner::LocalProcedureConfig {
+        procedure_id: procedure.id().into(),
+        attempt_id,
+        variant: match variant {
+            LocalVariant::Positive => asmodeus_dsl::ProcedureVariantKind::Positive,
+            LocalVariant::BenignControl => asmodeus_dsl::ProcedureVariantKind::BenignControl,
+        },
+        timeout_ms,
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        // Register before starting the worker so Ctrl-C always requests cleanup.
+        #[cfg(unix)]
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let signal = async {
+            #[cfg(unix)]
+            {
+                interrupt.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let worker_cancel = cancel.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            asmodeus_runner::run_local_procedure(config, worker_cancel)
+        });
+        tokio::select! {
+            result = &mut worker => Ok(result??),
+            signal_result = signal => {
+                cancel.store(true, Ordering::SeqCst);
+                // The bounded harness owns cleanup. Do not abort its worker.
+                let evidence = worker.await??;
+                signal_result?;
+                Ok(evidence)
+            }
+        }
+    })
+}
+
+fn reserve_local_evidence(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn export_local_evidence(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -609,6 +742,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 client.get(&endpoint).header("X-Apex-Role", &role),
                 "procedures",
             )?;
+        }
+        Cmd::ProcedureLocal {
+            procedure,
+            variant,
+            attempt_id,
+            timeout_ms,
+            output,
+        } => {
+            // Reserve before execution: a conflicting export must not consume an attempt ID.
+            let mut export = output.as_deref().map(reserve_local_evidence).transpose()?;
+            let evidence = run_local_fixture(procedure, variant, attempt_id, timeout_ms)?;
+            let bytes = serde_json::to_vec_pretty(&evidence)?;
+            if let Some(file) = export.as_mut() {
+                export_local_evidence(file, &bytes)?;
+            }
+            println!("{}", std::str::from_utf8(&bytes)?);
+            if evidence.status != asmodeus_runner::LocalAttemptStatus::Executed {
+                return Err(
+                    format!("local fixture ended with status {:?}", evidence.status).into(),
+                );
+            }
         }
         Cmd::Mitre { role, url } => {
             let endpoint = format!("{url}/api/v1/asmodeus/scenarios/mitre");
@@ -984,6 +1138,98 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn procedure_local_limits_inputs_to_fixed_fixture_contracts() {
+        let cli = Cli::try_parse_from([
+            "asmodeus",
+            "procedure-local",
+            "--procedure",
+            "http-beacon",
+            "--variant",
+            "benign-control",
+            "--attempt-id",
+            "test_123-A",
+            "--timeout-ms",
+            "250",
+            "--output",
+            "evidence.json",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::ProcedureLocal {
+                procedure,
+                variant,
+                attempt_id,
+                timeout_ms,
+                output,
+            } => {
+                assert_eq!(procedure.id(), "http-beacon");
+                assert!(matches!(variant, LocalVariant::BenignControl));
+                assert_eq!(attempt_id, "test_123-A");
+                assert_eq!(timeout_ms, 250);
+                assert_eq!(output, Some(PathBuf::from("evidence.json")));
+            }
+            _ => panic!("unexpected command"),
+        }
+        let args = [
+            "asmodeus",
+            "procedure-local",
+            "--procedure",
+            "dns-pattern",
+            "--variant",
+            "positive",
+            "--attempt-id",
+            "local-test",
+        ];
+        match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::ProcedureLocal { timeout_ms, .. } => assert_eq!(timeout_ms, 10000),
+            _ => panic!("unexpected command"),
+        }
+        for (flag, value) in [
+            ("--timeout-ms", "0"),
+            ("--timeout-ms", "10001"),
+            ("--target-dir", "/tmp/anywhere"),
+            ("--destination", "example.com"),
+            ("--command", "echo"),
+        ] {
+            assert!(Cli::try_parse_from(args.into_iter().chain([flag, value])).is_err());
+        }
+        for id in ["../escape", "a/b", "", ".", "a b"] {
+            assert!(parse_attempt_id(id).is_err());
+        }
+        let mut unknown = args.to_vec();
+        unknown[3] = "unknown-procedure";
+        assert!(Cli::try_parse_from(unknown).is_err());
+        let mut unknown_variant = args.to_vec();
+        unknown_variant[5] = "attack-command";
+        assert!(Cli::try_parse_from(unknown_variant).is_err());
+    }
+
+    #[test]
+    fn procedure_local_export_refuses_existing_file() {
+        let root = std::env::temp_dir().join(format!("asmodeus-cli-export-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let output = root.join("evidence.json");
+        let mut file = reserve_local_evidence(&output).unwrap();
+        export_local_evidence(&mut file, b"{\"signature_status\":\"UNSIGNED\"}").unwrap();
+        let original = std::fs::read(&output).unwrap();
+        let error = reserve_local_evidence(&output).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let error = run(Cli {
+            cmd: Cmd::ProcedureLocal {
+                procedure: LocalProcedure::HttpBeacon,
+                variant: LocalVariant::Positive,
+                attempt_id: "should-not-run".into(),
+                timeout_ms: 10000,
+                output: Some(output.clone()),
+            },
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("exist"));
+        assert_eq!(std::fs::read(&output).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn procedures_is_read_only_with_auditor_defaults() {

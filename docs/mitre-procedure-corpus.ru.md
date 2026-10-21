@@ -31,6 +31,48 @@
 Marker/replay/behavioral различаются в модели, но API корпуса не выдаёт
 исполнительный evidence manifest.
 
+## Локальный исполнитель fixtures
+
+`asmodeus procedure-local` выполняет три локальных опыта: `http-beacon`,
+`dns-pattern`, `synthetic-transfer`. Он создаёт собственные TCP/UDP receivers
+на `127.0.0.1:0`; внешние адреса, команды, payload и пути через CLI не задаются.
+DNS-пакеты идут непосредственно в собственный UDP receiver, без обращения
+к системному DNS. У каждой процедуры есть `positive` и `benign-control`.
+
+```sh
+asmodeus procedure-local --procedure http-beacon --variant positive \
+  --attempt-id local-http-001 --output local-http-001.json
+```
+
+Attempt ID обязателен и не переиспользуется. До открытия сокетов исполнитель
+создаёт постоянную запись владения
+`/tmp/asmodeus-canary/local-procedures/<attempt-id>.ownership.json`.
+Эта запись сохраняется после cleanup; повторный запуск с тем же ID отклоняется.
+Эфемерная директория `<attempt-id>/` принадлежит только этому запуску.
+
+JSON содержит локальные наблюдения, ревизии, окружение, временные отметки,
+фактически принятые данные и результат cleanup. `--output` отказывается
+перезаписывать существующий файл. Evidence **не подписан** и не является
+доверенным producer feedback. Его можно отдельно подписать существующей
+офлайн-командой `asmodeus sign`; подпись сама по себе не доказывает реакцию
+защитного продукта.
+
+Общий deadline ограничен 10 секундами; `--timeout-ms` может его сократить.
+Ctrl-C запрашивает отмену и штатную очистку. SIGKILL не позволяет подтвердить
+filesystem cleanup: запись владения остаётся с `crash_cleanup=NOT_VERIFIED`,
+чужие/предыдущие attempts автоматически не удаляются.
+
+Локальные fixtures не выполняют контейнерные и продуктовые preconditions
+корпуса v1. Поэтому каталог сохраняет все шесть `UNSUPPORTED`, а protection
+остаётся неподтверждённым даже при успешном локальном исполнении. Container exec,
+shell и runtime socket этой командой не исполняются.
+
+`python3 scripts/procedure_smoke.py` проверяет парные TCP/UDP receipts,
+идемпотентный отказ от повторного ID, экспорт, timeout, Ctrl-C и SIGKILL.
+Переменная `ASMODEUS_PROCEDURE_EVIDENCE_OUT` сохраняет JSON-архив результатов;
+script удаляет только созданные им attempts после проверок. Этот smoke включён
+в основной `Jenkinsfile`, а его локальный запуск не заменяет Jenkins на точном SHA.
+
 ## Следующий этап S02
 
 Исполнитель должен сохранить существующие проверки подписи, deadline,
