@@ -31,10 +31,10 @@ Slot — это единица, которую оператор реально �
   зелёного результата.
 
 Источник истины — `crates/asmodeus-dsl/src/procedures.rs`
-(`CORPUS_VERSION = "asmodeus-mitre-wave1-v1"`). Исполнение, safety-харнесс и
+(`CORPUS_VERSION = "asmodeus-mitre-wave1-v2"`). Исполнение, safety-харнесс и
 manifest — `crates/asmodeus-runner/src/procedures.rs`.
 
-## 2. Шесть slots (corpus v1)
+## 2. Шесть slots (corpus v2)
 
 | Slot | Procedure | Техника (роль) | Платформы | Требование | Локальный режим | Что проверяет / ограничение |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -42,13 +42,16 @@ manifest — `crates/asmodeus-runner/src/procedures.rs`.
 | `WAVE1-EXEC-SHELL` | `ASMOD-WAVE1-0002` | T1059.004 (behavioral_candidate) | linux/macos | canary FS | marker | транскрипт shell-команды в canary; реальный shell локально не запускается |
 | `WAVE1-EXEC-RUNTIME-SOCKET` | `ASMOD-WAVE1-0003` | T1611 (**precondition_signal**) | containers/linux | canary runtime-сокет стенда | marker (иначе NOT_RUN) | сигнал достижимости тест-сокета; **не** escape и не доступ к хосту |
 | `WAVE1-C2-HTTP-BEACON` | `ASMOD-WAVE1-0004` | T1071.001 (behavioral_candidate) | network/linux | loopback test-receiver | behavioral | реальный loopback-round-trip с синтетическим beacon; egress наружу нет |
-| `WAVE1-C2-DNS` | `ASMOD-WAVE1-0005` | T1071.004 (behavioral_candidate) | network/linux | loopback test-receiver | behavioral | реальная loopback-датаграмма с синтетической DNS-меткой; резолва нет |
+| `WAVE1-C2-DNS` | `ASMOD-WAVE1-0005` | T1071.004 (behavioral_candidate) | network/linux | loopback test-receiver | behavioral | корректный DNS TXT question в loopback UDP; внешнего резолва нет |
 | `WAVE1-EXFIL-TRANSFER` | `ASMOD-WAVE1-0006` | T1041 (behavioral_candidate) | network/linux | loopback test-receiver | behavioral | реальная loopback-передача canary-блоба; данные хост не покидают |
 
 Каждый slot дополнительно несёт: `preconditions`, `expected_observables`,
 `limitations`, `safety_scope`, **benign paired control** (ожидаемое поведение
 продукта + как проверить фактический эффект) и `ResourceBudget`
-(`max_duration_ms`/`max_bytes`/`max_files`).
+(`max_duration_ms`/`max_bytes`/`max_files`). Ресурсы резервируются до
+создания файла и отправки payload; превышение лимита не выполняет запись.
+DNS procedure revision 2 отправляет корректный DNS wire-format (TXT/IN).
+Повышение corpus до v2 требует нового прогона; результаты v1 не переносятся.
 
 ## 3. Режимы исполнения и потолок fidelity
 
@@ -87,8 +90,14 @@ Loopback test-receiver — это in-process `TcpListener`/`UdpSocket` на `127
 ## 5. Manifest выполненных процедур
 
 `asmodeus-runner` c `ASMODEUS_MITRE_WAVE1=1` печатает JSON-manifest локального
-прогона corpus (а с `ASMODEUS_MITRE_WAVE1=stand` — прогон на полностью
-обеспеченном runtime-стенде). Каждый attempt несёт: `attempt_id`, `procedure_id`
+прогона corpus (а с `ASMODEUS_MITRE_WAVE1=stand` — запрос стендового режима).
+Canary-сокеты задаются явно: `ASMODEUS_MITRE_ADMIN_SOCKET` и
+`ASMODEUS_MITRE_RUNTIME_SOCKET`. При отсутствии endpoint соответствующий slot
+остаётся `NOT_RUN`; без обоих endpoint результат помечается `local-canary`.
+Несуществующий endpoint, обычный файл или выход из canary scope отклоняется.
+Runner не создаёт подставные runtime/admin-сокеты. Сам факт соединения с
+предоставленным тестовым сокетом остаётся marker/precondition evidence и не
+подтверждает реальное container exec или escape. Каждый attempt несёт: `attempt_id`, `procedure_id`
 + `procedure_revision`, environment manifest (`stand`, `os`, capabilities),
 `started/stopped_unix_ms`, `mode`, реальные `observations`, `bytes_written` /
 `files_created`, `fidelity_ceiling`, `claims_behavioral`, `cleanup_verified`.

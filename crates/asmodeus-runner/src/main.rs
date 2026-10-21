@@ -100,13 +100,14 @@ fn dry_run() -> Result<(), Box<dyn std::error::Error>> {
 /// are never dropped from the denominator.
 fn mitre_wave1_manifest() -> Result<(), Box<dyn std::error::Error>> {
     // `ASMODEUS_MITRE_WAVE1=stand` runs against a fully provisioned runtime
-    // stand (operator-supplied canary sockets); any other value is a plain
-    // local canary run, where the two runtime-stand slots stay NOT_RUN.
+    // stand via ASMODEUS_MITRE_ADMIN_SOCKET / ASMODEUS_MITRE_RUNTIME_SOCKET.
+    // Missing endpoints stay NOT_RUN; with neither endpoint the manifest
+    // remains local-canary. No mock stand sockets are fabricated.
     let on_stand = std::env::var("ASMODEUS_MITRE_WAVE1")
         .map(|v| v.eq_ignore_ascii_case("stand"))
         .unwrap_or(false);
     let (manifest, stand) = if on_stand {
-        let opts = procedures::RunOptions::stand();
+        let opts = procedures::RunOptions::stand()?;
         let stand = opts.env.stand.as_str();
         (
             procedures::run_corpus(&opts, &procedures::CancelToken::new()),

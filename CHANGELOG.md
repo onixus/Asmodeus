@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### Исправлено — независимое ревью S02, 2026-10-21
+
+- Стендовые container/runtime slots используют только явно предоставленные
+  canary-сокеты; без endpoint остаются NOT_RUN, без обоих — local-canary.
+- DNS slot отправляет корректный DNS TXT question вместо текстового маркера;
+  corpus поднят до `asmodeus-mitre-wave1-v2`, DNS procedure revision — 2.
+- Бюджет резервируется до записи/отправки, отказ не создаёт canary-файл.
+- Пустой network capture не даёт PASS; behavioral override не повышает
+  marker-only slot. Добавлены регрессионные проверки.
+
 ### Добавлено — воспроизводимые процедуры первой MITRE-волны (S02), 2026-10-21
 
 - Фиксированный versioned corpus из шести synthetic-only procedure-slots

@@ -30,7 +30,7 @@ use crate::mitre::ATTACK_VERSION;
 /// Identifier of this frozen corpus. Bumping it is a corpus revision: it
 /// requires an impact review and a re-run of the affected procedures (the
 /// results of an old corpus version do not carry over to a new one).
-pub const CORPUS_VERSION: &str = "asmodeus-mitre-wave1-v1";
+pub const CORPUS_VERSION: &str = "asmodeus-mitre-wave1-v2";
 
 /// How faithfully a procedure is exercised on a given run. This bounds the
 /// fidelity it may claim and keeps a cheap local run from masquerading as a
@@ -267,7 +267,7 @@ pub const PROCEDURE_SLOTS: &[ProcedureSlot] = &[
     ProcedureSlot {
         slot_id: "WAVE1-EXEC-SHELL",
         procedure_id: "ASMOD-WAVE1-0002",
-        procedure_revision: 1,
+        procedure_revision: 2,
         title: "synthetic unix-shell command execution",
         techniques: &[CandidateTechnique {
             technique_id: "T1059.004",
@@ -276,15 +276,15 @@ pub const PROCEDURE_SLOTS: &[ProcedureSlot] = &[
         platforms: &[Platform::Linux, Platform::Macos],
         requirement: Requirement::CanaryFilesystem,
         local_mode: ExecutionMode::Marker,
-        stand_mode: ExecutionMode::Behavioral,
+        stand_mode: ExecutionMode::Marker,
         preconditions: "writable canary directory",
         expected_observables: &[
             "a synthetic shell-command transcript written in canary scope",
         ],
         limitations:
             "records a synthetic shell-command transcript in canary scope and spawns NO real shell \
-             process locally — marker-only; a representative benign shell execution is a runtime-\
-             stand behavioural step, not claimed here",
+             process — marker-only in both local and stand modes; representative shell execution \
+             is not implemented",
         safety_scope: SCOPE_CANARY_FS,
         benign_control: BenignControl {
             expected_product_behavior:
@@ -380,7 +380,7 @@ pub const PROCEDURE_SLOTS: &[ProcedureSlot] = &[
     ProcedureSlot {
         slot_id: "WAVE1-C2-DNS",
         procedure_id: "ASMOD-WAVE1-0005",
-        procedure_revision: 1,
+        procedure_revision: 2,
         title: "synthetic DNS C2 query pattern to a loopback test receiver",
         techniques: &[CandidateTechnique {
             technique_id: "T1071.004",
@@ -396,7 +396,7 @@ pub const PROCEDURE_SLOTS: &[ProcedureSlot] = &[
             "the synthetic query label recorded in the attempt's canary log",
         ],
         limitations:
-            "emits a synthetic DNS-shaped query over a real loopback datagram to an in-process test \
+            "emits a valid synthetic DNS TXT question over a real loopback datagram to an in-process test \
              receiver within reserved test scope; performs NO real name resolution and reaches no \
              external resolver",
         safety_scope: SCOPE_LOOPBACK,

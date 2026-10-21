@@ -16,7 +16,10 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::FileTypeExt;
+#[cfg(test)]
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -163,20 +166,22 @@ impl BudgetGuard {
 
     /// Charge resource usage and refuse to exceed the budget.
     pub fn charge(&mut self, bytes: u64, files: u32) -> Result<(), ProcedureError> {
-        self.bytes = self.bytes.saturating_add(bytes);
-        self.files = self.files.saturating_add(files);
-        if self.bytes > self.budget.max_bytes {
+        let next_bytes = self.bytes.saturating_add(bytes);
+        let next_files = self.files.saturating_add(files);
+        if next_bytes > self.budget.max_bytes {
             return Err(ProcedureError::Budget(format!(
                 "bytes {}/{}",
-                self.bytes, self.budget.max_bytes
+                next_bytes, self.budget.max_bytes
             )));
         }
-        if self.files > self.budget.max_files {
+        if next_files > self.budget.max_files {
             return Err(ProcedureError::Budget(format!(
                 "files {}/{}",
-                self.files, self.budget.max_files
+                next_files, self.budget.max_files
             )));
         }
+        self.bytes = next_bytes;
+        self.files = next_files;
         Ok(())
     }
 
@@ -352,11 +357,13 @@ fn local_dest(addr: SocketAddr) -> io::Result<NetDestination> {
 
 /// A bounded in-process canary-scoped unix socket standing in for a runtime /
 /// container admin socket on a stand. Captures one synthetic command / probe.
+#[cfg(test)]
 pub struct UnixSocketReceiver {
     path: PathBuf,
     join: Option<JoinHandle<Vec<u8>>>,
 }
 
+#[cfg(test)]
 impl UnixSocketReceiver {
     pub fn start(path: &Path) -> Result<Self, ProcedureError> {
         let as_str = path.to_string_lossy();
@@ -409,6 +416,7 @@ impl UnixSocketReceiver {
     }
 }
 
+#[cfg(test)]
 impl Drop for UnixSocketReceiver {
     fn drop(&mut self) {
         if let Some(j) = self.join.take() {
@@ -445,16 +453,16 @@ fn canary_log(
     obs: &mut Observations,
 ) -> Result<(), ProcedureError> {
     guard.checkpoint()?;
-    std::fs::create_dir_all(dir)?;
     let log = dir.join("attempt.canary.log");
     let fresh = !log.exists();
+    let payload = format!("{line}\n");
+    guard.charge(payload.len() as u64, if fresh { 1 } else { 0 })?;
+    std::fs::create_dir_all(dir)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log)?;
-    let payload = format!("{line}\n");
     f.write_all(payload.as_bytes())?;
-    guard.charge(payload.len() as u64, if fresh { 1 } else { 0 })?;
     obs.bytes = obs.bytes.saturating_add(payload.len() as u64);
     if fresh {
         obs.files = obs.files.saturating_add(1);
@@ -515,11 +523,12 @@ impl Injector for ContainerExecInjector {
         let mut stream = UnixStream::connect(&self.socket).map_err(|e| {
             ProcedureError::PreconditionUnmet(format!("canary admin socket unavailable: {e}"))
         })?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let cmd = b"T1609 SYNTHETIC_EXEC namespace=asmodeus-canary cmd=/bin/true # marker\n";
+        guard.charge(cmd.len() as u64, 0)?;
         stream.write_all(cmd)?;
         stream.flush()?;
         drop(stream);
-        guard.charge(cmd.len() as u64, 0)?;
         obs.bytes = obs.bytes.saturating_add(cmd.len() as u64);
         canary_log(
             &self.dir,
@@ -559,11 +568,12 @@ impl Injector for RuntimeSocketInjector {
         let mut stream = UnixStream::connect(&self.socket).map_err(|e| {
             ProcedureError::PreconditionUnmet(format!("canary runtime socket unreachable: {e}"))
         })?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let probe = b"T1611 SYNTHETIC_REACHABILITY_SIGNAL (precondition only; no escape)\n";
+        guard.charge(probe.len() as u64, 0)?;
         stream.write_all(probe)?;
         stream.flush()?;
         drop(stream);
-        guard.charge(probe.len() as u64, 0)?;
         obs.bytes = obs.bytes.saturating_add(probe.len() as u64);
         canary_log(
             &self.dir,
@@ -596,8 +606,8 @@ impl Injector for HttpBeaconInjector {
         guard.checkpoint()?;
         let beacon = "GET /canary/beacon HTTP/1.1\r\nHost: beacon-test.invalid\r\n\
              X-Asmodeus: T1071.001 synthetic jitter_ms=25\r\n\r\n";
+        guard.charge(beacon.len() as u64, 0)?;
         let sent = tcp_send(self.dest, beacon.as_bytes())?;
-        guard.charge(sent as u64, 0)?;
         obs.bytes = obs.bytes.saturating_add(sent as u64);
         obs.note(format!(
             "sent synthetic HTTP beacon ({sent} bytes) over loopback to {}:{}",
@@ -634,9 +644,9 @@ impl Injector for DnsC2Injector {
     fn execute(&self, guard: &mut BudgetGuard) -> Result<Observations, ProcedureError> {
         let mut obs = Observations::default();
         guard.checkpoint()?;
-        let query = b"T1071.004 QUERY c2-canary.beacon-test.invalid TXT (synthetic)";
-        let sent = udp_send(self.dest, query)?;
-        guard.charge(sent as u64, 0)?;
+        let query = dns_canary_query();
+        guard.charge(query.len() as u64, 0)?;
+        let sent = udp_send(self.dest, &query)?;
         obs.bytes = obs.bytes.saturating_add(sent as u64);
         obs.note(format!(
             "sent synthetic DNS C2 query label ({sent} bytes) over loopback to {}:{}",
@@ -708,6 +718,17 @@ impl Injector for ExfilTransferInjector {
         )?;
         Ok(obs)
     }
+}
+
+/// Valid DNS wire query: one TXT question, no external resolver involved.
+fn dns_canary_query() -> Vec<u8> {
+    let mut query = vec![0x41, 0x53, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in ["c2-canary", "beacon-test", "invalid"] {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 16, 0, 1]); // root, QTYPE=TXT, QCLASS=IN
+    query
 }
 
 fn connect_tcp(dest: NetDestination) -> Result<TcpStream, ProcedureError> {
@@ -935,6 +956,8 @@ pub struct RunOptions {
     pub mode_override: Option<ExecutionMode>,
     pub fault: Fault,
     pub exfil_blob_bytes: usize,
+    pub admin_socket: Option<PathBuf>,
+    pub runtime_socket: Option<PathBuf>,
 }
 
 impl RunOptions {
@@ -945,22 +968,50 @@ impl RunOptions {
             mode_override: None,
             fault: Fault::None,
             exfil_blob_bytes: 32 * 1024,
+            admin_socket: None,
+            runtime_socket: None,
         }
     }
 
-    /// Options for a fully provisioned runtime stand: every slot is supported
-    /// (the operator has wired the stand's canary-scoped sockets), and results
-    /// are recorded against [`Stand::RuntimeStand`] so they are not conflated
-    /// with a plain local run.
-    pub fn stand() -> Self {
-        RunOptions {
-            env: Environment {
-                stand: Stand::RuntimeStand,
-                os: std::env::consts::OS.to_string(),
-                caps: Capabilities::FULL_STAND,
-            },
-            ..RunOptions::local()
+    /// Read explicit operator endpoints; absent endpoints stay unsupported.
+    pub fn stand() -> Result<Self, ProcedureError> {
+        Self::with_stand_sockets(
+            std::env::var_os("ASMODEUS_MITRE_ADMIN_SOCKET").map(PathBuf::from),
+            std::env::var_os("ASMODEUS_MITRE_RUNTIME_SOCKET").map(PathBuf::from),
+        )
+    }
+
+    fn with_stand_sockets(
+        admin: Option<PathBuf>,
+        runtime: Option<PathBuf>,
+    ) -> Result<Self, ProcedureError> {
+        for path in [&admin, &runtime].into_iter().flatten() {
+            validate_dir(path)?;
+            // Reject symlink escapes as well as non-socket/stale endpoints.
+            let resolved = std::fs::canonicalize(path)?;
+            let confined = ["/tmp", "/var/tmp"].iter().any(|root| {
+                std::fs::canonicalize(root)
+                    .is_ok_and(|parent| resolved.starts_with(parent.join("asmodeus-canary")))
+            });
+            if !confined {
+                return Err(ProcedureError::OutOfScope(resolved.display().to_string()));
+            }
+            if !std::fs::metadata(path)?.file_type().is_socket() {
+                return Err(ProcedureError::PreconditionUnmet(format!(
+                    "not a stand socket: {}",
+                    path.display()
+                )));
+            }
         }
+        let mut opts = Self::local();
+        opts.env.caps.container_admin_socket = admin.is_some();
+        opts.env.caps.runtime_test_socket = runtime.is_some();
+        if admin.is_some() || runtime.is_some() {
+            opts.env.stand = Stand::RuntimeStand;
+        }
+        opts.admin_socket = admin;
+        opts.runtime_socket = runtime;
+        Ok(opts)
     }
 }
 
@@ -1023,7 +1074,16 @@ pub fn run_slot(slot: &ProcedureSlot, opts: &RunOptions, cancel: &CancelToken) -
         return manifest;
     }
 
-    let mode = opts.mode_override.unwrap_or(slot.local_mode);
+    let implemented_mode = if opts.env.stand == Stand::RuntimeStand {
+        slot.stand_mode
+    } else {
+        slot.local_mode
+    };
+    let mode = match opts.mode_override {
+        Some(ExecutionMode::Replay) => ExecutionMode::Replay,
+        Some(ExecutionMode::Marker) => ExecutionMode::Marker,
+        _ => implemented_mode,
+    };
     manifest.mode = Some(mode);
     manifest.work_dir = Some(dir.to_string_lossy().into_owned());
     let budget = opts.budget_override.unwrap_or(slot.budget);
@@ -1060,6 +1120,10 @@ pub fn run_slot(slot: &ProcedureSlot, opts: &RunOptions, cancel: &CancelToken) -
             manifest.observations = obs.items;
             manifest.fidelity_ceiling = Some(mode.fidelity_ceiling());
             manifest.detail = format!("{} PASS ({} mode)", slot.slot_id, mode.as_str());
+        }
+        Err(ProcedureError::PreconditionUnmet(detail)) => {
+            manifest.status = AttemptStatus::NotRun;
+            manifest.detail = detail;
         }
         Err(e) => {
             manifest.status = AttemptStatus::Fail;
@@ -1108,22 +1172,18 @@ fn run_live(
     match slot.requirement {
         Requirement::LoopbackTestReceiver => run_network_slot(slot, dir, opts, guard),
         Requirement::ContainerAdminSocket => {
-            let sock = dir.join("admin.sock");
-            let receiver = UnixSocketReceiver::start(&sock)?;
-            let dest = receiver.path().to_path_buf();
-            let injector = ContainerExecInjector::new(dir.to_path_buf(), dest)?;
-            let out = run_guarded(&injector, guard);
-            let captured = receiver.finish();
-            finish_socket(out, &captured, "admin socket")
+            let socket = opts.admin_socket.as_ref().ok_or_else(|| {
+                ProcedureError::PreconditionUnmet("operator admin socket not configured".into())
+            })?;
+            let injector = ContainerExecInjector::new(dir.to_path_buf(), socket.clone())?;
+            run_guarded(&injector, guard)
         }
         Requirement::RuntimeTestSocket => {
-            let sock = dir.join("runtime.sock");
-            let receiver = UnixSocketReceiver::start(&sock)?;
-            let dest = receiver.path().to_path_buf();
-            let injector = RuntimeSocketInjector::new(dir.to_path_buf(), dest)?;
-            let out = run_guarded(&injector, guard);
-            let captured = receiver.finish();
-            finish_socket(out, &captured, "runtime socket")
+            let socket = opts.runtime_socket.as_ref().ok_or_else(|| {
+                ProcedureError::PreconditionUnmet("operator runtime socket not configured".into())
+            })?;
+            let injector = RuntimeSocketInjector::new(dir.to_path_buf(), socket.clone())?;
+            run_guarded(&injector, guard)
         }
         Requirement::CanaryFilesystem => {
             // Shell marker — the only filesystem-only slot in the corpus.
@@ -1189,25 +1249,19 @@ fn finish_net(
     captured: &[u8],
     dest: NetDestination,
 ) -> Result<Observations, ProcedureError> {
-    out.map(|mut obs| {
+    out.and_then(|mut obs| {
+        if captured.is_empty() {
+            return Err(ProcedureError::Io(
+                "test receiver captured no payload".into(),
+            ));
+        }
         obs.note(format!(
             "test receiver on {}:{} captured {} bytes",
             dest.ip,
             dest.port,
             captured.len()
         ));
-        obs
-    })
-}
-
-fn finish_socket(
-    out: Result<Observations, ProcedureError>,
-    captured: &[u8],
-    label: &str,
-) -> Result<Observations, ProcedureError> {
-    out.map(|mut obs| {
-        obs.note(format!("canary {label} captured {} bytes", captured.len()));
-        obs
+        Ok(obs)
     })
 }
 
@@ -1255,6 +1309,146 @@ mod tests {
     }
 
     #[test]
+    fn stand_without_operator_sockets_is_local_and_not_run() {
+        let opts = RunOptions::with_stand_sockets(None, None).unwrap();
+        let m = run_corpus(&opts, &CancelToken::new());
+        assert_eq!(m.stand, Stand::LocalCanary);
+        assert_eq!(m.not_run_count(), 2);
+        assert_eq!(m.denominator(), 6);
+    }
+
+    #[test]
+    fn stand_rejects_non_socket_and_out_of_scope_endpoints() {
+        let (_, dir) = new_attempt();
+        let mut cleanup = WorkDirGuard::new(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-socket");
+        std::fs::write(&file, b"canary").unwrap();
+        assert!(RunOptions::with_stand_sockets(Some(file), None).is_err());
+        assert!(RunOptions::with_stand_sockets(Some("/etc/runtime.sock".into()), None).is_err());
+        assert!(cleanup.cleanup());
+    }
+
+    #[test]
+    fn vanished_stand_socket_stays_not_run() {
+        let (_, dir) = new_attempt();
+        let mut cleanup = WorkDirGuard::new(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("admin.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let opts = RunOptions::with_stand_sockets(Some(socket.clone()), None).unwrap();
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        let m = run_slot(
+            slot_def("WAVE1-EXEC-CONTAINER").unwrap(),
+            &opts,
+            &CancelToken::new(),
+        );
+        assert_eq!(m.status, AttemptStatus::NotRun);
+        assert!(!m.to_json()["claims_behavioral"].as_bool().unwrap());
+        assert_clean(&m);
+        assert!(cleanup.cleanup());
+    }
+
+    #[test]
+    fn behavioral_override_cannot_promote_shell_marker() {
+        let mut opts = RunOptions::local();
+        opts.mode_override = Some(ExecutionMode::Behavioral);
+        let m = run_slot(
+            slot_def("WAVE1-EXEC-SHELL").unwrap(),
+            &opts,
+            &CancelToken::new(),
+        );
+        assert_eq!(m.status, AttemptStatus::Pass);
+        assert_eq!(m.fidelity_ceiling, Some(Fidelity::MarkerOnly));
+        assert!(!m.to_json()["claims_behavioral"].as_bool().unwrap());
+        assert_clean(&m);
+    }
+
+    #[test]
+    fn exhausted_budget_prevents_file_creation_and_preserves_usage() {
+        for (bytes, files) in [(0, 4), (1024, 0)] {
+            let (_, dir) = new_attempt();
+            let mut cleanup = WorkDirGuard::new(dir.clone());
+            let mut guard = BudgetGuard::new(
+                ResourceBudget {
+                    max_duration_ms: 1000,
+                    max_bytes: bytes,
+                    max_files: files,
+                },
+                CancelToken::new(),
+            );
+            let injector = ShellExecInjector::new(dir.clone()).unwrap();
+            assert!(matches!(
+                injector.execute(&mut guard),
+                Err(ProcedureError::Budget(_))
+            ));
+            assert!(!dir.exists());
+            assert_eq!(guard.usage(), (0, 0));
+            assert!(cleanup.cleanup());
+        }
+    }
+
+    #[test]
+    fn exhausted_budget_prevents_udp_send() {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let (_, dir) = new_attempt();
+        let mut guard = BudgetGuard::new(
+            ResourceBudget {
+                max_duration_ms: 1000,
+                max_bytes: 0,
+                max_files: 0,
+            },
+            CancelToken::new(),
+        );
+        let injector =
+            DnsC2Injector::new(dir.clone(), local_dest(sock.local_addr().unwrap()).unwrap())
+                .unwrap();
+        assert!(matches!(
+            injector.execute(&mut guard),
+            Err(ProcedureError::Budget(_))
+        ));
+        let mut buf = [0; 512];
+        assert!(matches!(
+            sock.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn dns_injector_sends_a_valid_txt_question() {
+        let receiver = LoopbackReceiver::start_udp().unwrap();
+        let (_, dir) = new_attempt();
+        let mut cleanup = WorkDirGuard::new(dir.clone());
+        let injector = DnsC2Injector::new(dir, receiver.destination()).unwrap();
+        let mut guard =
+            BudgetGuard::new(slot_def("WAVE1-C2-DNS").unwrap().budget, CancelToken::new());
+        injector.execute(&mut guard).unwrap();
+        let packet = receiver.finish();
+        assert_eq!(&packet[2..12], &[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let mut offset = 12;
+        let mut labels = Vec::new();
+        while packet[offset] != 0 {
+            let len = usize::from(packet[offset]);
+            offset += 1;
+            labels.push(std::str::from_utf8(&packet[offset..offset + len]).unwrap());
+            offset += len;
+        }
+        assert_eq!(labels.join("."), "c2-canary.beacon-test.invalid");
+        assert_eq!(&packet[offset..], &[0, 0, 16, 0, 1]);
+        assert!(cleanup.cleanup());
+    }
+
+    #[test]
+    fn empty_network_capture_cannot_pass() {
+        let dest = NetDestination::new(Ipv4Addr::LOCALHOST, 12345).unwrap();
+        assert!(finish_net(Ok(Observations::default()), &[], dest).is_err());
+    }
+
+    #[test]
     fn local_corpus_keeps_unsupported_in_denominator() {
         let m = run_local_corpus();
         assert_eq!(m.attempts.len(), 6);
@@ -1280,7 +1474,17 @@ mod tests {
 
     #[test]
     fn full_stand_runs_all_six_and_cleans_up() {
-        let m = run_corpus(&RunOptions::stand(), &CancelToken::new());
+        let (_, dir) = new_attempt();
+        let mut cleanup = WorkDirGuard::new(dir.clone());
+        let admin = UnixSocketReceiver::start(&dir.join("admin.sock")).unwrap();
+        let runtime = UnixSocketReceiver::start(&dir.join("runtime.sock")).unwrap();
+        let opts =
+            RunOptions::with_stand_sockets(Some(admin.path().into()), Some(runtime.path().into()))
+                .unwrap();
+        let m = run_corpus(&opts, &CancelToken::new());
+        assert!(!admin.finish().is_empty());
+        assert!(!runtime.finish().is_empty());
+        assert!(cleanup.cleanup());
         assert_eq!(m.stand, Stand::RuntimeStand);
         assert_eq!(m.not_run_count(), 0);
         assert_eq!(m.failed_count(), 0);
