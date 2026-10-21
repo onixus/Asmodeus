@@ -542,7 +542,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "  category: {:?}, severity: {}, mitre: {}",
                     parsed.metadata.category,
                     parsed.metadata.severity,
-                    parsed.metadata.mitre_technique.as_deref().unwrap_or("N/A")
+                    parsed.primary_technique().map(|t| t.id).unwrap_or("N/A")
+                );
+                // S01: show the effective fidelity (a legacy v1alpha1 manifest
+                // reports `unspecified` regardless of what it declares).
+                let fidelity = parsed.effective_fidelity();
+                println!(
+                    "  apiVersion: {} ({}), fidelity: {} — {}",
+                    parsed.api_version,
+                    if parsed.is_legacy() {
+                        "legacy"
+                    } else {
+                        "current"
+                    },
+                    fidelity.as_str(),
+                    fidelity.summary()
                 );
             } else if let Some(d) = target_dir {
                 if ops::validate_scope(&d) {

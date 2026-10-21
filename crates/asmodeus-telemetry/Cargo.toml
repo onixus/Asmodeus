@@ -11,3 +11,8 @@ asmodeus-common = { workspace = true }
 asmodeus-crypto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# S01: validate that compliance control definitions only reference technique
+# IDs that exist in the pinned ATT&CK taxonomy (no runtime dependency).
+asmodeus-dsl = { workspace = true }

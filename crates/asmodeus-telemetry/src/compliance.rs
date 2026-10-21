@@ -15,12 +15,73 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditRecord;
 
 /// Minimal scenario metadata needed for compliance evaluation.
+fn default_unspecified() -> String {
+    "unspecified".to_string()
+}
+
+/// One technique a scenario references, with the fidelity it is exercised at.
+/// Stringly typed so telemetry carries no runtime dependency on the DSL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioTechniqueFidelity {
+    pub technique_id: String,
+    #[serde(default = "default_unspecified")]
+    pub fidelity: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioMeta {
     pub id: String,
     pub name: String,
     pub category: String,
+    /// Primary technique (single-technique projection, back-compat).
     pub mitre_technique: String,
+    /// Scenario-level (ceiling) fidelity string
+    /// (`behavioral` | `marker_only` | `unspecified`). Defaults to
+    /// `unspecified` so a scenario is never assumed behavioural.
+    #[serde(default = "default_unspecified")]
+    pub fidelity: String,
+    /// S01: per-technique fidelity. Prevention/behavioural eligibility for a
+    /// control is decided from the fidelity of the **specific matched
+    /// technique** here — never from the scenario ceiling — so a scenario that
+    /// declares a high ceiling but exercises a given technique only at
+    /// marker-only cannot claim prevention of that technique.
+    #[serde(default)]
+    pub technique_refs: Vec<ScenarioTechniqueFidelity>,
+}
+
+impl ScenarioMeta {
+    /// True iff this scenario's *ceiling* fidelity is behavioural. Kept for the
+    /// single-technique fallback only; control eligibility uses
+    /// [`Self::is_behavioral_for_any`].
+    pub fn is_behavioral(&self) -> bool {
+        self.fidelity == "behavioral"
+    }
+
+    /// True iff this scenario references any of `techniques` at all (via the
+    /// per-technique refs, or the single primary projection as a fallback).
+    pub fn matches_any(&self, techniques: &[&str]) -> bool {
+        if self
+            .technique_refs
+            .iter()
+            .any(|r| techniques.contains(&r.technique_id.as_str()))
+        {
+            return true;
+        }
+        techniques.contains(&self.mitre_technique.as_str())
+    }
+
+    /// True iff this scenario exercises at least one of `techniques` at
+    /// behavioural fidelity. Uses the per-technique refs; when none are present
+    /// (legacy caller), falls back to the ceiling fidelity paired with the
+    /// primary technique.
+    pub fn is_behavioral_for_any(&self, techniques: &[&str]) -> bool {
+        if !self.technique_refs.is_empty() {
+            return self.technique_refs.iter().any(|r| {
+                r.fidelity == "behavioral" && techniques.contains(&r.technique_id.as_str())
+            });
+        }
+        self.is_behavioral() && techniques.contains(&self.mitre_technique.as_str())
+    }
 }
 
 /// Regulatory framework or standard.
@@ -49,6 +110,22 @@ pub struct ComplianceControl {
     pub description: String,
     pub mapped_techniques: Vec<String>,
     pub matching_scenarios: Vec<String>,
+    /// S01: matching scenarios that run at behavioural fidelity — the only ones
+    /// that may support a prevention/behavioural claim for this control.
+    #[serde(default)]
+    pub behavioral_scenarios: Vec<String>,
+    /// S01: matching scenarios that are marker-only / undeclared fidelity. They
+    /// prove an indicator is present and detectable, not that the technique's
+    /// behaviour ran or was prevented.
+    #[serde(default)]
+    pub marker_only_scenarios: Vec<String>,
+    /// S01: true iff at least one matching scenario is behavioural. When false,
+    /// this control has no behavioural/prevention coverage regardless of status.
+    #[serde(default)]
+    pub prevention_eligible: bool,
+    /// S01: present when coverage is marker-only, stating the limitation plainly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_note: Option<String>,
     pub total_runs: usize,
     pub detected_runs: usize,
     pub detection_rate_pct: f32,
@@ -121,12 +198,38 @@ impl ComplianceReport {
         let mut non_compliant_count = 0;
 
         for (cid, std, title, desc, techniques) in controls_defs {
-            // Find scenarios matching any of the mapped techniques
-            let matching_scenarios: Vec<String> = scenarios
+            // Find scenarios matching any of the mapped techniques, split by
+            // fidelity so prevention/behavioural coverage can be assessed
+            // honestly (S01): a marker-only scenario is matched but never
+            // treated as prevention coverage.
+            let matched: Vec<&ScenarioMeta> = scenarios
                 .iter()
-                .filter(|s| techniques.iter().any(|&t| s.mitre_technique == t))
+                .filter(|s| s.matches_any(&techniques))
+                .collect();
+            let matching_scenarios: Vec<String> = matched.iter().map(|s| s.id.clone()).collect();
+            // Behavioural/prevention eligibility is decided from the fidelity of
+            // the *specific matched technique*, not the scenario ceiling (S01
+            // honesty gate; mirrors the per-ref logic in the MITRE matrix).
+            let behavioral_scenarios: Vec<String> = matched
+                .iter()
+                .filter(|s| s.is_behavioral_for_any(&techniques))
                 .map(|s| s.id.clone())
                 .collect();
+            let marker_only_scenarios: Vec<String> = matched
+                .iter()
+                .filter(|s| !s.is_behavioral_for_any(&techniques))
+                .map(|s| s.id.clone())
+                .collect();
+            let prevention_eligible = !behavioral_scenarios.is_empty();
+            let coverage_note = if !matching_scenarios.is_empty() && !prevention_eligible {
+                Some(
+                    "marker-only coverage: matched scenarios prove indicator detection only, \
+                     not behavioural execution or prevention of the mapped technique(s)"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
 
             // Find runs matching these scenarios or techniques
             let matching_runs: Vec<&AuditRecord> = records
@@ -176,6 +279,10 @@ impl ComplianceReport {
                 description: desc.to_string(),
                 mapped_techniques: techniques.into_iter().map(String::from).collect(),
                 matching_scenarios,
+                behavioral_scenarios,
+                marker_only_scenarios,
+                prevention_eligible,
+                coverage_note,
                 total_runs,
                 detected_runs,
                 detection_rate_pct,
@@ -226,9 +333,9 @@ impl ComplianceReport {
         ));
 
         out.push_str(
-            "| Контроль | Стандарт | Название | MITRE Техники | Прогоны | Детект % | Статус |\n",
+            "| Контроль | Стандарт | Название | MITRE Техники | Прогоны | Детект % | Статус | Покрытие |\n",
         );
-        out.push_str("| :--- | :--- | :--- | :--- | :---: | :---: | :---: |\n");
+        out.push_str("| :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: |\n");
 
         for c in &self.controls {
             let status_badge = match c.status.as_str() {
@@ -238,15 +345,25 @@ impl ComplianceReport {
                 "NO_EVIDENCE" => "⚪ NO_EVIDENCE",
                 _ => "⚪ NOT_TESTED",
             };
+            // S01: fidelity of the coverage — marker-only is flagged so a
+            // reader never mistakes indicator detection for prevention.
+            let coverage_badge = if c.matching_scenarios.is_empty() {
+                "—"
+            } else if c.prevention_eligible {
+                "behavioural"
+            } else {
+                "⚠️ marker-only"
+            };
             out.push_str(&format!(
-                "| **{}** | {} | {} | `{}` | {} | {:.1}% | {} |\n",
+                "| **{}** | {} | {} | `{}` | {} | {:.1}% | {} | {} |\n",
                 c.control_id,
                 c.standard,
                 c.title,
                 c.mapped_techniques.join(", "),
                 c.total_runs,
                 c.detection_rate_pct,
-                status_badge
+                status_badge,
+                coverage_badge
             ));
         }
 
@@ -344,6 +461,93 @@ mod tests {
     use super::*;
     use crate::Measurements;
 
+    #[test]
+    fn every_mapped_control_technique_is_known_to_the_taxonomy() {
+        // S01 CI gate: a control that maps to a stale/mistyped technique ID
+        // (the historical T1568 / T1562.001 drift) fails the build here.
+        let report = ComplianceReport::generate(&[], &[]);
+        for control in &report.controls {
+            for tech in &control.mapped_techniques {
+                assert!(
+                    asmodeus_dsl::is_known_id(tech),
+                    "control {} maps to unknown technique {tech}",
+                    control.control_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_technique_fidelity_overrides_scenario_ceiling_for_prevention() {
+        // The exploit the adversarial review found: a scenario with a
+        // behavioural *ceiling* that exercises the matched technique (T1486)
+        // only at marker-only must NOT make the T1486 control prevention
+        // eligible. Eligibility reads the per-technique ref, not the ceiling.
+        let crafted = vec![ScenarioMeta {
+            id: "DYN-MIXED-001".into(),
+            name: "Mixed fidelity".into(),
+            category: "red_team".into(),
+            mitre_technique: "T1486".into(),
+            fidelity: "behavioral".into(), // ceiling claims behavioural
+            technique_refs: vec![ScenarioTechniqueFidelity {
+                technique_id: "T1486".into(),
+                fidelity: "marker_only".into(), // but T1486 is only marker-only
+            }],
+        }];
+        let report = ComplianceReport::generate(&crafted, &[]);
+        let ds = report
+            .controls
+            .iter()
+            .find(|c| c.control_id == "NIST-PR.DS-01") // maps T1486
+            .unwrap();
+        assert!(ds.matching_scenarios.contains(&"DYN-MIXED-001".to_string()));
+        assert!(
+            !ds.prevention_eligible,
+            "marker-only T1486 ref must not be prevention eligible despite behavioural ceiling"
+        );
+        assert!(ds.coverage_note.is_some());
+        assert!(ds.behavioral_scenarios.is_empty());
+    }
+
+    #[test]
+    fn behavioral_technique_ref_is_prevention_eligible() {
+        let crafted = vec![ScenarioMeta {
+            id: "DYN-BEH-001".into(),
+            name: "Behavioural ransomware".into(),
+            category: "red_team".into(),
+            mitre_technique: "T1486".into(),
+            fidelity: "behavioral".into(),
+            technique_refs: vec![ScenarioTechniqueFidelity {
+                technique_id: "T1486".into(),
+                fidelity: "behavioral".into(),
+            }],
+        }];
+        let report = ComplianceReport::generate(&crafted, &[]);
+        let ds = report
+            .controls
+            .iter()
+            .find(|c| c.control_id == "NIST-PR.DS-01")
+            .unwrap();
+        assert!(ds.prevention_eligible);
+        assert!(ds.coverage_note.is_none());
+        assert_eq!(ds.behavioral_scenarios, vec!["DYN-BEH-001".to_string()]);
+    }
+
+    #[test]
+    fn marker_only_control_is_flagged_not_prevention_eligible() {
+        // Credential-access control maps to T1003, which is marker-only here.
+        let report = ComplianceReport::generate(&sample_scenarios(), &[]);
+        let ac = report
+            .controls
+            .iter()
+            .find(|c| c.control_id == "NIST-PR.AC-04")
+            .unwrap();
+        assert!(ac.matching_scenarios.contains(&"SCN-RT-002".to_string()));
+        assert!(!ac.prevention_eligible);
+        assert!(ac.coverage_note.is_some());
+        assert!(ac.behavioral_scenarios.is_empty());
+    }
+
     fn sample_scenarios() -> Vec<ScenarioMeta> {
         vec![
             ScenarioMeta {
@@ -351,18 +555,33 @@ mod tests {
                 name: "Ransomware".into(),
                 category: "red_team".into(),
                 mitre_technique: "T1486".into(),
+                fidelity: "behavioral".into(),
+                technique_refs: vec![ScenarioTechniqueFidelity {
+                    technique_id: "T1486".into(),
+                    fidelity: "behavioral".into(),
+                }],
             },
             ScenarioMeta {
                 id: "SCN-RT-002".into(),
                 name: "Credential Honeytoken".into(),
                 category: "red_team".into(),
                 mitre_technique: "T1003".into(),
+                fidelity: "marker_only".into(),
+                technique_refs: vec![ScenarioTechniqueFidelity {
+                    technique_id: "T1003".into(),
+                    fidelity: "marker_only".into(),
+                }],
             },
             ScenarioMeta {
                 id: "SCN-RT-003".into(),
                 name: "C2 Beacon".into(),
                 category: "red_team".into(),
                 mitre_technique: "T1071".into(),
+                fidelity: "marker_only".into(),
+                technique_refs: vec![ScenarioTechniqueFidelity {
+                    technique_id: "T1071".into(),
+                    fidelity: "marker_only".into(),
+                }],
             },
         ]
     }

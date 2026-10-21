@@ -115,6 +115,10 @@ pub(crate) async fn list_scenarios(
                 },
                 "mitre_technique": entry.mitre.map(|m| m.id),
                 "mitre_tactic": entry.mitre.map(|m| m.tactic),
+                // S01: fidelity flag so a marker-only scenario is visible as
+                // such and cannot be read as behavioural coverage.
+                "fidelity": entry.fidelity.as_str(),
+                "claims_behavioral_coverage": entry.claims_behavioral_coverage(),
                 "severity": entry.severity,
                 "detector": entry.detector,
                 "description": entry.description,
@@ -139,6 +143,36 @@ pub(crate) async fn get_scenario(
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("unknown scenario_id: {id}")))?;
 
+    // S01: full technique mapping with per-technique fidelity.
+    let technique_refs: Vec<Value> = entry
+        .technique_refs
+        .iter()
+        .map(|r| {
+            let t = asmodeus_dsl::lookup_technique(&r.technique_id);
+            json!({
+                "technique_id": r.technique_id,
+                "technique_name": t.map(|t| t.name),
+                "tactic": t.map(|t| t.tactic),
+                "tactics": t.map(|t| t.tactics),
+                "fidelity": r.fidelity.as_str(),
+            })
+        })
+        .collect();
+
+    // S01: the pinned procedure profile (built-in scenarios).
+    let profile = entry.profile.as_ref().map(|p| {
+        json!({
+            "procedure_id": p.procedure_id,
+            "procedure_revision": p.procedure_revision,
+            "platforms": p.platforms.iter().map(|pl| pl.as_str()).collect::<Vec<_>>(),
+            "preconditions": p.preconditions,
+            "safety_scope": p.safety_scope,
+            "expected_observables": p.expected_observables,
+            "limitations": p.limitations,
+            "legacy_technique": p.legacy_technique,
+        })
+    });
+
     Ok(Json(json!({
         "id": entry.id,
         "name": entry.name,
@@ -146,10 +180,17 @@ pub(crate) async fn get_scenario(
             Category::RedTeam => "red_team",
             Category::Chaos => "chaos",
         },
+        "attack_version": asmodeus_dsl::ATTACK_VERSION,
         "mitre_technique": entry.mitre.map(|m| m.id),
         "mitre_tactic": entry.mitre.map(|m| m.tactic),
         "mitre_technique_name": entry.mitre.map(|m| m.name),
         "mitre_description": entry.mitre.map(|m| m.description),
+        // S01 honesty fields.
+        "fidelity": entry.fidelity.as_str(),
+        "fidelity_summary": entry.fidelity.summary(),
+        "claims_behavioral_coverage": entry.claims_behavioral_coverage(),
+        "technique_refs": technique_refs,
+        "profile": profile,
         "severity": entry.severity,
         "detector": entry.detector,
         "description": entry.description,
@@ -168,24 +209,54 @@ pub(crate) async fn mitre_matrix(
         return Err(ApiError::Forbidden("role may not view MITRE matrix"));
     }
 
+    use asmodeus_dsl::Fidelity;
+
     let mut tactics_map: HashMap<&'static str, Vec<Value>> = HashMap::new();
-    let mut covered_techniques = std::collections::HashSet::new();
+    // All referenced techniques, and — separately — the best fidelity any
+    // scenario exercises each at. "Referenced" is not "covered": a technique is
+    // only *behaviourally* covered when some scenario runs it at behavioural
+    // fidelity. Marker-only references are recorded but never promoted.
+    let mut referenced_techniques: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut best_fidelity: HashMap<String, Fidelity> = HashMap::new();
     let mut mitre_scenarios_count = 0;
 
     for entry in state.catalog.entries() {
-        if let Some(m) = entry.mitre {
-            mitre_scenarios_count += 1;
-            covered_techniques.insert(m.id);
-            tactics_map.entry(m.tactic).or_default().push(json!({
+        if entry.technique_refs.is_empty() {
+            continue;
+        }
+        mitre_scenarios_count += 1;
+        for r in &entry.technique_refs {
+            let Some(t) = asmodeus_dsl::lookup_technique(&r.technique_id) else {
+                continue;
+            };
+            referenced_techniques.insert(r.technique_id.clone());
+            let slot = best_fidelity.entry(r.technique_id.clone()).or_default();
+            if r.fidelity > *slot {
+                *slot = r.fidelity;
+            }
+            tactics_map.entry(t.tactic).or_default().push(json!({
                 "scenario_id": entry.id,
                 "scenario_name": entry.name,
-                "technique_id": m.id,
-                "technique_name": m.name,
+                "technique_id": t.id,
+                "technique_name": t.name,
+                "fidelity": r.fidelity.as_str(),
+                // The honest caveat travels with the row.
+                "claims_behavioral_coverage": r.fidelity.claims_behavioral(),
+                "limitations": entry.profile.as_ref().map(|p| p.limitations.clone()),
                 "severity": entry.severity,
                 "detector": entry.detector,
             }));
         }
     }
+
+    let behavioral_coverage_count = best_fidelity
+        .values()
+        .filter(|f| f.claims_behavioral())
+        .count();
+    let marker_only_techniques_count = referenced_techniques
+        .len()
+        .saturating_sub(behavioral_coverage_count);
 
     let mut sorted_tactics: Vec<_> = tactics_map
         .into_iter()
@@ -204,9 +275,20 @@ pub(crate) async fn mitre_matrix(
 
     Ok(Json(json!({
         "framework": "MITRE ATT&CK Enterprise Matrix",
+        "attack_version": asmodeus_dsl::ATTACK_VERSION,
         "total_scenarios": total_scenarios,
         "mitre_scenarios_count": mitre_scenarios_count,
-        "covered_techniques_count": covered_techniques.len(),
+        // `covered_techniques_count` is retained for backward compatibility and
+        // means "techniques *referenced* by a scenario" — it is NOT a claim of
+        // behavioural coverage. Use the split fields below for honest coverage.
+        "covered_techniques_count": referenced_techniques.len(),
+        "techniques_referenced_count": referenced_techniques.len(),
+        "behavioral_coverage_count": behavioral_coverage_count,
+        "marker_only_techniques_count": marker_only_techniques_count,
+        "coverage_note": "A referenced technique is not behavioural coverage. \
+             Only `behavioral_coverage_count` techniques are exercised at behavioural \
+             fidelity; the rest are marker-only (synthetic indicator) and prove detection \
+             of an indicator, not that the technique's behaviour ran or was prevented.",
         "tactics_count": sorted_tactics.len(),
         "tactics": sorted_tactics,
     })))
@@ -267,14 +349,27 @@ pub(crate) async fn validate_scenario_manifest(
     let body_str = std::str::from_utf8(&body)
         .map_err(|e| ApiError::Unprocessable(format!("invalid UTF-8 body: {e}")))?;
     match asmodeus_dsl::parse_and_validate_manifest(body_str) {
-        Ok(manifest) => Ok(Json(json!({
-            "valid": true,
-            "manifest_id": manifest.metadata.id,
-            "manifest_name": manifest.metadata.name,
-            "category": manifest.metadata.category,
-            "mitre_technique": manifest.metadata.mitre_technique,
-            "inv_0_compliant": true,
-        }))),
+        Ok(manifest) => {
+            let refs: Vec<Value> = manifest
+                .resolved_technique_refs()
+                .into_iter()
+                .map(|r| json!({ "technique_id": r.technique_id, "fidelity": r.fidelity.as_str() }))
+                .collect();
+            Ok(Json(json!({
+                "valid": true,
+                "manifest_id": manifest.metadata.id,
+                "manifest_name": manifest.metadata.name,
+                "category": manifest.metadata.category,
+                "api_version": manifest.api_version,
+                "legacy": manifest.is_legacy(),
+                "mitre_technique": manifest.primary_technique().map(|t| t.id),
+                // Effective fidelity — a legacy manifest is reported as
+                // `unspecified` no matter what it self-declares.
+                "fidelity": manifest.effective_fidelity().as_str(),
+                "technique_refs": refs,
+                "inv_0_compliant": true,
+            })))
+        }
         Err(e) => Err(ApiError::Unprocessable(e.to_string())),
     }
 }
