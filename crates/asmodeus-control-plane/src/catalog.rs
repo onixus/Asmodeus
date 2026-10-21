@@ -47,7 +47,13 @@ impl ScenarioEntry {
     /// True iff this scenario may contribute to **behavioural** coverage of its
     /// technique(s). Marker-only / undeclared scenarios never do.
     pub fn claims_behavioral_coverage(&self) -> bool {
-        self.fidelity.claims_behavioral()
+        if self.technique_refs.is_empty() {
+            self.fidelity.claims_behavioral()
+        } else {
+            self.technique_refs
+                .iter()
+                .any(|r| r.fidelity.claims_behavioral())
+        }
     }
 }
 
@@ -145,11 +151,7 @@ impl Catalog {
 
             let plan =
                 asmodeus_dsl::ExecutionPlan::from_manifest(&manifest).map_err(|e| e.to_string())?;
-            let mitre = manifest
-                .metadata
-                .mitre_technique
-                .as_deref()
-                .and_then(asmodeus_dsl::lookup_technique);
+            let mitre = manifest.primary_technique();
 
             // S01: fidelity and the full technique mapping come from the
             // manifest. A legacy (v1alpha1) manifest yields `Unspecified` refs
@@ -549,7 +551,10 @@ spec:
             match entry.mitre {
                 Some(m) => {
                     assert_eq!(
-                        entry.technique_refs.first().map(|r| r.technique_id.as_str()),
+                        entry
+                            .technique_refs
+                            .first()
+                            .map(|r| r.technique_id.as_str()),
                         Some(m.id),
                         "{}: primary ref != mitre projection",
                         entry.id
@@ -631,6 +636,17 @@ spec:
         assert_eq!(e.fidelity, Fidelity::Behavioral);
         assert!(e.claims_behavioral_coverage());
         assert_eq!(e.technique_refs[0].technique_id, "T1486");
+        assert_eq!(e.mitre.unwrap().id, "T1486");
+        // Changing only the executor to a marker must lower both matrix and
+        // compliance eligibility even when the author still claims behavioral.
+        let mut marker: serde_json::Value = serde_json::from_str(json).unwrap();
+        marker["spec"]["action"]["type"] = "credential_canary".into();
+        marker["spec"]["action"]["parameters"] = serde_json::json!({});
+        std::fs::write(dir.join("v2.json"), serde_json::to_vec(&marker).unwrap()).unwrap();
+        cat.load_from_dir(&dir).unwrap();
+        let e = cat.get("DYN-V2-001").unwrap();
+        assert!(!e.claims_behavioral_coverage());
+        assert_eq!(e.technique_refs[0].fidelity, Fidelity::MarkerOnly);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

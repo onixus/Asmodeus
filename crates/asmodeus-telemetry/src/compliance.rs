@@ -76,10 +76,9 @@ impl ScenarioMeta {
     /// primary technique.
     pub fn is_behavioral_for_any(&self, techniques: &[&str]) -> bool {
         if !self.technique_refs.is_empty() {
-            return self
-                .technique_refs
-                .iter()
-                .any(|r| r.fidelity == "behavioral" && techniques.contains(&r.technique_id.as_str()));
+            return self.technique_refs.iter().any(|r| {
+                r.fidelity == "behavioral" && techniques.contains(&r.technique_id.as_str())
+            });
         }
         self.is_behavioral() && techniques.contains(&self.mitre_technique.as_str())
     }
