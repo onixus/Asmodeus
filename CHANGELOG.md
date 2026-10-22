@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+### Добавлено — полный локальный набор процедур, 2026-10-21
+
+- `procedure-local-suite` выполняет все шесть MITRE slots с парными контролями
+  и экспортирует единый JSON: версии и digest корпуса, receipts, cleanup, gaps.
+- Знаменатели 6 slots / 12 вариантов не сокращаются: неподдерживаемые варианты
+  дают `INCONCLUSIVE`, timeout/cancellation/ошибки запуска и очистки — `FAILED`.
+  Текущий результат — 3 полные локальные пары из 6; protection всегда
+  `INCONCLUSIVE`. S03/S04 и runtime acceptance этим не закрываются.
+- Ctrl-C останавливает активный опыт с очисткой; оставшиеся варианты видны как
+  `NOT_RUN`. Отдельные subprocess-тесты проверяют экспорт, retry, timeout, отмену.
+
 ### Добавлено — локальные fixtures S02, 2026-10-21
 
 - Offline CLI `procedure-local` исполняет HTTP beacon, DNS pattern и передачу
