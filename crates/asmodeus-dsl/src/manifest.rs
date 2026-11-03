@@ -191,7 +191,9 @@ impl ScenarioManifest {
         // Fidelity describes the executor, not an author-supplied assertion.
         // All other supported actions only create/read synthetic markers.
         let implemented = match self.spec.action.action_type.as_str() {
-            "synthetic_canary_encrypt" | "latency_spike" => Fidelity::Behavioral,
+            "synthetic_canary_encrypt" | "latency_spike" | "dns_sinkhole_drop" => {
+                Fidelity::Behavioral
+            }
             _ => Fidelity::MarkerOnly,
         };
         declared.min(implemented)

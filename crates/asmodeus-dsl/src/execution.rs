@@ -13,7 +13,21 @@ pub enum Action {
     PersistenceCanary,
     ExfiltrationCanary,
     WatchdogProbe,
+    /// Chaos: synthetic agent-crash probe against a decoy process (FTT §4.2.2).
+    AgentCrashProbe,
     LatencySpike,
+    /// Chaos: simulated DNS RPZ sinkhole outage on the loopback test segment
+    /// (FTT §4.2.3) — a full-drop rule rather than a latency perturbation.
+    DnsSinkholeDrop,
+}
+
+impl Action {
+    /// True iff this action drives the network-chaos backend (a real or
+    /// simulated tc/eBPF rule on a reserved test segment), as opposed to a
+    /// filesystem marker injector.
+    pub fn is_net_chaos(&self) -> bool {
+        matches!(self, Action::LatencySpike | Action::DnsSinkholeDrop)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +45,25 @@ pub struct ExecutionPlan {
     pub latency_ms: u32,
     pub jitter_ms: u32,
     pub loss_percent: u8,
+    /// Chaos DNS port targeted by `dns_sinkhole_drop` (FTT §4.2.3: the sinkhole
+    /// outage is simulated by dropping traffic to the resolver port). Bounded
+    /// to the unprivileged/standard DNS range and only honoured by net-chaos
+    /// actions.
+    pub dns_port: u16,
+}
+
+/// Default chaos parameters per scenario ID (FTT §4.2). A manifest may override
+/// any of these through `spec.action.parameters`; the overrides are still bound
+/// by the resource envelope validated in [`ExecutionPlan::from_manifest`] and
+/// by `NetChaosSpec::validate` on the runner.
+pub fn chaos_defaults(scenario_id: &str) -> Option<(&'static str, u32, u32, u8, u32)> {
+    Some(match scenario_id {
+        // 2500 ms latency / 25 % drop, FTT §4.2.1.
+        "LATENCY_SPIKE_VM" => ("lo", 2_500, 250, 25, 5_000),
+        // RPZ sinkhole outage: full drop on the loopback test segment, FTT §4.2.3.
+        "DNS_RPZ_SINKHOLE_DROP" => ("lo", 0, 0, 100, 5_000),
+        _ => return None,
+    })
 }
 
 pub fn action_for_scenario(id: &str) -> &'static str {
@@ -42,8 +75,10 @@ pub fn action_for_scenario(id: &str) -> &'static str {
         "LOG_TAMPER_CANARY" => "log_tamper_canary",
         "PERSISTENCE_CRON_CANARY" => "persistence_canary",
         "DATA_EXFILTRATION_CANARY" => "exfiltration_canary",
-        "DEFENSE_IMPAIRMENT_CANARY" | "AGENT_CRASH_ENDPOINT" => "watchdog_probe",
-        "LATENCY_SPIKE_VM" | "DNS_RPZ_SINKHOLE_DROP" => "latency_spike",
+        "DEFENSE_IMPAIRMENT_CANARY" => "watchdog_probe",
+        "AGENT_CRASH_ENDPOINT" => "agent_crash_probe",
+        "LATENCY_SPIKE_VM" => "latency_spike",
+        "DNS_RPZ_SINKHOLE_DROP" => "dns_sinkhole_drop",
         _ => "unsupported",
     }
 }
@@ -68,8 +103,15 @@ impl ExecutionPlan {
                     }
                     Action::C2Beacon => name == "file_count",
                     Action::ExfiltrationCanary => name == "chunk_size_kb",
-                    Action::LatencySpike => ["latency_ms", "jitter_ms", "loss_percent", "iface"]
-                        .contains(&name.as_str()),
+                    Action::AgentCrashProbe => name == "recovery_window_ms",
+                    Action::LatencySpike | Action::DnsSinkholeDrop => [
+                        "latency_ms",
+                        "jitter_ms",
+                        "loss_percent",
+                        "iface",
+                        "dns_port",
+                    ]
+                    .contains(&name.as_str()),
                     _ => false,
                 };
             if !allowed {
@@ -78,6 +120,15 @@ impl ExecutionPlan {
                 )));
             }
         }
+        // Chaos defaults (FTT §4.2) seed the numeric envelope per scenario ID;
+        // manifest parameters override them and are still clamped by the bounds
+        // below and re-validated by the runner's NetChaosSpec gate.
+        let defaults = chaos_defaults(&m.metadata.id);
+        let d_iface = defaults.map(|d| d.0).unwrap_or("lo");
+        let d_latency = defaults.map(|d| d.1).unwrap_or(100);
+        let d_jitter = defaults.map(|d| d.2).unwrap_or(0);
+        let d_loss = defaults.map(|d| d.3).unwrap_or(0);
+        let d_duration = defaults.map(|d| d.4).unwrap_or(0);
         let number = |name: &str, default: u32, min: u32, max: u32| -> Result<u32, Error> {
             match parameters.get(name) {
                 None => Ok(default),
@@ -141,9 +192,9 @@ impl ExecutionPlan {
                     "iface must be a nonempty string of at most 15 bytes".into(),
                 ))
             }
-            None => "lo".into(),
+            None => d_iface.to_string(),
         };
-        let duration_ms = number("duration_ms", 0, 0, 120_000)?;
+        let duration_ms = number("duration_ms", d_duration, 0, 120_000)?;
         if duration_ms > m.spec.safety.max_duration_sec.saturating_mul(1000) {
             return Err(invalid("duration_ms exceeds max_duration_sec".into()));
         }
@@ -153,7 +204,7 @@ impl ExecutionPlan {
             .as_ref()
             .and_then(|s| s.target_cidr.clone())
             .unwrap_or_else(|| "127.0.0.1/32".into());
-        if action != Action::LatencySpike
+        if !action.is_net_chaos()
             && m.spec
                 .target_scope
                 .as_ref()
@@ -161,7 +212,9 @@ impl ExecutionPlan {
                 .is_some()
         {
             return Err(invalid(
-                "target_cidr is supported only by latency_spike".into(),
+                "target_cidr is supported only by net-chaos actions (latency_spike, \
+                 dns_sinkhole_drop)"
+                    .into(),
             ));
         }
         Ok(Self {
@@ -175,9 +228,10 @@ impl ExecutionPlan {
             cpu_limit_percent: m.spec.safety.cpu_limit_percent,
             target_cidr,
             iface,
-            latency_ms: number("latency_ms", 100, 0, 5000)?,
-            jitter_ms: number("jitter_ms", 0, 0, 1000)?,
-            loss_percent: number("loss_percent", 0, 0, 50)? as u8,
+            latency_ms: number("latency_ms", d_latency, 0, 5000)?,
+            jitter_ms: number("jitter_ms", d_jitter, 0, 1000)?,
+            loss_percent: number("loss_percent", d_loss, 0, 100)? as u8,
+            dns_port: number("dns_port", 53, 1, 65535)? as u16,
         })
     }
 }

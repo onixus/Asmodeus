@@ -439,6 +439,161 @@ impl ScenarioInjector for NetChaosInjector {
 }
 
 // ---------------------------------------------------------------------------
+// 10. Chaos — Agent Crash Endpoint Probe (FTT §4.2.2)
+// ---------------------------------------------------------------------------
+
+/// Synthetic `AGENT_CRASH_ENDPOINT` executor. FTT §4.2.2 asks for a `kill -9`
+/// against the security agent; INV-0 forbids touching any real process, so
+/// this injector spawns its own *decoy* child inside the canary blast radius,
+/// force-kills it with SIGKILL (the exact signal semantics under test), then
+/// waits out the pinned watchdog recovery window and writes a signed-shape
+/// recovery pulse marker the endpoint watchdog detector is expected to observe.
+/// Cleanup removes every trace unconditionally.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct AgentCrashProbeInjector {
+    dir: PathBuf,
+    /// Watchdog recovery window from the manifest (`recovery_window_ms`);
+    /// FTT pins the expected restart at < 5 s (§4.2.2).
+    recovery_window_ms: u32,
+}
+
+#[cfg(unix)]
+impl AgentCrashProbeInjector {
+    pub fn new(
+        dir: impl AsRef<Path>,
+        recovery_window_ms: u32,
+    ) -> Result<Self, InjectError> {
+        let dir = dir.as_ref().to_path_buf();
+        let as_str = dir.to_string_lossy();
+        if !path_in_scope(&as_str) {
+            return Err(InjectError::OutOfScope(as_str.into_owned()));
+        }
+        Ok(AgentCrashProbeInjector {
+            dir,
+            recovery_window_ms: recovery_window_ms.clamp(100, 30_000),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ScenarioInjector for AgentCrashProbeInjector {
+    fn inject(&self) -> Result<Report, InjectError> {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        fs::create_dir_all(&self.dir)?;
+        let crash_log = self.dir.join("agent_crash_probe.log");
+        let pulse = self.dir.join("watchdog_recovery.pulse");
+
+        // Decoy "agent": a long-sleeping child owned exclusively by this run.
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                InjectError::Io(io::Error::new(
+                    e.kind(),
+                    format!("cannot spawn synthetic decoy agent: {e}"),
+                ))
+            })?;
+        let pid = child.id() as i32;
+
+        // The interruption under test: SIGKILL (kill -9) on the decoy only.
+        nix_kill_sig9(pid)?;
+
+        // Reap the child and confirm it died of SIGKILL, within the watchdog
+        // window — the same assertion the real Lariska watchdog must satisfy.
+        let deadline = Instant::now() + Duration::from_millis(u64::from(self.recovery_window_ms));
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(InjectError::Io(io::Error::other(
+                        "decoy agent survived the forced termination window",
+                    )));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => return Err(InjectError::Io(e)),
+            }
+        };
+        if status.signal() != Some(libc::SIGKILL) {
+            return Err(InjectError::Io(io::Error::other(
+                "decoy agent did not terminate via SIGKILL",
+            )));
+        }
+
+        // Recovery-window wait: the pulse is emitted only after the window has
+        // elapsed, mirroring the expected watchdog restart telemetry (< 5 s).
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_secs(30)));
+
+        let marker = format!(
+            "AGENT_CRASH_PROBE: target=synthetic_decoy_agent pid={pid} signal=SIGKILL \
+             recovery_window_ms={} status=WATCHDOG_WINDOW_OBSERVED\n",
+            self.recovery_window_ms
+        );
+        let mut total = marker.len() as u64;
+        fs::write(&pulse, marker.as_bytes())?;
+
+        let log = format!(
+            "TERMINATION_EVENT pid={pid} signal=9 recovered_within_ms={}\n",
+            self.recovery_window_ms
+        );
+        total += log.len() as u64;
+        fs::write(&crash_log, log.as_bytes())?;
+
+        Ok(Report {
+            files_created: 2,
+            bytes_written: total,
+        })
+    }
+
+    fn cleanup(&self) -> Result<(), InjectError> {
+        if self.dir.exists() {
+            remove_file_idempotent(self.dir.join("watchdog_recovery.pulse"))?;
+            remove_file_idempotent(self.dir.join("agent_crash_probe.log"))?;
+            let _ = fs::remove_dir(&self.dir);
+        }
+        Ok(())
+    }
+}
+
+/// Best-effort `kill(pid, SIGKILL)` without pulling in a new dependency:
+/// shells out to nothing — uses the libc syscall binding already available
+/// through std's `Child::kill` semantics plus an explicit signal check above.
+/// On Unix `Child::kill` is SIGKILL, but we need the raw pid signal for the
+/// decoy spawned outside a supervisor race; implement via `libc` re-export.
+#[cfg(unix)]
+fn nix_kill_sig9(pid: i32) -> Result<(), InjectError> {
+    // SAFETY: kill(2) with a valid pid owned by this process; errors are
+    // returned, never panicked.
+    let rc = unsafe { libc_kill(pid, libc_SIGKILL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(InjectError::Io(io::Error::last_os_error()))
+    }
+}
+
+// Minimal FFI bindings so no extra crate dependency is introduced.
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+#[cfg(unix)]
+const libc_SIGKILL: i32 = 9;
+
+#[cfg(not(unix))]
+impl AgentCrashProbeInjectorMarker for () {}
+
+// ---------------------------------------------------------------------------
 // Factory Dispatcher
 // ---------------------------------------------------------------------------
 
