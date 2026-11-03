@@ -7,6 +7,33 @@
 
 ## [Unreleased]
 
+### Добавлено — допил функционала хаос-инженера, 2026-11-04
+
+- DSL (`asmodeus-dsl`): новые действия `AgentCrashProbe` и `DnsSinkholeDrop`;
+  единый источник параметров по умолчанию `chaos_defaults()` (FTT §4.2);
+  параметры манифеста (`latency_ms`, `jitter_ms`, `loss_percent`, `iface`,
+  `dns_port`, `recovery_window_ms`) читаются динамически вместо хардкода;
+  поле `ExecutionPlan.recovery_window_ms` с границами 100..=5000 мс;
+  `execution_plan_for_preset()` для канонической маршрутизации.
+- Runner (`asmodeus-runner`): `AgentCrashProbeInjector` — реальный SIGKILL
+  синтетического decoy-процесса (libc::kill), проверка сигнала завершения,
+  окно восстановления watchdog, recovery pulse; фабрика
+  `create_injector_from_plan()` для всех 11 действий с параметрами из плана;
+  non-Unix fallback. gRPC `service.rs`: net-chaos ветка покрывает оба
+  действия, `NetChaosSpec` строится из подписанного плана (dns_sinkhole,
+  dns_port).
+- Control plane (`asmodeus-control-plane`): профиль `AGENT_CRASH_ENDPOINT`
+  промоутирован с `MarkerOnly` на `Behavioral` (procedure_revision 1→2),
+  preconditions/expected_observables/limitations скорректированы под реальный
+  вывод инжектора; `manifest.effective_fidelity()` клампит самообъявление
+  оператора для `agent_crash_probe`; CI-тест против дрейфа fidelity у
+  маркерных сценариев.
+- Docs: `docs/mitre-fidelity.ru.md` — строка `AGENT_CRASH_ENDPOINT` переведена
+  в behavioral с честным ограничением (убивается только собственный decoy,
+  T1562 prevention не подтверждается).
+- Проверка: `cargo test --workspace` — 281 passed / 0 failed;
+  `cargo clippy --workspace --all-targets` — без предупреждений.
+
 ### Добавлено — полный локальный набор процедур, 2026-10-21
 
 - `procedure-local-suite` выполняет все шесть MITRE slots с парными контролями
