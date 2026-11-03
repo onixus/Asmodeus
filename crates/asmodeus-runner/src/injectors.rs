@@ -564,16 +564,14 @@ impl ScenarioInjector for AgentCrashProbeInjector {
     }
 }
 
-/// Best-effort `kill(pid, SIGKILL)` without pulling in a new dependency:
-/// shells out to nothing — uses the libc syscall binding already available
-/// through std's `Child::kill` semantics plus an explicit signal check above.
-/// On Unix `Child::kill` is SIGKILL, but we need the raw pid signal for the
-/// decoy spawned outside a supervisor race; implement via `libc` re-export.
+/// `kill(pid, SIGKILL)` through the `libc` binding already in the dependency
+/// set. The runner never shells out (INV-0 / D7); the signal goes directly to
+/// the decoy child this injector spawned and owns.
 #[cfg(unix)]
 fn nix_kill_sig9(pid: i32) -> Result<(), InjectError> {
     // SAFETY: kill(2) with a valid pid owned by this process; errors are
     // returned, never panicked.
-    let rc = unsafe { libc_kill(pid, libc_SIGKILL) };
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
     if rc == 0 {
         Ok(())
     } else {
@@ -581,88 +579,167 @@ fn nix_kill_sig9(pid: i32) -> Result<(), InjectError> {
     }
 }
 
-// Minimal FFI bindings so no extra crate dependency is introduced.
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
-}
-#[cfg(unix)]
-const libc_SIGKILL: i32 = 9;
-
-#[cfg(not(unix))]
-impl AgentCrashProbeInjectorMarker for () {}
-
 // ---------------------------------------------------------------------------
 // Factory Dispatcher
 // ---------------------------------------------------------------------------
 
-/// Create the appropriate synthetic scenario injector based on `scenario_id`.
+/// Chaos parameters carried by an [`ExecutionPlan`] that the injector factory
+/// needs. Mirrors the plan's chaos fields so [`create_injector_from_plan`] can
+/// build a spec without depending on the plan type's interior layout.
+#[derive(Debug, Clone)]
+struct ChaosParams {
+    iface: String,
+    target_cidr: String,
+    latency_ms: u32,
+    jitter_ms: u32,
+    loss_pct: u8,
+    duration_ms: u32,
+    dns_port: u16,
+}
+
+impl ChaosParams {
+    fn from_plan(plan: &asmodeus_dsl::ExecutionPlan) -> Self {
+        ChaosParams {
+            iface: plan.iface.clone(),
+            target_cidr: plan.target_cidr.clone(),
+            latency_ms: plan.latency_ms,
+            jitter_ms: plan.jitter_ms,
+            loss_pct: plan.loss_percent,
+            duration_ms: plan.duration_ms,
+            dns_port: plan.dns_port,
+        }
+    }
+
+    /// Turn these manifest-derived parameters into a validated net-chaos rule.
+    /// `sinkhole` selects the DNS RPZ outage shape (FTT §4.2.3): a
+    /// deterministic full drop on `dns_port`, allowed to claim 100 % loss —
+    /// versus the probabilistic latency perturbation of `LATENCY_SPIKE_VM`
+    /// (FTT §4.2.1). Every field comes from the signed plan, never hardcoded.
+    fn to_net_spec(&self, sinkhole: bool) -> NetChaosSpec {
+        let base = if sinkhole {
+            NetChaosSpec::dns_sinkhole_demo()
+        } else {
+            NetChaosSpec::latency_spike_demo()
+        };
+        NetChaosSpec {
+            iface: self.iface.clone(),
+            target_cidr: self.target_cidr.clone(),
+            latency_ms: self.latency_ms,
+            jitter_ms: self.jitter_ms,
+            // A sinkhole outage is defined by dropping resolver traffic; keep
+            // its full-drop semantics even if the manifest left loss at 0.
+            loss_pct: if sinkhole && self.loss_pct == 0 {
+                100
+            } else {
+                self.loss_pct
+            },
+            duration_ms: self.duration_ms.max(1),
+            dns_sinkhole: sinkhole,
+            dns_port: self.dns_port,
+        }
+        .with_validated_defaults(&base)
+    }
+}
+
+impl NetChaosSpec {
+    /// Backfill any field a manifest omitted with the demo-shaped default
+    /// (`duration_ms == 0` would otherwise trip the budget gate) before the
+    /// caller validates through `NetChaosSession::start`.
+    fn with_validated_defaults(mut self, defaults: &NetChaosSpec) -> Self {
+        if self.duration_ms == 0 {
+            self.duration_ms = defaults.duration_ms;
+        }
+        if self.dns_port == 0 {
+            self.dns_port = defaults.dns_port;
+        }
+        self
+    }
+}
+
+/// Create the appropriate synthetic scenario injector for a compiled execution
+/// plan. This is the canonical dispatch path: every chaos parameter (interface,
+/// CIDR, latency/jitter/loss, DNS port, recovery window, duration) flows from
+/// the signed manifest through [`asmodeus_dsl::ExecutionPlan`] into the
+/// injector, so an operator tuning `spec.action.parameters` changes behaviour
+/// instead of silently hitting hardcoded values.
+pub fn create_injector_from_plan(
+    plan: &asmodeus_dsl::ExecutionPlan,
+    target_dir: &str,
+) -> Result<Box<dyn ScenarioInjector>, InjectError> {
+    use asmodeus_dsl::Action;
+    let params = ChaosParams::from_plan(plan);
+    match plan.action {
+        Action::SyntheticCanaryEncrypt => {
+            let inj = CanaryInjector::new(target_dir, plan.file_count as usize, plan.chunk_size_kb as usize)?;
+            Ok(Box::new(inj))
+        }
+        Action::K8sEscapeProbe => Ok(Box::new(K8sEscapeInjector::new(target_dir)?)),
+        Action::C2Beacon => Ok(Box::new(C2BeaconInjector::new(
+            target_dir,
+            plan.file_count as usize,
+        )?)),
+        Action::CredentialCanary => Ok(Box::new(CredentialAccessInjector::new(target_dir)?)),
+        Action::LogTamperCanary => Ok(Box::new(LogTamperInjector::new(target_dir)?)),
+        Action::PersistenceCanary => Ok(Box::new(PersistenceCronInjector::new(target_dir)?)),
+        Action::ExfiltrationCanary => Ok(Box::new(DataExfiltrationInjector::new(
+            target_dir,
+            plan.chunk_size_kb as usize,
+        )?)),
+        Action::WatchdogProbe => Ok(Box::new(DefenseImpairmentInjector::new(target_dir)?)),
+        Action::AgentCrashProbe => create_agent_crash_probe(target_dir, plan.duration_ms),
+        Action::LatencySpike => {
+            let spec = params.to_net_spec(false);
+            Ok(Box::new(NetChaosInjector::new(target_dir, spec)?))
+        }
+        Action::DnsSinkholeDrop => {
+            let spec = params.to_net_spec(true);
+            Ok(Box::new(NetChaosInjector::new(target_dir, spec)?))
+        }
+    }
+}
+
+/// Build the agent-crash probe injector, falling back to the benign watchdog
+/// pulse marker where a real SIGKILL cannot be exercised (non-Unix hosts), so
+/// the scenario still produces an observable footprint without violating INV-0.
+fn create_agent_crash_probe(target_dir: &str, recovery_window_ms: u32) -> Result<Box<dyn ScenarioInjector>, InjectError> {
+    #[cfg(unix)]
+    {
+        Ok(Box::new(AgentCrashProbeInjector::new(
+            target_dir,
+            recovery_window_ms,
+        )?))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = recovery_window_ms;
+        Ok(Box::new(DefenseImpairmentInjector::new(target_dir)?))
+    }
+}
+
+/// Create the appropriate synthetic scenario injector based on `scenario_id`,
+/// using each scenario's pinned FTT defaults. Prefer
+/// [`create_injector_from_plan`] on the gRPC path, which honours the signed
+/// manifest's parameter overrides; this convenience wrapper exists for the
+/// standalone demo/local paths that have no compiled plan.
 pub fn create_injector(
     scenario_id: &str,
     target_dir: &str,
     file_count: usize,
     chunk_size_kb: usize,
 ) -> Result<Box<dyn ScenarioInjector>, InjectError> {
-    match scenario_id {
-        "RANSOMWARE_CANARY_SPIKE" => {
-            let inj = CanaryInjector::new(target_dir, file_count, chunk_size_kb)?;
-            Ok(Box::new(inj))
-        }
-        "K8S_ESCAPE_SIMULATION" => {
-            let inj = K8sEscapeInjector::new(target_dir)?;
-            Ok(Box::new(inj))
-        }
-        "C2_BEACONING_SIMULATION" => {
-            let inj = C2BeaconInjector::new(target_dir, file_count)?;
-            Ok(Box::new(inj))
-        }
-        "CREDENTIAL_ACCESS_CANARY" => {
-            let inj = CredentialAccessInjector::new(target_dir)?;
-            Ok(Box::new(inj))
-        }
-        "LOG_TAMPER_CANARY" => {
-            let inj = LogTamperInjector::new(target_dir)?;
-            Ok(Box::new(inj))
-        }
-        "PERSISTENCE_CRON_CANARY" => {
-            let inj = PersistenceCronInjector::new(target_dir)?;
-            Ok(Box::new(inj))
-        }
-        "DATA_EXFILTRATION_CANARY" => {
-            let inj = DataExfiltrationInjector::new(target_dir, chunk_size_kb)?;
-            Ok(Box::new(inj))
-        }
-        "DEFENSE_IMPAIRMENT_CANARY" => {
-            let inj = DefenseImpairmentInjector::new(target_dir)?;
-            Ok(Box::new(inj))
-        }
-        "LATENCY_SPIKE_VM" => {
-            let spec = NetChaosSpec::latency_spike_demo();
-            let inj = NetChaosInjector::new(target_dir, spec)?;
-            Ok(Box::new(inj))
-        }
-        "AGENT_CRASH_ENDPOINT" => {
-            let inj = DefenseImpairmentInjector::new(target_dir)?;
-            Ok(Box::new(inj))
-        }
-        "DNS_RPZ_SINKHOLE_DROP" => {
-            let spec = NetChaosSpec {
-                iface: "lo".into(),
-                target_cidr: "127.0.0.1/32".into(),
-                latency_ms: 100,
-                jitter_ms: 20,
-                loss_pct: 50,
-                duration_ms: 5000,
-            };
-            let inj = NetChaosInjector::new(target_dir, spec)?;
-            Ok(Box::new(inj))
-        }
-        _ => Err(InjectError::Io(io::Error::new(
+    let plan = asmodeus_dsl::execution_plan_for_preset(
+        scenario_id,
+        target_dir,
+        file_count as u32,
+        chunk_size_kb as u32,
+    )
+    .ok_or_else(|| {
+        InjectError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsupported scenario/action",
-        ))),
-    }
+        ))
+    })?;
+    create_injector_from_plan(&plan, target_dir)
 }
 
 #[cfg(test)]

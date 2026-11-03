@@ -202,19 +202,30 @@ fn run_worker(
     let mut simulated = false;
     let result = (|| -> Result<Report, InjectError> {
         check()?;
-        if plan.action == Action::LatencySpike {
+        if plan.action.is_net_chaos() {
             use crate::netchaos::{
                 default_backend, NetChaosBackend, NetChaosSession, NetChaosSpec,
             };
             let backend = default_backend();
             simulated = backend.name() == "sim";
+            // Every chaos field comes from the signed manifest's compiled plan
+            // — never hardcoded. The sinkhole outage (FTT §4.2.3) is a full
+            // drop on `dns_port`; the latency spike (§4.2.1) stays a
+            // probabilistic perturbation.
+            let sinkhole = plan.action == Action::DnsSinkholeDrop;
             let spec = NetChaosSpec {
                 iface: plan.iface.clone(),
                 target_cidr: plan.target_cidr.clone(),
                 latency_ms: plan.latency_ms,
                 jitter_ms: plan.jitter_ms,
-                loss_pct: plan.loss_percent,
+                loss_pct: if sinkhole && plan.loss_percent == 0 {
+                    100
+                } else {
+                    plan.loss_percent
+                },
                 duration_ms: plan.duration_ms.max(1),
+                dns_sinkhole: sinkhole,
+                dns_port: plan.dns_port,
             };
             let mut session = NetChaosSession::start(&backend, &spec)
                 .map_err(|e| InjectError::Io(std::io::Error::other(e.to_string())))?;

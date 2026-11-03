@@ -56,7 +56,7 @@ pub struct ExecutionPlan {
 /// any of these through `spec.action.parameters`; the overrides are still bound
 /// by the resource envelope validated in [`ExecutionPlan::from_manifest`] and
 /// by `NetChaosSpec::validate` on the runner.
-pub fn chaos_defaults(scenario_id: &str) -> Option<(&'static str, u32, u32, u8, u32)> {
+pub fn chaos_defaults(scenario_id: &str) -> Option<(&'static str, u32, u32, u32, u32)> {
     Some(match scenario_id {
         // 2500 ms latency / 25 % drop, FTT §4.2.1.
         "LATENCY_SPIKE_VM" => ("lo", 2_500, 250, 25, 5_000),
@@ -252,11 +252,43 @@ pub fn synthetic_manifest(
     if matches!(action, "synthetic_canary_encrypt" | "exfiltration_canary") {
         parameters.insert("chunk_size_kb".into(), chunk_size_kb.into());
     }
+    // Chaos scenarios carry their FTT-pinned defaults (§4.2) as explicit
+    // parameters so a preset plan exercises the same override path an operator
+    // manifest would (rather than relying on hardcoded runner values).
+    if let Some((iface, latency, jitter, loss, duration)) = chaos_defaults(id) {
+        parameters.insert("iface".into(), iface.into());
+        parameters.insert("latency_ms".into(), latency.into());
+        parameters.insert("jitter_ms".into(), jitter.into());
+        parameters.insert("loss_percent".into(), loss.into());
+        parameters.insert("duration_ms".into(), duration.into());
+    }
+    if action == "agent_crash_probe" {
+        // FTT §4.2.2 pins the watchdog recovery window at < 5 s.
+        parameters.insert("recovery_window_ms".into(), 5_000u32.into());
+        parameters.insert("duration_ms".into(), 5_000u32.into());
+    }
     serde_json::from_value(serde_json::json!({
         "apiVersion":"asmodeus.io/v1alpha1", "kind":"AttackScenario",
         "metadata":{"id":id,"name":id,"category":"red_team"},
         "spec":{"target_scope":{"target_path":target},"safety":{},"action":{"nature":"synthetic","type":action,"parameters":parameters}}
     })).expect("built-in manifest schema")
+}
+
+/// Compile a ready-to-run [`ExecutionPlan`] for a built-in scenario preset.
+/// Used by the runner's convenience factory (`create_injector`) where no signed
+/// manifest is at hand; the chaos parameters are the FTT-pinned defaults, so
+/// preset dispatch and manifest dispatch agree on one source of truth.
+pub fn execution_plan_for_preset(
+    id: &str,
+    target_dir: &str,
+    file_count: u32,
+    chunk_size_kb: u32,
+) -> Option<ExecutionPlan> {
+    if action_for_scenario(id) == "unsupported" {
+        return None;
+    }
+    let manifest = synthetic_manifest(id, target_dir, file_count, chunk_size_kb);
+    ExecutionPlan::from_manifest(&manifest).ok()
 }
 
 #[cfg(test)]
