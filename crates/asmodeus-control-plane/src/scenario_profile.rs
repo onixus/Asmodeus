@@ -94,9 +94,11 @@ const TEST_NET_SCOPE: &str = "reserved test nets only (loopback + RFC 5737 TEST-
 /// The pinned old→new fidelity mapping for every built-in scenario.
 ///
 /// Fidelity is assigned from the injector each scenario actually dispatches
-/// (`asmodeus-runner::injectors::create_injector`): only the reversible-XOR
-/// canary encryptor and the network-chaos perturbation run representative
-/// behaviour — everything else merely writes/reads a synthetic marker.
+/// (`asmodeus-runner::injectors::create_injector_from_plan`): the
+/// reversible-XOR canary encryptor, both network-chaos perturbations and the
+/// synthetic agent-crash probe (real SIGKILL of a decoy child) run
+/// representative behaviour — everything else merely writes/reads a synthetic
+/// marker.
 pub const PROFILES: &[ProfileDef] = &[
     ProfileDef {
         scenario_id: "RANSOMWARE_CANARY_SPIKE",
@@ -246,18 +248,26 @@ pub const PROFILES: &[ProfileDef] = &[
     },
     ProfileDef {
         scenario_id: "AGENT_CRASH_ENDPOINT",
-        fidelity: Fidelity::MarkerOnly,
+        fidelity: Fidelity::Behavioral,
         techniques: &["T1562"],
         legacy_technique: Some("T1562"),
         procedure_id: "ASMOD-CHAOS-0002",
-        procedure_revision: 1,
+        // Revision 2: the executor was promoted from a benign pulse marker to
+        // the synthetic SIGKILL crash probe (FTT §4.2.2); the bump records that
+        // behavioural change in the procedure identity.
+        procedure_revision: 2,
         platforms: &[Platform::Linux],
-        preconditions: "writable canary directory",
+        preconditions: "writable canary directory; Unix host able to spawn and reap a child process",
         safety_scope: CANARY_FS_SCOPE,
-        expected_observables: &["a watchdog_recovery.pulse marker written in canary scope"],
+        expected_observables: &[
+            "process-termination event for the synthetic decoy agent killed with SIGKILL (kill -9 semantics)",
+            "agent_crash_probe.log TERMINATION_EVENT record inside the canary scope",
+            "watchdog_recovery.pulse emitted within the pinned < 5 s recovery window (FTT §4.2.2)",
+        ],
         limitations:
-            "writes a benign recovery pulse marker to test the endpoint watchdog window; disables \
-             NO real tool — not behavioural or prevention coverage of T1562",
+            "force-kills ONLY its own synthetic decoy child inside the canary blast radius; no \
+             real security agent or endpoint tool is terminated — proves watchdog/recovery-window \
+             detection behaviourally, not prevention coverage of T1562",
     },
     ProfileDef {
         scenario_id: "DNS_RPZ_SINKHOLE_DROP",
@@ -337,5 +347,51 @@ mod tests {
             assert!(p.techniques.is_empty());
             assert!(p.legacy_technique.is_none());
         }
+    }
+
+    #[test]
+    fn agent_crash_endpoint_is_behavioral() {
+        // The synthetic SIGKILL crash probe (FTT §4.2.2) really exercises the
+        // termination/recovery behaviour, so the profile must claim behavioral
+        // fidelity — and still carry an honest limitation about blast radius.
+        let p = profile_for("AGENT_CRASH_ENDPOINT").unwrap();
+        assert_eq!(p.fidelity, Fidelity::Behavioral);
+        assert!(p.fidelity.claims_behavioral());
+        assert_eq!(p.techniques, &["T1562"]);
+        assert_eq!(p.procedure_revision, 2);
+        assert!(p.limitations.contains("synthetic decoy"));
+        assert!(!p.limitations.is_empty());
+        // Every observable names something the injector actually emits.
+        assert!(p
+            .expected_observables
+            .iter()
+            .any(|o| o.contains("SIGKILL")));
+        assert!(p
+            .expected_observables
+            .iter()
+            .any(|o| o.contains("watchdog_recovery.pulse")));
+    }
+
+    #[test]
+    fn marker_only_scenarios_match_the_pinned_set() {
+        // CI gate against silent fidelity drift: exactly these built-ins are
+        // marker-only; anything else claiming MarkerOnly needs a profile edit.
+        let marker_only: Vec<&str> = PROFILES
+            .iter()
+            .filter(|p| p.fidelity == Fidelity::MarkerOnly)
+            .map(|p| p.scenario_id)
+            .collect();
+        assert_eq!(
+            marker_only,
+            vec![
+                "K8S_ESCAPE_SIMULATION",
+                "C2_BEACONING_SIMULATION",
+                "CREDENTIAL_ACCESS_CANARY",
+                "LOG_TAMPER_CANARY",
+                "PERSISTENCE_CRON_CANARY",
+                "DATA_EXFILTRATION_CANARY",
+                "DEFENSE_IMPAIRMENT_CANARY",
+            ]
+        );
     }
 }

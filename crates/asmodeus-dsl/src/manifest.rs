@@ -194,6 +194,10 @@ impl ScenarioManifest {
             "synthetic_canary_encrypt" | "latency_spike" | "dns_sinkhole_drop" => {
                 Fidelity::Behavioral
             }
+            // The agent-crash probe really force-kills a decoy process with
+            // SIGKILL and observes the watchdog window (FTT §4.2.2) — it is no
+            // longer a marker-only footprint.
+            "agent_crash_probe" => Fidelity::Behavioral,
             _ => Fidelity::MarkerOnly,
         };
         declared.min(implemented)

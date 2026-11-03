@@ -595,6 +595,7 @@ struct ChaosParams {
     loss_pct: u8,
     duration_ms: u32,
     dns_port: u16,
+    recovery_window_ms: u32,
 }
 
 impl ChaosParams {
@@ -607,6 +608,7 @@ impl ChaosParams {
             loss_pct: plan.loss_percent,
             duration_ms: plan.duration_ms,
             dns_port: plan.dns_port,
+            recovery_window_ms: plan.recovery_window_ms,
         }
     }
 
@@ -686,7 +688,11 @@ pub fn create_injector_from_plan(
             plan.chunk_size_kb as usize,
         )?)),
         Action::WatchdogProbe => Ok(Box::new(DefenseImpairmentInjector::new(target_dir)?)),
-        Action::AgentCrashProbe => create_agent_crash_probe(target_dir, plan.duration_ms),
+        Action::AgentCrashProbe => {
+            // The watchdog window flows from the signed plan (FTT §4.2.2),
+            // never from a hardcoded runner constant.
+            create_agent_crash_probe(target_dir, params.recovery_window_ms)
+        }
         Action::LatencySpike => {
             let spec = params.to_net_spec(false);
             Ok(Box::new(NetChaosInjector::new(target_dir, spec)?))

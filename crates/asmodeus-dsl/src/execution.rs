@@ -50,6 +50,10 @@ pub struct ExecutionPlan {
     /// to the unprivileged/standard DNS range and only honoured by net-chaos
     /// actions.
     pub dns_port: u16,
+    /// Watchdog recovery window for `agent_crash_probe` (FTT §4.2.2 pins the
+    /// expected agent restart at < 5 s). Only honoured by that action; other
+    /// actions leave it at the default.
+    pub recovery_window_ms: u32,
 }
 
 /// Default chaos parameters per scenario ID (FTT §4.2). A manifest may override
@@ -65,6 +69,11 @@ pub fn chaos_defaults(scenario_id: &str) -> Option<(&'static str, u32, u32, u32,
         _ => return None,
     })
 }
+
+/// The watchdog recovery window pinned for `AGENT_CRASH_ENDPOINT` by FTT
+/// §4.2.2 (expected agent restart < 5 s). Single source of truth shared by the
+/// preset fixture and the profile/catalog layer.
+pub const AGENT_CRASH_RECOVERY_WINDOW_MS: u32 = 5_000;
 
 pub fn action_for_scenario(id: &str) -> &'static str {
     match id {
@@ -232,6 +241,18 @@ impl ExecutionPlan {
             jitter_ms: number("jitter_ms", d_jitter, 0, 1000)?,
             loss_percent: number("loss_percent", d_loss, 0, 100)? as u8,
             dns_port: number("dns_port", 53, 1, 65535)? as u16,
+            // FTT §4.2.2 pins the watchdog recovery window at < 5 s; the bound
+            // keeps a manifest from stretching the chaos beyond that ceiling.
+            recovery_window_ms: if action == Action::AgentCrashProbe {
+                number(
+                    "recovery_window_ms",
+                    AGENT_CRASH_RECOVERY_WINDOW_MS,
+                    100,
+                    AGENT_CRASH_RECOVERY_WINDOW_MS,
+                )?
+            } else {
+                AGENT_CRASH_RECOVERY_WINDOW_MS
+            },
         })
     }
 }
@@ -264,7 +285,10 @@ pub fn synthetic_manifest(
     }
     if action == "agent_crash_probe" {
         // FTT §4.2.2 pins the watchdog recovery window at < 5 s.
-        parameters.insert("recovery_window_ms".into(), 5_000u32.into());
+        parameters.insert(
+            "recovery_window_ms".into(),
+            crate::execution::AGENT_CRASH_RECOVERY_WINDOW_MS.into(),
+        );
         parameters.insert("duration_ms".into(), 5_000u32.into());
     }
     serde_json::from_value(serde_json::json!({
@@ -313,5 +337,66 @@ mod tests {
         }
         manifest.spec.action.action_type = "invented-action".into();
         assert!(ExecutionPlan::from_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn chaos_manifest_parameters_flow_into_the_plan() {
+        // Operator overrides must reach the plan instead of being shadowed by
+        // the FTT defaults (the runner builds its spec from these fields).
+        let mut manifest =
+            synthetic_manifest("LATENCY_SPIKE_VM", "/tmp/asmodeus-canary/net", 1, 1);
+        manifest.spec.action.parameters.insert("latency_ms".into(), 800.into());
+        manifest.spec.action.parameters.insert("jitter_ms".into(), 40.into());
+        manifest.spec.action.parameters.insert("loss_percent".into(), 10.into());
+        manifest.spec.action.parameters.insert("iface".into(), "lo".into());
+        let plan = ExecutionPlan::from_manifest(&manifest).unwrap();
+        assert_eq!(
+            (plan.latency_ms, plan.jitter_ms, plan.loss_percent),
+            (800, 40, 10)
+        );
+
+        // Without overrides the FTT §4.2 defaults apply.
+        let preset = execution_plan_for_preset("LATENCY_SPIKE_VM", "/tmp/asmodeus-canary/net", 1, 1)
+            .expect("preset plan");
+        assert_eq!((preset.latency_ms, preset.jitter_ms, preset.loss_percent), (2_500, 250, 25));
+
+        // DNS port is honoured on net-chaos actions only.
+        let mut dns = synthetic_manifest("DNS_RPZ_SINKHOLE_DROP", "/tmp/asmodeus-canary/net", 1, 1);
+        dns.spec.action.parameters.insert("dns_port".into(), 5353.into());
+        let plan = ExecutionPlan::from_manifest(&dns).unwrap();
+        assert_eq!(plan.dns_port, 5_353);
+        assert!(plan.action.is_net_chaos());
+    }
+
+    #[test]
+    fn agent_crash_probe_recovery_window_is_bounded_by_ftt() {
+        // FTT §4.2.2 pins the watchdog window at < 5 s; the plan honours
+        // operator overrides inside the bound and rejects anything beyond it.
+        let preset =
+            execution_plan_for_preset("AGENT_CRASH_ENDPOINT", "/tmp/asmodeus-canary/crash", 1, 1)
+                .expect("preset plan");
+        assert_eq!(preset.recovery_window_ms, AGENT_CRASH_RECOVERY_WINDOW_MS);
+
+        let mut manifest =
+            synthetic_manifest("AGENT_CRASH_ENDPOINT", "/tmp/asmodeus-canary/crash", 1, 1);
+        manifest
+            .spec
+            .action
+            .parameters
+            .insert("recovery_window_ms".into(), 2_500.into());
+        let plan = ExecutionPlan::from_manifest(&manifest).unwrap();
+        assert_eq!(plan.recovery_window_ms, 2_500);
+
+        for bad in [99u32, 5_001, 60_000] {
+            let mut over = manifest.clone();
+            over.spec
+                .action
+                .parameters
+                .insert("recovery_window_ms".into(), bad.into());
+            assert!(
+                ExecutionPlan::from_manifest(&over).is_err(),
+                "recovery_window_ms={bad} must exceed the FTT ceiling"
+            );
+        }
     }
 }
