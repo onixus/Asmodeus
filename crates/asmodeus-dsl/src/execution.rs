@@ -226,6 +226,18 @@ impl ExecutionPlan {
                     .into(),
             ));
         }
+        // FTT §4.2.2 pins the watchdog recovery window at < 5 s; the bound
+        // keeps a manifest from stretching the chaos beyond that ceiling.
+        let recovery_window_ms = if action == Action::AgentCrashProbe {
+            number(
+                "recovery_window_ms",
+                AGENT_CRASH_RECOVERY_WINDOW_MS,
+                100,
+                AGENT_CRASH_RECOVERY_WINDOW_MS,
+            )?
+        } else {
+            AGENT_CRASH_RECOVERY_WINDOW_MS
+        };
         Ok(Self {
             action,
             target_dir,
@@ -241,18 +253,7 @@ impl ExecutionPlan {
             jitter_ms: number("jitter_ms", d_jitter, 0, 1000)?,
             loss_percent: number("loss_percent", d_loss, 0, 100)? as u8,
             dns_port: number("dns_port", 53, 1, 65535)? as u16,
-            // FTT §4.2.2 pins the watchdog recovery window at < 5 s; the bound
-            // keeps a manifest from stretching the chaos beyond that ceiling.
-            recovery_window_ms: if action == Action::AgentCrashProbe {
-                number(
-                    "recovery_window_ms",
-                    AGENT_CRASH_RECOVERY_WINDOW_MS,
-                    100,
-                    AGENT_CRASH_RECOVERY_WINDOW_MS,
-                )?
-            } else {
-                AGENT_CRASH_RECOVERY_WINDOW_MS
-            },
+            recovery_window_ms,
         })
     }
 }
