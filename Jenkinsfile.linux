@@ -135,11 +135,16 @@ pipeline {
                     set -eu
                     docker run -i --rm -u 0:0 \
                         -e WORKSPACE="$WORKSPACE" \
+                        -e AGENT_UID="$(id -u)" \
+                        -e AGENT_GID="$(id -g)" \
                         -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}" \
                         -v "$WORKSPACE:$WORKSPACE:rw,z" \
                         -w "$WORKSPACE" \
                         rust:1-bookworm \
                         bash -eu -s <<'EOF'
+                    # Кэши и dist остаются от root. Следующая стадия делает
+                    # deleteDir агентом и падает на chmod (EPERM, #16).
+                    trap 'chown -R "${AGENT_UID}:${AGENT_GID}" "$WORKSPACE" || true' EXIT
                     export CARGO_HOME="$WORKSPACE/.cargo-root-home"
                     export RUSTUP_HOME="$WORKSPACE/.cargo-root-rustup"
                     export CARGO_TARGET_DIR="$WORKSPACE/.cargo-root-target"
