@@ -65,10 +65,14 @@ pipeline {
                 // создаются от root, а cargo здесь идёт под uid агента (см. тот же
                 // урок в Ferrum/Jenkinsfile.linux). Каталог создаём до `docker run`,
                 // иначе Docker создаст его сам — от root.
+                // `:z` нужен на SELinux (gaming-нода, Enforcing): без перевешивания
+                // container_t не пишет в cache_home_t, и cargo падает с EACCES,
+                // хотя каталог уже принадлежит uid агента. Воркспейс плагин
+                // монтирует с `:z` сам. Без SELinux флаг — no-op.
                 sh 'mkdir -p "$HOME/.cache/asmodeus-ci"'
                 script {
                     def ci = docker.build('asmodeus-ci:1.90', '-f stand/Dockerfile.ci stand')
-                    ci.inside("-v ${env.HOME}/.cache/asmodeus-ci:/cache") {
+                    ci.inside("-v ${env.HOME}/.cache/asmodeus-ci:/cache:z") {
                         withEnv(['CARGO_HOME=/cache/cargo-home', 'CARGO_TARGET_DIR=/cache/target']) {
                             // Формат не блокирует тесты и стенд: это не поведение.
                             // Стадия краснеет, билд становится UNSTABLE.
