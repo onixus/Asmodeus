@@ -115,7 +115,10 @@ services:
 
   apex-console:
     build:
-      context: ../.apex/web-console
+      # Dockerfile копирует и web-console, и design-system, поэтому контекст —
+      # корень архива платформы, а не каталог самой консоли.
+      context: ../.apex
+      dockerfile: web-console/Dockerfile
       args:
         NEXT_PUBLIC_GATEWAY_URL: http://${STAND_HOST:?STAND_HOST не задан}:8800
     image: asmodeus-stand-apex-console:local
