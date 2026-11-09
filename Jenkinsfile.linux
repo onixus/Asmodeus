@@ -121,20 +121,25 @@ pipeline {
         // Отдельный root-контейнер: установка nightly/LLVM/bpf-linker пишет за
         // пределы воркспейса, под uid агента этого нельзя; кэши — свои
         // (.cargo-root-*), чтобы не мешать каталогам стадии тестов под её uid.
+        // Не через `agent { docker { args '-u 0:0' } }`: плагин всё равно
+        // добавляет `-u <uid агента>`, а durable-task внутри root-контейнера
+        // агент не видит — `sh` умирает с exit -2
+        // («process apparently never started»), не дойдя до rustc (#15).
+        // Контейнер запускает обычный sh агента, как стадия «Стенд».
         stage('netchaos BPF ELF') {
-            agent {
-                docker {
-                    label 'gaming'
-                    image 'rust:1-bookworm'
-                    args '-u 0:0'
-                    reuseNode true
-                }
-            }
+            agent { label 'gaming' }
             steps {
                 deleteDir()
                 unstash 'src'
                 sh '''
                     set -eu
+                    docker run -i --rm -u 0:0 \
+                        -e WORKSPACE="$WORKSPACE" \
+                        -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}" \
+                        -v "$WORKSPACE:$WORKSPACE:rw,z" \
+                        -w "$WORKSPACE" \
+                        rust:1-bookworm \
+                        bash -eu -s <<'EOF'
                     export CARGO_HOME="$WORKSPACE/.cargo-root-home"
                     export RUSTUP_HOME="$WORKSPACE/.cargo-root-rustup"
                     export CARGO_TARGET_DIR="$WORKSPACE/.cargo-root-target"
@@ -202,6 +207,7 @@ pipeline {
                     mkdir -p dist
                     cp "$elf" dist/asmodeus-netchaos.bpf.o
                     ls -l dist/asmodeus-netchaos.bpf.o
+EOF
                 '''
                 archiveArtifacts artifacts: 'dist/asmodeus-netchaos.bpf.o', fingerprint: true
             }
