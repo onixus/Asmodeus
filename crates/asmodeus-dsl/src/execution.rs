@@ -45,10 +45,9 @@ pub struct ExecutionPlan {
     pub latency_ms: u32,
     pub jitter_ms: u32,
     pub loss_percent: u8,
-    /// Chaos DNS port targeted by `dns_sinkhole_drop` (FTT §4.2.3: the sinkhole
-    /// outage is simulated by dropping traffic to the resolver port). Bounded
-    /// to the unprivileged/standard DNS range and only honoured by net-chaos
-    /// actions.
+    /// Port recorded for a `dns_sinkhole_drop` manifest. The sim backend and the
+    /// eBPF classifier match the destination CIDR only, so this value does not
+    /// narrow the drop to a resolver port. Range 1..=65535.
     pub dns_port: u16,
     /// Watchdog recovery window for `agent_crash_probe` (FTT §4.2.2 pins the
     /// expected agent restart at < 5 s). Only honoured by that action; other
@@ -238,6 +237,13 @@ impl ExecutionPlan {
         } else {
             AGENT_CRASH_RECOVERY_WINDOW_MS
         };
+        // Latency rules stay within the 50 % runner budget. Only a sinkhole
+        // may ask for a full drop, and that drop is the whole test CIDR.
+        let loss_max = if action == Action::DnsSinkholeDrop {
+            100
+        } else {
+            50
+        };
         Ok(Self {
             action,
             target_dir,
@@ -251,7 +257,7 @@ impl ExecutionPlan {
             iface,
             latency_ms: number("latency_ms", d_latency, 0, 5000)?,
             jitter_ms: number("jitter_ms", d_jitter, 0, 1000)?,
-            loss_percent: number("loss_percent", d_loss, 0, 100)? as u8,
+            loss_percent: number("loss_percent", d_loss, 0, loss_max)? as u8,
             dns_port: number("dns_port", 53, 1, 65535)? as u16,
             recovery_window_ms,
         })
@@ -344,12 +350,27 @@ mod tests {
     fn chaos_manifest_parameters_flow_into_the_plan() {
         // Operator overrides must reach the plan instead of being shadowed by
         // the FTT defaults (the runner builds its spec from these fields).
-        let mut manifest =
-            synthetic_manifest("LATENCY_SPIKE_VM", "/tmp/asmodeus-canary/net", 1, 1);
-        manifest.spec.action.parameters.insert("latency_ms".into(), 800.into());
-        manifest.spec.action.parameters.insert("jitter_ms".into(), 40.into());
-        manifest.spec.action.parameters.insert("loss_percent".into(), 10.into());
-        manifest.spec.action.parameters.insert("iface".into(), "lo".into());
+        let mut manifest = synthetic_manifest("LATENCY_SPIKE_VM", "/tmp/asmodeus-canary/net", 1, 1);
+        manifest
+            .spec
+            .action
+            .parameters
+            .insert("latency_ms".into(), 800.into());
+        manifest
+            .spec
+            .action
+            .parameters
+            .insert("jitter_ms".into(), 40.into());
+        manifest
+            .spec
+            .action
+            .parameters
+            .insert("loss_percent".into(), 10.into());
+        manifest
+            .spec
+            .action
+            .parameters
+            .insert("iface".into(), "lo".into());
         let plan = ExecutionPlan::from_manifest(&manifest).unwrap();
         assert_eq!(
             (plan.latency_ms, plan.jitter_ms, plan.loss_percent),
@@ -357,13 +378,20 @@ mod tests {
         );
 
         // Without overrides the FTT §4.2 defaults apply.
-        let preset = execution_plan_for_preset("LATENCY_SPIKE_VM", "/tmp/asmodeus-canary/net", 1, 1)
-            .expect("preset plan");
-        assert_eq!((preset.latency_ms, preset.jitter_ms, preset.loss_percent), (2_500, 250, 25));
+        let preset =
+            execution_plan_for_preset("LATENCY_SPIKE_VM", "/tmp/asmodeus-canary/net", 1, 1)
+                .expect("preset plan");
+        assert_eq!(
+            (preset.latency_ms, preset.jitter_ms, preset.loss_percent),
+            (2_500, 250, 25)
+        );
 
         // DNS port is honoured on net-chaos actions only.
         let mut dns = synthetic_manifest("DNS_RPZ_SINKHOLE_DROP", "/tmp/asmodeus-canary/net", 1, 1);
-        dns.spec.action.parameters.insert("dns_port".into(), 5353.into());
+        dns.spec
+            .action
+            .parameters
+            .insert("dns_port".into(), 5353.into());
         let plan = ExecutionPlan::from_manifest(&dns).unwrap();
         assert_eq!(plan.dns_port, 5_353);
         assert!(plan.action.is_net_chaos());
@@ -396,7 +424,7 @@ mod tests {
                 .insert("recovery_window_ms".into(), bad.into());
             assert!(
                 ExecutionPlan::from_manifest(&over).is_err(),
-                "recovery_window_ms={bad} must exceed the FTT ceiling"
+                "recovery_window_ms={bad} must be rejected (allowed 100..={AGENT_CRASH_RECOVERY_WINDOW_MS})"
             );
         }
     }

@@ -24,8 +24,8 @@ pub const MAX_JITTER_MS: u32 = 1_000;
 /// Probabilistic loss budget for a latency-perturbation rule (FTT §4.2.1:
 /// 25 % drop, headroom to 50 %).
 pub const MAX_LOSS_PCT: u8 = 50;
-/// Absolute ceiling — a DNS sinkhole outage (FTT §4.2.3) drops *every* packet
-/// to the resolver on the reserved test segment; nothing above 100 % exists.
+/// Absolute ceiling — a DNS sinkhole outage (FTT §4.2.3) may drop every IPv4
+/// packet toward the reserved test CIDR. The classifier has no L4 port match.
 pub const HARD_MAX_LOSS_PCT: u8 = 100;
 pub const MAX_DURATION_MS: u32 = 120_000;
 
@@ -51,11 +51,12 @@ pub struct NetChaosSpec {
     pub loss_pct: u8,
     /// How long the rule stays installed before mandatory revert.
     pub duration_ms: u32,
-    /// True for a DNS sinkhole outage (FTT §4.2.3): a deterministic full-drop
-    /// on `dns_port` toward the reserved test segment, not a probabilistic
-    /// latency perturbation. Such a spec may carry `loss_pct == 100`.
+    /// True for a DNS sinkhole outage (FTT §4.2.3): a deterministic full drop
+    /// of the destination CIDR, not a probabilistic latency perturbation.
+    /// Such a spec may carry `loss_pct == 100`.
     pub dns_sinkhole: bool,
-    /// Resolver port targeted by a sinkhole rule (default standard DNS, 53).
+    /// Recorded from the manifest (default 53). Not applied by `SimBackend` or
+    /// the eBPF classifier; those match the destination CIDR only.
     pub dns_port: u16,
 }
 
@@ -90,7 +91,7 @@ impl NetChaosSpec {
     }
 
     /// A `DNS_RPZ_SINKHOLE_DROP`-shaped spec against loopback: full drop of
-    /// resolver traffic on the reserved test segment (FTT §4.2.3).
+    /// the reserved test CIDR (FTT §4.2.3). The rule is not port-specific.
     pub fn dns_sinkhole_demo() -> Self {
         NetChaosSpec {
             dns_sinkhole: true,
@@ -122,8 +123,7 @@ impl NetChaosSpec {
             )));
         }
         // Probabilistic loss keeps the conservative 50 % budget; only an
-        // explicitly-flagged sinkhole outage may deterministically drop 100 %
-        // of resolver traffic, and only on the reserved test segment.
+        // explicitly-flagged sinkhole may drop 100 % of the test CIDR.
         let loss_ceiling = if self.dns_sinkhole {
             HARD_MAX_LOSS_PCT
         } else {

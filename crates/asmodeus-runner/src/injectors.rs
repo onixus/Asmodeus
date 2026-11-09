@@ -445,25 +445,21 @@ impl ScenarioInjector for NetChaosInjector {
 /// Synthetic `AGENT_CRASH_ENDPOINT` executor. FTT §4.2.2 asks for a `kill -9`
 /// against the security agent; INV-0 forbids touching any real process, so
 /// this injector spawns its own *decoy* child inside the canary blast radius,
-/// force-kills it with SIGKILL (the exact signal semantics under test), then
-/// waits out the pinned watchdog recovery window and writes a signed-shape
-/// recovery pulse marker the endpoint watchdog detector is expected to observe.
-/// Cleanup removes every trace unconditionally.
+/// force-kills it with SIGKILL, reaps it, and writes a pulse. `reap_ms` is the
+/// time until that child died. The planned window is a budget, not evidence
+/// that a real agent restarted. Cleanup removes every trace unconditionally.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct AgentCrashProbeInjector {
     dir: PathBuf,
-    /// Watchdog recovery window from the manifest (`recovery_window_ms`);
-    /// FTT pins the expected restart at < 5 s (§4.2.2).
+    /// Budget, from the manifest, for how long the decoy may take to die.
+    /// FTT §4.2.2 caps it at 5 s. It is not a measured agent restart.
     recovery_window_ms: u32,
 }
 
 #[cfg(unix)]
 impl AgentCrashProbeInjector {
-    pub fn new(
-        dir: impl AsRef<Path>,
-        recovery_window_ms: u32,
-    ) -> Result<Self, InjectError> {
+    pub fn new(dir: impl AsRef<Path>, recovery_window_ms: u32) -> Result<Self, InjectError> {
         let dir = dir.as_ref().to_path_buf();
         let as_str = dir.to_string_lossy();
         if !path_in_scope(&as_str) {
@@ -471,7 +467,8 @@ impl AgentCrashProbeInjector {
         }
         Ok(AgentCrashProbeInjector {
             dir,
-            recovery_window_ms: recovery_window_ms.clamp(100, 30_000),
+            recovery_window_ms: recovery_window_ms
+                .clamp(100, asmodeus_dsl::AGENT_CRASH_RECOVERY_WINDOW_MS),
         })
     }
 }
@@ -501,25 +498,36 @@ impl ScenarioInjector for AgentCrashProbeInjector {
                 ))
             })?;
         let pid = child.id() as i32;
+        let reap = |child: &mut std::process::Child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        };
 
         // The interruption under test: SIGKILL (kill -9) on the decoy only.
-        nix_kill_sig9(pid)?;
+        let killed = Instant::now();
+        if let Err(error) = nix_kill_sig9(pid) {
+            reap(&mut child);
+            return Err(error);
+        }
 
-        // Reap the child and confirm it died of SIGKILL, within the watchdog
-        // window — the same assertion the real Lariska watchdog must satisfy.
-        let deadline = Instant::now() + Duration::from_millis(u64::from(self.recovery_window_ms));
+        // Reap the child and confirm it died of SIGKILL inside the planned
+        // window. The elapsed time is how long the decoy took to die, not a
+        // measurement of some other agent's restart.
+        let deadline = killed + Duration::from_millis(u64::from(self.recovery_window_ms));
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    reap(&mut child);
                     return Err(InjectError::Io(io::Error::other(
                         "decoy agent survived the forced termination window",
                     )));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                Err(e) => return Err(InjectError::Io(e)),
+                Err(e) => {
+                    reap(&mut child);
+                    return Err(InjectError::Io(e));
+                }
             }
         };
         if status.signal() != Some(libc::SIGKILL) {
@@ -527,22 +535,18 @@ impl ScenarioInjector for AgentCrashProbeInjector {
                 "decoy agent did not terminate via SIGKILL",
             )));
         }
-
-        // Recovery-window wait: the pulse is emitted only after the window has
-        // elapsed, mirroring the expected watchdog restart telemetry (< 5 s).
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(remaining.min(Duration::from_secs(30)));
+        let reap_ms = u32::try_from(killed.elapsed().as_millis()).unwrap_or(u32::MAX);
 
         let marker = format!(
             "AGENT_CRASH_PROBE: target=synthetic_decoy_agent pid={pid} signal=SIGKILL \
-             recovery_window_ms={} status=WATCHDOG_WINDOW_OBSERVED\n",
+             reap_ms={reap_ms} planned_window_ms={} status=DECOY_REAPED\n",
             self.recovery_window_ms
         );
         let mut total = marker.len() as u64;
         fs::write(&pulse, marker.as_bytes())?;
 
         let log = format!(
-            "TERMINATION_EVENT pid={pid} signal=9 recovered_within_ms={}\n",
+            "TERMINATION_EVENT pid={pid} signal=9 reap_ms={reap_ms} planned_window_ms={}\n",
             self.recovery_window_ms
         );
         total += log.len() as u64;
@@ -569,8 +573,10 @@ impl ScenarioInjector for AgentCrashProbeInjector {
 /// the decoy child this injector spawned and owns.
 #[cfg(unix)]
 fn nix_kill_sig9(pid: i32) -> Result<(), InjectError> {
-    // SAFETY: kill(2) with a valid pid owned by this process; errors are
-    // returned, never panicked.
+    // SAFETY: `pid` is the id of a Child this function's caller just spawned.
+    // The caller reaps that Child on every exit path. kill(2) errors are
+    // returned, never panicked. A recycled pid would have to appear before
+    // the reap; the signal is still only SIGKILL of that numeric id.
     let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
     if rc == 0 {
         Ok(())
@@ -613,10 +619,11 @@ impl ChaosParams {
     }
 
     /// Turn these manifest-derived parameters into a validated net-chaos rule.
-    /// `sinkhole` selects the DNS RPZ outage shape (FTT §4.2.3): a
-    /// deterministic full drop on `dns_port`, allowed to claim 100 % loss —
-    /// versus the probabilistic latency perturbation of `LATENCY_SPIKE_VM`
-    /// (FTT §4.2.1). Every field comes from the signed plan, never hardcoded.
+    /// `sinkhole` selects the DNS RPZ outage shape (FTT §4.2.3): a full drop
+    /// of the test CIDR, allowed to claim 100 % loss, versus the probabilistic
+    /// latency perturbation of `LATENCY_SPIKE_VM` (FTT §4.2.1). `dns_port` is
+    /// copied onto the spec and is not a datapath match. Every field comes
+    /// from the signed plan, never hardcoded.
     fn to_net_spec(&self, sinkhole: bool) -> NetChaosSpec {
         let base = if sinkhole {
             NetChaosSpec::dns_sinkhole_demo()
@@ -628,8 +635,8 @@ impl ChaosParams {
             target_cidr: self.target_cidr.clone(),
             latency_ms: self.latency_ms,
             jitter_ms: self.jitter_ms,
-            // A sinkhole outage is defined by dropping resolver traffic; keep
-            // its full-drop semantics even if the manifest left loss at 0.
+            // A sinkhole is a full CIDR drop; keep that even if the manifest
+            // left loss at 0.
             loss_pct: if sinkhole && self.loss_pct == 0 {
                 100
             } else {
@@ -672,7 +679,11 @@ pub fn create_injector_from_plan(
     let params = ChaosParams::from_plan(plan);
     match plan.action {
         Action::SyntheticCanaryEncrypt => {
-            let inj = CanaryInjector::new(target_dir, plan.file_count as usize, plan.chunk_size_kb as usize)?;
+            let inj = CanaryInjector::new(
+                target_dir,
+                plan.file_count as usize,
+                plan.chunk_size_kb as usize,
+            )?;
             Ok(Box::new(inj))
         }
         Action::K8sEscapeProbe => Ok(Box::new(K8sEscapeInjector::new(target_dir)?)),
@@ -707,7 +718,10 @@ pub fn create_injector_from_plan(
 /// Build the agent-crash probe injector, falling back to the benign watchdog
 /// pulse marker where a real SIGKILL cannot be exercised (non-Unix hosts), so
 /// the scenario still produces an observable footprint without violating INV-0.
-fn create_agent_crash_probe(target_dir: &str, recovery_window_ms: u32) -> Result<Box<dyn ScenarioInjector>, InjectError> {
+fn create_agent_crash_probe(
+    target_dir: &str,
+    recovery_window_ms: u32,
+) -> Result<Box<dyn ScenarioInjector>, InjectError> {
     #[cfg(unix)]
     {
         Ok(Box::new(AgentCrashProbeInjector::new(

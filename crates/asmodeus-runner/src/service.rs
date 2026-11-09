@@ -208,10 +208,10 @@ fn run_worker(
             };
             let backend = default_backend();
             simulated = backend.name() == "sim";
-            // Every chaos field comes from the signed manifest's compiled plan
-            // — never hardcoded. The sinkhole outage (FTT §4.2.3) is a full
-            // drop on `dns_port`; the latency spike (§4.2.1) stays a
-            // probabilistic perturbation.
+            // Every chaos field comes from the signed manifest's compiled plan.
+            // A sinkhole is a full drop of the destination CIDR on the test
+            // iface. `dns_port` is stored on the spec and is not a classifier
+            // match. The latency spike stays a probabilistic perturbation.
             let sinkhole = plan.action == Action::DnsSinkholeDrop;
             let spec = NetChaosSpec {
                 iface: plan.iface.clone(),
@@ -250,6 +250,15 @@ fn run_worker(
                     1000 / u64::from(plan.io_rate_per_sec)
                 },
             )?
+        } else if plan.action == Action::AgentCrashProbe {
+            // inject() reaps the decoy this run spawned. duration_ms is only the
+            // safety envelope, so the worker must not sleep it a second time.
+            let injector = crate::injectors::create_injector_from_plan(&plan, target.as_ref())?;
+            let injected = injector.inject();
+            if let Err(error) = injector.cleanup() {
+                cleanup_error = Some(error.to_string());
+            }
+            return injected;
         } else {
             let id = match plan.action {
                 Action::K8sEscapeProbe => "K8S_ESCAPE_SIMULATION",
@@ -259,7 +268,12 @@ fn run_worker(
                 Action::PersistenceCanary => "PERSISTENCE_CRON_CANARY",
                 Action::ExfiltrationCanary => "DATA_EXFILTRATION_CANARY",
                 Action::WatchdogProbe => "DEFENSE_IMPAIRMENT_CANARY",
-                _ => unreachable!(),
+                Action::SyntheticCanaryEncrypt
+                | Action::AgentCrashProbe
+                | Action::LatencySpike
+                | Action::DnsSinkholeDrop => {
+                    unreachable!("action dispatched before the marker-injector match")
+                }
             };
             let injector = crate::injectors::create_injector(
                 id,
@@ -810,6 +824,9 @@ mod tests {
             "CREDENTIAL_ACCESS_CANARY",
             "K8S_ESCAPE_SIMULATION",
             "LOG_TAMPER_CANARY",
+            // Must complete on the worker path. A missing arm used to hit
+            // unreachable!() inside spawn_blocking and never emit COMPLETED.
+            "AGENT_CRASH_ENDPOINT",
         ] {
             let poly = Polygon::new(&format!("grpc-{scenario_id}"));
             let manifest = asmodeus_dsl::synthetic_manifest(scenario_id, &poly.path(), 3, 1);

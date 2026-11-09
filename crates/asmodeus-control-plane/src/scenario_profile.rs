@@ -248,26 +248,26 @@ pub const PROFILES: &[ProfileDef] = &[
     },
     ProfileDef {
         scenario_id: "AGENT_CRASH_ENDPOINT",
-        fidelity: Fidelity::Behavioral,
+        fidelity: Fidelity::MarkerOnly,
         techniques: &["T1562"],
         legacy_technique: Some("T1562"),
         procedure_id: "ASMOD-CHAOS-0002",
-        // Revision 2: the executor was promoted from a benign pulse marker to
-        // the synthetic SIGKILL crash probe (FTT §4.2.2); the bump records that
-        // behavioural change in the procedure identity.
+        // Revision 2: the executor now SIGKILLs a decoy child instead of only
+        // writing a static pulse. Fidelity stays marker-only: reap time is not
+        // an observation of a real agent restart, so this is not T1562 behaviour.
         procedure_revision: 2,
         platforms: &[Platform::Linux],
         preconditions: "writable canary directory; Unix host able to spawn and reap a child process",
         safety_scope: CANARY_FS_SCOPE,
         expected_observables: &[
-            "process-termination event for the synthetic decoy agent killed with SIGKILL (kill -9 semantics)",
-            "agent_crash_probe.log TERMINATION_EVENT record inside the canary scope",
-            "watchdog_recovery.pulse emitted within the pinned < 5 s recovery window (FTT §4.2.2)",
+            "SIGKILL of the synthetic decoy child this run spawned",
+            "agent_crash_probe.log TERMINATION_EVENT with the measured reap latency",
+            "watchdog_recovery.pulse in the canary scope after the decoy is reaped",
         ],
         limitations:
-            "force-kills ONLY its own synthetic decoy child inside the canary blast radius; no \
-             real security agent or endpoint tool is terminated — proves watchdog/recovery-window \
-             detection behaviourally, not prevention coverage of T1562",
+            "SIGKILL applies only to a synthetic decoy child this run spawned; the pulse is written \
+             after that child is reaped. planned_window_ms is the budget, not a measured restart of \
+             a real agent — not behavioural or prevention coverage of T1562",
     },
     ProfileDef {
         scenario_id: "DNS_RPZ_SINKHOLE_DROP",
@@ -279,7 +279,9 @@ pub const PROFILES: &[ProfileDef] = &[
         platforms: &[Platform::Network],
         preconditions: "a test interface bound to loopback",
         safety_scope: TEST_NET_SCOPE,
-        expected_observables: &["simulated DNS RPZ resolver outage on the loopback test segment"],
+        expected_observables: &[
+            "full drop of IPv4 toward the reserved test CIDR on the test interface; no L4 port match",
+        ],
         limitations:
             "infrastructure-chaos resilience test on reserved test nets; maps to NO ATT&CK \
              technique and contributes no technique coverage",
@@ -350,22 +352,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_crash_endpoint_is_behavioral() {
-        // The synthetic SIGKILL crash probe (FTT §4.2.2) really exercises the
-        // termination/recovery behaviour, so the profile must claim behavioral
-        // fidelity — and still carry an honest limitation about blast radius.
+    fn agent_crash_endpoint_stays_marker_only() {
+        // The probe SIGKILLs its own decoy. That is not a measured watchdog
+        // restart, so the profile must not claim behavioural T1562 coverage.
         let p = profile_for("AGENT_CRASH_ENDPOINT").unwrap();
-        assert_eq!(p.fidelity, Fidelity::Behavioral);
-        assert!(p.fidelity.claims_behavioral());
+        assert_eq!(p.fidelity, Fidelity::MarkerOnly);
+        assert!(!p.fidelity.claims_behavioral());
         assert_eq!(p.techniques, &["T1562"]);
         assert_eq!(p.procedure_revision, 2);
         assert!(p.limitations.contains("synthetic decoy"));
-        assert!(!p.limitations.is_empty());
-        // Every observable names something the injector actually emits.
-        assert!(p
-            .expected_observables
-            .iter()
-            .any(|o| o.contains("SIGKILL")));
+        assert!(p.expected_observables.iter().any(|o| o.contains("SIGKILL")));
         assert!(p
             .expected_observables
             .iter()
@@ -391,6 +387,7 @@ mod tests {
                 "PERSISTENCE_CRON_CANARY",
                 "DATA_EXFILTRATION_CANARY",
                 "DEFENSE_IMPAIRMENT_CANARY",
+                "AGENT_CRASH_ENDPOINT",
             ]
         );
     }
