@@ -403,6 +403,19 @@ mod tests {
         state
     }
 
+    /// Park between polls. A `yield_now` loop stays runnable and, when the
+    /// whole workspace suite is scheduled together, starves the campaign
+    /// worker until a short timeout fires.
+    async fn wait_until(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !ready() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for campaign state");
+    }
+
     #[tokio::test]
     async fn cancelled_campaign_resumes_once_with_new_stage_id_and_snapshotted_plan() {
         let polygon = Polygon::new("campaign-resume");
@@ -411,16 +424,7 @@ mod tests {
             .await
             .unwrap();
         // Observe scenario admission rather than relying on a sleep.
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if !state.runs.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until(|| !state.runs.lock().unwrap().is_empty()).await;
         assert!(request_cancel(&state, &admitted.id));
         let cancelled = worker.await.unwrap().unwrap();
         assert_eq!(cancelled.status, CANCELLED);
@@ -590,41 +594,29 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let handler = tokio::spawn(app.oneshot(request));
-        let admitted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(run) = state
-                    .campaign_runs
-                    .read()
-                    .unwrap()
-                    .list(None, None, None)
-                    .pop()
-                {
-                    break run;
-                }
-                tokio::task::yield_now().await;
-            }
+        let mut found = None;
+        wait_until(|| {
+            found = state
+                .campaign_runs
+                .read()
+                .unwrap()
+                .list(None, None, None)
+                .pop();
+            found.is_some()
         })
-        .await
-        .unwrap();
+        .await;
+        let admitted = found.unwrap();
         handler.abort();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if state
-                    .campaign_runs
-                    .read()
-                    .unwrap()
-                    .get(&admitted.id)
-                    .unwrap()
-                    .status
-                    == COMPLETED
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+        let run_id = admitted.id.clone();
+        wait_until(|| {
+            state
+                .campaign_runs
+                .read()
+                .unwrap()
+                .get(&run_id)
+                .is_some_and(|run| run.status == COMPLETED)
         })
-        .await
-        .unwrap();
+        .await;
         assert_eq!(state.audit.len(), 4);
     }
 
@@ -635,16 +627,7 @@ mod tests {
         let (_, worker) = launch(state.clone(), run(&state), Role::RedTeam, false)
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if !state.runs.lock().unwrap().is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until(|| !state.runs.lock().unwrap().is_empty()).await;
         let path = polygon.dir().join("campaign_runs.json");
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -746,16 +729,7 @@ mod tests {
             .0,
             StatusCode::ACCEPTED
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if !state.campaign_controls.lock().unwrap().contains_key(id) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until(|| !state.campaign_controls.lock().unwrap().contains_key(id)).await;
         assert_eq!(
             call(
                 app.clone(),
@@ -768,16 +742,7 @@ mod tests {
             .0,
             StatusCode::ACCEPTED
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if !state.campaign_controls.lock().unwrap().contains_key(id) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until(|| !state.campaign_controls.lock().unwrap().contains_key(id)).await;
         let (status, details) = call(app.clone(), "GET", &path, "auditor", json!(null)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(details["status"], COMPLETED);

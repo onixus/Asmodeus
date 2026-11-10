@@ -65,10 +65,14 @@ pipeline {
                 // создаются от root, а cargo здесь идёт под uid агента (см. тот же
                 // урок в Ferrum/Jenkinsfile.linux). Каталог создаём до `docker run`,
                 // иначе Docker создаст его сам — от root.
+                // `:z` нужен на SELinux (gaming-нода, Enforcing): без перевешивания
+                // container_t не пишет в cache_home_t, и cargo падает с EACCES,
+                // хотя каталог уже принадлежит uid агента. Воркспейс плагин
+                // монтирует с `:z` сам. Без SELinux флаг — no-op.
                 sh 'mkdir -p "$HOME/.cache/asmodeus-ci"'
                 script {
                     def ci = docker.build('asmodeus-ci:1.90', '-f stand/Dockerfile.ci stand')
-                    ci.inside("-v ${env.HOME}/.cache/asmodeus-ci:/cache") {
+                    ci.inside("-v ${env.HOME}/.cache/asmodeus-ci:/cache:z") {
                         withEnv(['CARGO_HOME=/cache/cargo-home', 'CARGO_TARGET_DIR=/cache/target']) {
                             // Формат не блокирует тесты и стенд: это не поведение.
                             // Стадия краснеет, билд становится UNSTABLE.
@@ -117,20 +121,30 @@ pipeline {
         // Отдельный root-контейнер: установка nightly/LLVM/bpf-linker пишет за
         // пределы воркспейса, под uid агента этого нельзя; кэши — свои
         // (.cargo-root-*), чтобы не мешать каталогам стадии тестов под её uid.
+        // Не через `agent { docker { args '-u 0:0' } }`: плагин всё равно
+        // добавляет `-u <uid агента>`, а durable-task внутри root-контейнера
+        // агент не видит — `sh` умирает с exit -2
+        // («process apparently never started»), не дойдя до rustc (#15).
+        // Контейнер запускает обычный sh агента, как стадия «Стенд».
         stage('netchaos BPF ELF') {
-            agent {
-                docker {
-                    label 'gaming'
-                    image 'rust:1-bookworm'
-                    args '-u 0:0'
-                    reuseNode true
-                }
-            }
+            agent { label 'gaming' }
             steps {
                 deleteDir()
                 unstash 'src'
                 sh '''
                     set -eu
+                    docker run -i --rm -u 0:0 \
+                        -e WORKSPACE="$WORKSPACE" \
+                        -e AGENT_UID="$(id -u)" \
+                        -e AGENT_GID="$(id -g)" \
+                        -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}" \
+                        -v "$WORKSPACE:$WORKSPACE:rw,z" \
+                        -w "$WORKSPACE" \
+                        rust:1-bookworm \
+                        bash -eu -s <<'EOF'
+                    # Кэши и dist остаются от root. Следующая стадия делает
+                    # deleteDir агентом и падает на chmod (EPERM, #16).
+                    trap 'chown -R "${AGENT_UID}:${AGENT_GID}" "$WORKSPACE" || true' EXIT
                     export CARGO_HOME="$WORKSPACE/.cargo-root-home"
                     export RUSTUP_HOME="$WORKSPACE/.cargo-root-rustup"
                     export CARGO_TARGET_DIR="$WORKSPACE/.cargo-root-target"
@@ -198,6 +212,7 @@ pipeline {
                     mkdir -p dist
                     cp "$elf" dist/asmodeus-netchaos.bpf.o
                     ls -l dist/asmodeus-netchaos.bpf.o
+EOF
                 '''
                 archiveArtifacts artifacts: 'dist/asmodeus-netchaos.bpf.o', fingerprint: true
             }
