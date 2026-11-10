@@ -235,8 +235,8 @@ fn build_report(
         }
         slots.push(slot_report(procedure, supplied, observation, &scope));
     }
-    observations.sort_by(|a, b| a.observation_id.cmp(&b.observation_id));
-    observations.dedup_by(|a, b| a.observation_id == b.observation_id);
+    observations.sort_by(|a, b| a.observation_id.urn.cmp(&b.observation_id.urn));
+    observations.dedup_by(|a, b| a.observation_id.urn == b.observation_id.urn);
     let mut gaps: Vec<String> = slots.iter().flat_map(|slot| slot.gaps.clone()).collect();
     gaps.sort();
     gaps.dedup();
@@ -368,7 +368,7 @@ fn slot_report(
         gaps.push("legacy_feedback_unconfirmed".into());
     }
     let evidence_links = observation
-        .map(|obs| vec![obs.observation_id.clone()])
+        .map(|obs| vec![obs.observation_id.urn.clone()])
         .unwrap_or_default();
     let attempt = observation.map(|obs| obs.attempt_id.as_str()).unwrap_or("");
     let variants = ["positive", "benign_control"]
@@ -488,12 +488,18 @@ fn judge(slots: &[SlotReport]) -> (AcceptanceGate, Vec<String>) {
 fn trusted_obs(observation: &ValidationObservation, trusted_public_key: &[u8]) -> bool {
     observation.schema_version == SCHEMA_VERSION
         && observation_trusted(observation, trusted_public_key)
-        && observation
-            .evidence_refs
-            .iter()
-            .all(|item| synthetic_ref(item) == *item)
-        && !observation.observation_id.contains("/tmp/")
-        && !observation.observation_id.contains("/var/")
+        && observation.evidence_refs.iter().all(|item| {
+            item.urn.starts_with("urn:apex:evidence:")
+                && synthetic_ref(&item.urn) == item.urn
+                && !item.urn.contains("/tmp/")
+                && !item.urn.contains("/var/")
+                && !item.local_id.contains("/tmp/")
+                && !item.local_id.contains("/var/")
+        })
+        && !observation.observation_id.urn.contains("/tmp/")
+        && !observation.observation_id.urn.contains("/var/")
+        && !observation.observation_id.local_id.contains("/tmp/")
+        && !observation.observation_id.local_id.contains("/var/")
 }
 
 fn scope_line() -> String {

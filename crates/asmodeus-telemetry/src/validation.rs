@@ -141,6 +141,9 @@ pub struct Producer {
 #[serde(deny_unknown_fields)]
 pub struct Dimensions {
     pub applicability: Applicability,
+    /// Omitted when absent. The observation schema rejects JSON null and
+    /// requires the string when applicability is NOT_APPLICABLE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applicability_reason: Option<String>,
     pub telemetry: TelemetryState,
     pub detection: DimensionOutcome,
@@ -170,6 +173,71 @@ impl Dimensions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceKind {
+    Asset,
+    Evidence,
+}
+
+impl ResourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asset => "asset",
+            Self::Evidence => "evidence",
+        }
+    }
+}
+
+/// Canonical resource reference. `urn` is `urn:apex:{kind}:{source}:{local_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceRef {
+    pub urn: String,
+    pub kind: ResourceKind,
+    pub source: String,
+    pub local_id: String,
+}
+
+impl ResourceRef {
+    fn new(kind: ResourceKind, source: &str, local_id: &str) -> Result<Self, String> {
+        if !is_source(source) || !is_local_id(local_id) {
+            return Err("resource ref does not match schema".into());
+        }
+        let urn = format!("urn:apex:{}:{source}:{local_id}", kind.as_str());
+        if split_apex_urn(&urn, kind.as_str()).is_none() {
+            return Err("resource ref does not match schema".into());
+        }
+        Ok(Self {
+            urn,
+            kind,
+            source: source.to_string(),
+            local_id: local_id.to_string(),
+        })
+    }
+
+    fn parse(urn: &str, kind: ResourceKind) -> Option<Self> {
+        let (source, local_id) = split_apex_urn(urn, kind.as_str())?;
+        Some(Self {
+            urn: urn.to_string(),
+            kind,
+            source: source.to_string(),
+            local_id: local_id.to_string(),
+        })
+    }
+
+    fn consistent(&self) -> bool {
+        self.urn
+            == format!(
+                "urn:apex:{}:{}:{}",
+                self.kind.as_str(),
+                self.source,
+                self.local_id
+            )
+            && split_apex_urn(&self.urn, self.kind.as_str()).is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
@@ -183,10 +251,10 @@ pub struct Provenance {
 #[serde(deny_unknown_fields)]
 pub struct ValidationObservation {
     pub schema_version: String,
-    pub observation_id: String,
+    pub observation_id: ResourceRef,
     pub producer: Producer,
     pub tenant_id: String,
-    pub asset_ref: String,
+    pub asset_ref: ResourceRef,
     pub environment_ref: String,
     pub run_id: String,
     pub attempt_id: String,
@@ -194,6 +262,7 @@ pub struct ValidationObservation {
     pub procedure_revision: u32,
     pub idempotency_key: String,
     pub revision: u32,
+    /// Previous evidence URN, or JSON null when this is the first revision.
     pub supersedes: Option<String>,
     pub occurred_at: String,
     pub observed_at: String,
@@ -203,17 +272,19 @@ pub struct ValidationObservation {
     pub fidelity: ObservationFidelity,
     pub dimensions: Dimensions,
     pub provenance: Provenance,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<ResourceRef>,
     pub limitations: Vec<String>,
 }
 
 impl ValidationObservation {
-    /// Length-prefixed preimage. `signature_hex` is excluded so the signature
-    /// can cover provenance metadata without signing itself.
+    /// Length-prefixed preimage. Resource refs contribute their wire fields
+    /// (`urn`, `kind`, `source`, `local_id`), not Debug output. `signature_hex`
+    /// is excluded so the signature can cover provenance metadata without
+    /// signing itself. `supersedes` is the previous URN or empty.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         field(&mut buf, &self.schema_version);
-        field(&mut buf, &self.observation_id);
+        write_ref(&mut buf, &self.observation_id);
         field(&mut buf, &self.producer.system);
         field(&mut buf, &self.producer.version);
         field(&mut buf, &self.producer.commit_sha);
@@ -221,7 +292,7 @@ impl ValidationObservation {
         field(&mut buf, &self.producer.config_digest);
         field(&mut buf, &self.producer.policy_digest);
         field(&mut buf, &self.tenant_id);
-        field(&mut buf, &self.asset_ref);
+        write_ref(&mut buf, &self.asset_ref);
         field(&mut buf, &self.environment_ref);
         field(&mut buf, &self.run_id);
         field(&mut buf, &self.attempt_id);
@@ -251,7 +322,10 @@ impl ValidationObservation {
         field(&mut buf, self.dimensions.validation.as_str());
         field(&mut buf, &self.provenance.trusted_key_id);
         field(&mut buf, &self.provenance.signature_covers.join(","));
-        field(&mut buf, &self.evidence_refs.join(","));
+        field(&mut buf, &self.evidence_refs.len().to_string());
+        for item in &self.evidence_refs {
+            write_ref(&mut buf, item);
+        }
         field(&mut buf, &self.limitations.join(","));
         buf
     }
@@ -403,6 +477,7 @@ impl Decision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // the admitted document is returned by value
 pub enum AdmitResult {
     Admitted(ValidationExtension),
     Duplicate(ValidationObservation),
@@ -444,6 +519,10 @@ pub fn is_commit_sha(value: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Id of a trusted public key, derived from that key's bytes.
+/// Not read from an audit record's embedded `public_key_hex`.
+/// `sha256:` plus 64 hex matches the observation token pattern, so the value
+/// is not rewritten to `asmodeus:<32 hex>`.
 pub fn trusted_key_id(public_key: &[u8]) -> String {
     sha256_prefixed(public_key)
 }
@@ -457,6 +536,69 @@ pub fn synthetic_ref(raw: &str) -> String {
     let digest = sha256_prefixed(raw.as_bytes());
     let hex = digest.trim_start_matches("sha256:");
     format!("urn:apex:evidence:asmodeus:ref:{hex}")
+}
+
+fn evidence_resource_ref(raw: &str) -> Result<ResourceRef, String> {
+    let urn = synthetic_ref(raw);
+    let local_id = urn
+        .strip_prefix("urn:apex:evidence:asmodeus:")
+        .ok_or("evidence ref is not an asmodeus urn")?;
+    ResourceRef::new(ResourceKind::Evidence, "asmodeus", local_id)
+}
+
+fn asset_resource_ref(raw: &str) -> Result<ResourceRef, String> {
+    if let Some(parsed) = ResourceRef::parse(raw, ResourceKind::Asset) {
+        return Ok(parsed);
+    }
+    if raw.starts_with("urn:") || !is_local_id(raw) {
+        return Err("asset_ref does not match schema".into());
+    }
+    ResourceRef::new(ResourceKind::Asset, "asmodeus", raw)
+}
+
+fn environment_urn(raw: &str) -> Result<String, String> {
+    if split_apex_urn(raw, "environment").is_some() {
+        return Ok(raw.to_string());
+    }
+    if raw.starts_with("urn:") || !is_local_id(raw) {
+        return Err("environment_ref does not match schema".into());
+    }
+    Ok(format!("urn:apex:environment:asmodeus:{raw}"))
+}
+
+fn observation_ref(run_id: &str, attempt_id: &str, revision: u32) -> Result<ResourceRef, String> {
+    let local_id = format!("{run_id}:{attempt_id}:r{revision}");
+    ResourceRef::new(ResourceKind::Evidence, "asmodeus", &local_id)
+}
+
+/// `attackRelease` is an identifier. Display text such as the pinned ATT&CK
+/// label is folded to a stable token; values that already match pass through.
+fn schema_attack_release(raw: &str) -> Result<String, String> {
+    if is_attack_release(raw) {
+        return Ok(raw.to_string());
+    }
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    while out.ends_with('-') || out.ends_with('.') || out.ends_with('_') {
+        out.pop();
+    }
+    if out.len() > 64 {
+        out.truncate(64);
+        while out.ends_with('-') || out.ends_with('.') || out.ends_with('_') {
+            out.pop();
+        }
+    }
+    if is_attack_release(&out) {
+        Ok(out)
+    } else {
+        Err("attack_release does not match schema".into())
+    }
 }
 
 pub fn claim_body_hash(claim: &FeedbackClaim) -> String {
@@ -504,7 +646,8 @@ pub fn legacy_feedback_unconfirmed(record: &AuditRecord) -> bool {
 
 pub fn stage_revision(record: &AuditRecord, trusted_public_key: &[u8]) -> Option<String> {
     let ext = record.validation.as_ref()?;
-    exportable(&ext.observation, trusted_public_key).then(|| ext.observation.observation_id.clone())
+    exportable(&ext.observation, trusted_public_key)
+        .then(|| ext.observation.observation_id.urn.clone())
 }
 
 /// Tip revision seen by a rebuilt aggregate. Same id as [`stage_revision`]
@@ -524,10 +667,10 @@ pub fn aggregate_revision(
             } else {
                 ext.revisions.as_slice()
             };
-            chain.iter().filter_map(|observation| {
-                exportable(observation, trusted_public_key)
-                    .then(|| (observation.revision, observation.observation_id.clone()))
-            })
+            chain
+                .iter()
+                .filter(|observation| exportable(observation, trusted_public_key))
+                .map(|observation| (observation.revision, observation.observation_id.urn.clone()))
         })
         .max_by_key(|(revision, _)| *revision)
         .map(|(_, id)| id)
@@ -555,14 +698,14 @@ pub fn export_observations(
             }
         }
     }
-    observations.sort_by(|a, b| a.observation_id.cmp(&b.observation_id));
-    observations.dedup_by(|a, b| a.observation_id == b.observation_id);
+    observations.sort_by(|a, b| a.observation_id.urn.cmp(&b.observation_id.urn));
+    observations.dedup_by(|a, b| a.observation_id.urn == b.observation_id.urn);
     if let Some(cursor) = cursor {
-        observations.retain(|obs| obs.observation_id.as_str() > cursor);
+        observations.retain(|obs| obs.observation_id.urn.as_str() > cursor);
     }
     let limit = limit.unwrap_or(100).clamp(1, 500);
     let next_cursor = if observations.len() > limit {
-        Some(observations[limit - 1].observation_id.clone())
+        Some(observations[limit - 1].observation_id.urn.clone())
     } else {
         None
     };
@@ -886,7 +1029,7 @@ pub fn admit(
                 let existing = prev
                     .revisions
                     .iter()
-                    .find(|obs| obs.observation_id == entry.observation_id)
+                    .find(|obs| obs.observation_id.urn == entry.observation_id)
                     .cloned()
                     .unwrap_or_else(|| prev.observation.clone());
                 return AdmitResult::Duplicate(existing);
@@ -906,16 +1049,33 @@ pub fn admit(
         .map(|prev| prev.observation.revision.saturating_add(1))
         .unwrap_or(1)
         .max(1);
-    let supersedes = previous.map(|prev| prev.observation.observation_id.clone());
-    let observation_id = format!(
-        "urn:apex:evidence:asmodeus:{}:{}:r{revision}",
-        binding.run_id, binding.attempt_id
-    );
-    let evidence_refs = claim
-        .evidence_refs
-        .iter()
-        .map(|raw| synthetic_ref(raw))
-        .collect();
+    let supersedes = previous.map(|prev| prev.observation.observation_id.urn.clone());
+    let observation_id = match observation_ref(&binding.run_id, &binding.attempt_id, revision) {
+        Ok(value) => value,
+        Err(err) => return AdmitResult::Invalid(err),
+    };
+    let asset_ref = match asset_resource_ref(&binding.asset_ref) {
+        Ok(value) => value,
+        Err(err) => return AdmitResult::Invalid(err),
+    };
+    let environment_ref = match environment_urn(&binding.environment_ref) {
+        Ok(value) => value,
+        Err(err) => return AdmitResult::Invalid(err),
+    };
+    let attack_release = match schema_attack_release(&claim.attack_release) {
+        Ok(value) => value,
+        Err(err) => return AdmitResult::Invalid(err),
+    };
+    if claim.evidence_refs.len() > 64 {
+        return AdmitResult::Invalid("too many evidence refs".into());
+    }
+    let mut evidence_refs = Vec::with_capacity(claim.evidence_refs.len());
+    for raw in &claim.evidence_refs {
+        match evidence_resource_ref(raw) {
+            Ok(item) => evidence_refs.push(item),
+            Err(err) => return AdmitResult::Invalid(err),
+        }
+    }
     let mut observation = ValidationObservation {
         schema_version: SCHEMA_VERSION.into(),
         observation_id,
@@ -928,8 +1088,8 @@ pub fn admit(
             policy_digest: claim.policy_digest.clone(),
         },
         tenant_id: binding.tenant_id.clone(),
-        asset_ref: binding.asset_ref.clone(),
-        environment_ref: binding.environment_ref.clone(),
+        asset_ref,
+        environment_ref,
         run_id: binding.run_id.clone(),
         attempt_id: binding.attempt_id.clone(),
         procedure_id: binding.procedure_id.clone(),
@@ -941,7 +1101,7 @@ pub fn admit(
         observed_at: claim.observed_at.clone(),
         expires_at: binding.expires_at.clone(),
         catalog_digest: claim.catalog_digest.clone(),
-        attack_release: claim.attack_release.clone(),
+        attack_release,
         fidelity: claim.fidelity,
         dimensions: decision.dimensions,
         provenance: Provenance {
@@ -972,7 +1132,7 @@ pub fn admit(
     ledger.push(IdempotencyEntry {
         key: claim.idempotency_key.clone(),
         body_hash: hash.clone(),
-        observation_id: observation.observation_id.clone(),
+        observation_id: observation.observation_id.urn.clone(),
         revision,
     });
     AdmitResult::Admitted(ValidationExtension {
@@ -1114,51 +1274,78 @@ pub fn assess_mttd(occurred_at: &str, observed_at: &str) -> MttdAssessment {
 fn exportable(observation: &ValidationObservation, trusted_public_key: &[u8]) -> bool {
     observation.schema_version == SCHEMA_VERSION
         && observation.revision >= 1
+        && observation.procedure_revision >= 1
         && observation.producer.system == "asmodeus"
         && is_commit_sha(&observation.producer.commit_sha)
         && is_sha256_digest(&observation.producer.artifact_digest)
         && is_sha256_digest(&observation.producer.config_digest)
         && is_sha256_digest(&observation.producer.policy_digest)
         && is_sha256_digest(&observation.catalog_digest)
-        && is_sha256_digest(&observation.provenance.trusted_key_id)
+        && observation.provenance.trusted_key_id == trusted_key_id(trusted_public_key)
+        && is_trusted_key_id(&observation.provenance.trusted_key_id)
+        && is_signature_hex(&observation.provenance.signature_hex)
+        && evidence_identity_ok(&observation.observation_id)
+        && asset_identity_ok(&observation.asset_ref)
+        && is_environment_urn(&observation.environment_ref)
         && observation
-            .observation_id
-            .starts_with("urn:apex:evidence:asmodeus:")
+            .supersedes
+            .as_deref()
+            .map(is_evidence_urn)
+            .unwrap_or(true)
         && observation
             .provenance
             .signature_covers
             .iter()
             .map(String::as_str)
             .eq(SIGNATURE_COVERS)
-        && observation
-            .evidence_refs
-            .iter()
-            .all(|item| synthetic_ref(item) == *item)
+        && observation.evidence_refs.len() <= 64
+        && observation.evidence_refs.iter().all(evidence_ref_ok)
+        && observation.limitations.len() <= 64
         && observation
             .limitations
             .iter()
             .all(|item| LIMITATION_CODES.contains(&item.as_str()))
-        && observation
-            .dimensions
-            .applicability_reason
-            .as_deref()
-            .map(reason_token)
-            .unwrap_or(true)
+        && schema_dimensions_ok(observation)
         && tokens_ok(observation)
         && !contains_secret_material(observation)
         && observation_trusted(observation, trusted_public_key)
 }
 
+fn schema_dimensions_ok(observation: &ValidationObservation) -> bool {
+    let reason = observation.dimensions.applicability_reason.as_deref();
+    let reason_ok = match observation.dimensions.applicability {
+        Applicability::NOT_APPLICABLE => reason.is_some_and(reason_token),
+        Applicability::APPLICABLE => reason.is_none(),
+    };
+    if !reason_ok {
+        return false;
+    }
+    if observation.fidelity == ObservationFidelity::Marker
+        && observation.dimensions.prevention == DimensionOutcome::PASSED
+    {
+        return false;
+    }
+    let confirmed = matches!(observation.dimensions.detection, DimensionOutcome::PASSED)
+        || matches!(observation.dimensions.prevention, DimensionOutcome::PASSED)
+        || matches!(observation.dimensions.containment, DimensionOutcome::PASSED);
+    if confirmed && observation.dimensions.telemetry != TelemetryState::AVAILABLE {
+        return false;
+    }
+    true
+}
+
 fn tokens_ok(observation: &ValidationObservation) -> bool {
     is_token(&observation.tenant_id)
-        && is_token(&observation.asset_ref)
-        && is_token(&observation.environment_ref)
-        && is_token(&observation.run_id)
-        && is_token(&observation.attempt_id)
-        && is_token(&observation.procedure_id)
-        && is_token(&observation.idempotency_key)
-        && acceptable_text(&observation.attack_release, 80)
-        && is_token(&observation.producer.version)
+        && is_schema_id(&observation.run_id)
+        && is_schema_id(&observation.attempt_id)
+        && is_procedure_id(&observation.procedure_id)
+        && is_idempotency_key(&observation.idempotency_key)
+        && is_attack_release(&observation.attack_release)
+        && (1..=64).contains(&observation.producer.version.len())
+        && is_source(&observation.producer.system)
+        && parse_rfc3339_ms(&observation.occurred_at).is_some()
+        && parse_rfc3339_ms(&observation.observed_at).is_some()
+        && parse_rfc3339_ms(&observation.expires_at).is_some()
 }
 
 fn contains_secret_material(observation: &ValidationObservation) -> bool {
@@ -1174,9 +1361,9 @@ fn shape_error(binding: &AttemptBinding, claim: &FeedbackClaim) -> Option<String
     if !is_token(&binding.tenant_id)
         || !is_token(&binding.environment_ref)
         || !is_token(&binding.asset_ref)
-        || !is_token(&binding.run_id)
-        || !is_token(&binding.attempt_id)
-        || !is_token(&binding.procedure_id)
+        || !is_schema_id(&binding.run_id)
+        || !is_schema_id(&binding.attempt_id)
+        || !is_procedure_id(&binding.procedure_id)
         || !is_token(&binding.technique_id)
         || binding.procedure_revision == 0
         || parse_rfc3339_ms(&binding.occurred_at).is_none()
@@ -1187,17 +1374,17 @@ fn shape_error(binding: &AttemptBinding, claim: &FeedbackClaim) -> Option<String
     if !is_token(&claim.tenant_id)
         || !is_token(&claim.environment_ref)
         || !is_token(&claim.asset_ref)
-        || !is_token(&claim.run_id)
-        || !is_token(&claim.attempt_id)
-        || !is_token(&claim.procedure_id)
-        || !is_token(&claim.idempotency_key)
+        || !is_schema_id(&claim.run_id)
+        || !is_schema_id(&claim.attempt_id)
+        || !is_procedure_id(&claim.procedure_id)
+        || !is_idempotency_key(&claim.idempotency_key)
         || claim.procedure_revision == 0
         || claim
             .technique_id
             .as_deref()
             .is_some_and(|technique| !is_token(technique))
         || !is_commit_sha(&claim.producer.commit_sha)
-        || !is_token(&claim.producer.version)
+        || !(1..=64).contains(&claim.producer.version.len())
         || !is_sha256_digest(&claim.catalog_digest)
         || !is_sha256_digest(&claim.config_digest)
         || !is_sha256_digest(&claim.artifact_digest)
@@ -1226,6 +1413,98 @@ fn is_token(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+fn is_local_id(value: &str) -> bool {
+    (1..=160).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b':' | b'-')
+        })
+}
+
+fn is_source(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn is_schema_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn is_procedure_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn is_idempotency_key(value: &str) -> bool {
+    (1..=256).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'~' | b'-')
+        })
+}
+
+fn is_attack_release(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_trusted_key_id(value: &str) -> bool {
+    is_schema_id(value)
+}
+
+fn is_signature_hex(value: &str) -> bool {
+    (64..=512).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_environment_urn(value: &str) -> bool {
+    split_apex_urn(value, "environment").is_some()
+}
+
+fn is_evidence_urn(value: &str) -> bool {
+    split_apex_urn(value, "evidence").is_some()
+}
+
+fn split_apex_urn<'a>(urn: &'a str, kind: &str) -> Option<(&'a str, &'a str)> {
+    let rest = urn.strip_prefix("urn:apex:")?.strip_prefix(kind)?;
+    let rest = rest.strip_prefix(':')?;
+    let (source, local_id) = rest.split_once(':')?;
+    (is_source(source) && is_local_id(local_id)).then_some((source, local_id))
+}
+
+fn evidence_identity_ok(item: &ResourceRef) -> bool {
+    item.kind == ResourceKind::Evidence && item.source == "asmodeus" && item.consistent()
+}
+
+fn asset_identity_ok(item: &ResourceRef) -> bool {
+    item.kind == ResourceKind::Asset && is_source(&item.source) && item.consistent()
+}
+
+fn evidence_ref_ok(item: &ResourceRef) -> bool {
+    evidence_identity_ok(item) && synthetic_ref(&item.urn) == item.urn
 }
 
 fn acceptable_text(value: &str, max: usize) -> bool {
@@ -1301,6 +1580,13 @@ fn field(buf: &mut Vec<u8>, value: &str) {
     buf.push(b':');
     buf.extend_from_slice(value.as_bytes());
     buf.push(b'|');
+}
+
+fn write_ref(buf: &mut Vec<u8>, item: &ResourceRef) {
+    field(buf, &item.urn);
+    field(buf, item.kind.as_str());
+    field(buf, &item.source);
+    field(buf, &item.local_id);
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -1749,7 +2035,7 @@ mod tests {
         assert_eq!(ext2.observation.revision, 2);
         assert_eq!(
             ext2.observation.supersedes.as_deref(),
-            Some(ext.observation.observation_id.as_str())
+            Some(ext.observation.observation_id.urn.as_str())
         );
         assert_eq!(
             ext2.revisions[0].provenance.signature_hex,
@@ -1780,6 +2066,7 @@ mod tests {
                     .unwrap()
                     .observation
                     .observation_id
+                    .urn
                     .as_str()
             )
         );
@@ -1895,6 +2182,349 @@ mod tests {
             Some("fixture_not_in_scope")
         );
         assert!(!decision.any_passed());
+    }
+
+    #[test]
+    fn first_wave_procedure_ids_match_the_observation_pattern() {
+        for id in [
+            "container-exec",
+            "shell-execution",
+            "runtime-socket-prerequisite",
+            "http-beacon",
+            "dns-pattern",
+            "synthetic-transfer",
+        ] {
+            assert!(is_procedure_id(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn exported_observation_matches_attack_observation_shape() {
+        let (pk, sk) = generate_keypair();
+        let mut claim = claim();
+        claim.evidence_refs = vec!["sensor-hit".into()];
+        let ext = match admit(&binding(), &claim, None, &sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&ext.observation.export_json()).unwrap();
+        assert_observation_shape(&value, true);
+        assert!(value["supersedes"].is_null());
+        assert!(value["dimensions"].get("applicability_reason").is_none());
+        assert_eq!(value["evidence_refs"].as_array().unwrap().len(), 1);
+        assert_eq!(value["procedure_id"], "http-beacon");
+        assert_eq!(value["attack_release"], "ATT-CK-Enterprise-v15.1");
+        assert_eq!(
+            value["environment_ref"],
+            "urn:apex:environment:asmodeus:env-lab"
+        );
+        assert_eq!(value["asset_ref"]["kind"], "asset");
+        assert_eq!(value["asset_ref"]["local_id"], "asset-1");
+        assert_eq!(value["asset_ref"]["urn"], "urn:apex:asset:asmodeus:asset-1");
+        assert_eq!(
+            ext.observation.provenance.trusted_key_id,
+            trusted_key_id(&pk)
+        );
+        let signature = value["provenance"]["signature_hex"].as_str().unwrap();
+        assert_eq!(signature.len(), 128);
+
+        let mut late = claim.clone();
+        late.idempotency_key = "idem-2".into();
+        late.evidence_refs.clear();
+        let ext2 = match admit(&binding(), &late, Some(&ext), &sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        let second: serde_json::Value =
+            serde_json::from_str(&ext2.observation.export_json()).unwrap();
+        assert_observation_shape(&second, false);
+        assert_eq!(second["supersedes"], value["observation_id"]["urn"]);
+        assert!(second["supersedes"].is_string());
+        assert!(second["evidence_refs"].as_array().unwrap().is_empty());
+
+        let mut na = claim.clone();
+        na.idempotency_key = "idem-na".into();
+        na.applicability = Applicability::NOT_APPLICABLE;
+        na.applicability_reason = Some("fixture_not_in_scope".into());
+        na.evidence_refs.clear();
+        let ext_na = match admit(&binding(), &na, Some(&ext2), &sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        let na_json: serde_json::Value =
+            serde_json::from_str(&ext_na.observation.export_json()).unwrap();
+        assert_eq!(na_json["dimensions"]["applicability"], "NOT_APPLICABLE");
+        assert_eq!(
+            na_json["dimensions"]["applicability_reason"],
+            "fixture_not_in_scope"
+        );
+        assert!(na_json["dimensions"]["applicability_reason"].is_string());
+        let page = export_observations(
+            std::slice::from_ref(&sample_audit(ext_na).sign(&sk).unwrap()),
+            &pk,
+            None,
+            None,
+        );
+        assert!(page.observations.iter().any(|obs| {
+            obs.dimensions.applicability == Applicability::NOT_APPLICABLE
+                && obs.dimensions.applicability_reason.as_deref() == Some("fixture_not_in_scope")
+        }));
+    }
+
+    #[test]
+    fn marker_prevention_passed_is_not_exported_as_confirmation() {
+        let (pk, sk) = generate_keypair();
+        let mut claim = claim();
+        claim.fidelity = ObservationFidelity::Marker;
+        claim.prevention_claimed = true;
+        let ext = match admit(&binding(), &claim, None, &sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(
+            ext.observation.dimensions.prevention,
+            DimensionOutcome::PASSED
+        );
+        let record = sample_audit(ext.clone()).sign(&sk).unwrap();
+        let page = export_observations(std::slice::from_ref(&record), &pk, None, None);
+        assert_eq!(page.observations.len(), 1);
+        assert_eq!(page.observations[0].fidelity, ObservationFidelity::Marker);
+        assert_ne!(
+            page.observations[0].dimensions.prevention,
+            DimensionOutcome::PASSED
+        );
+        let rendered = export_page_json(&page);
+        assert!(!rendered.contains("\"prevention\":\"PASSED\""));
+
+        let mut relabeled = ext.observation.clone();
+        relabeled.dimensions.prevention = DimensionOutcome::PASSED;
+        sign_observation(&mut relabeled, &sk).unwrap();
+        assert!(observation_trusted(&relabeled, &pk));
+        let mut ext = ext;
+        ext.observation = relabeled.clone();
+        ext.revisions = vec![relabeled];
+        let record = sample_audit(ext).sign(&sk).unwrap();
+        let page = export_observations(std::slice::from_ref(&record), &pk, None, None);
+        assert!(page.observations.is_empty());
+    }
+
+    #[test]
+    fn trusted_key_id_comes_from_the_trusted_key_argument() {
+        let (trusted_pk, trusted_sk) = generate_keypair();
+        let (attacker_pk, _) = generate_keypair();
+        let ext = match admit(&binding(), &claim(), None, &trusted_sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        let id = ext.observation.provenance.trusted_key_id.clone();
+        assert_eq!(id, trusted_key_id(&trusted_pk));
+        assert!(is_trusted_key_id(&id));
+        assert_ne!(id, to_hex(&trusted_pk));
+        assert_ne!(id, to_hex(&attacker_pk));
+        let mut record = sample_audit(ext.clone()).sign(&trusted_sk).unwrap();
+        record.public_key_hex = to_hex(&attacker_pk);
+        assert_eq!(
+            record
+                .validation
+                .as_ref()
+                .unwrap()
+                .observation
+                .provenance
+                .trusted_key_id,
+            id
+        );
+        let page = export_observations(std::slice::from_ref(&record), &trusted_pk, None, None);
+        assert_eq!(page.observations.len(), 1);
+        assert_eq!(page.observations[0].provenance.trusted_key_id, id);
+        let hidden = export_observations(std::slice::from_ref(&record), &attacker_pk, None, None);
+        assert!(hidden.observations.is_empty());
+
+        let mut relabeled = ext.observation.clone();
+        relabeled.provenance.trusted_key_id = trusted_key_id(&attacker_pk);
+        relabeled.provenance.signature_hex.clear();
+        let sig = asmodeus_crypto::sign_message(&relabeled.canonical_bytes(), &trusted_sk).unwrap();
+        relabeled.provenance.signature_hex = to_hex(&sig);
+        assert!(observation_trusted(&relabeled, &trusted_pk));
+        assert_ne!(
+            relabeled.provenance.trusted_key_id,
+            trusted_key_id(&trusted_pk)
+        );
+        let mut ext = ext;
+        ext.observation = relabeled.clone();
+        ext.revisions = vec![relabeled];
+        let record = sample_audit(ext).sign(&trusted_sk).unwrap();
+        let page = export_observations(std::slice::from_ref(&record), &trusted_pk, None, None);
+        assert!(page.observations.is_empty());
+    }
+
+    fn assert_observation_shape(value: &serde_json::Value, with_evidence: bool) {
+        let keys = object_keys(value);
+        assert_eq!(
+            keys,
+            vec![
+                "asset_ref",
+                "attack_release",
+                "attempt_id",
+                "catalog_digest",
+                "dimensions",
+                "environment_ref",
+                "evidence_refs",
+                "expires_at",
+                "fidelity",
+                "idempotency_key",
+                "limitations",
+                "observation_id",
+                "observed_at",
+                "occurred_at",
+                "procedure_id",
+                "procedure_revision",
+                "producer",
+                "provenance",
+                "revision",
+                "run_id",
+                "schema_version",
+                "supersedes",
+                "tenant_id",
+            ]
+        );
+        assert_eq!(value["schema_version"], "1.0");
+        assert_resource_ref(&value["observation_id"], "evidence", "asmodeus");
+        assert_resource_ref(&value["asset_ref"], "asset", "asmodeus");
+        assert!(value["environment_ref"].is_string());
+        assert!(is_environment_urn(
+            value["environment_ref"].as_str().unwrap()
+        ));
+        for key in [
+            "tenant_id",
+            "run_id",
+            "attempt_id",
+            "procedure_id",
+            "idempotency_key",
+        ] {
+            assert!(value[key].is_string(), "{key}");
+        }
+        assert!(is_schema_id(value["run_id"].as_str().unwrap()));
+        assert!(is_schema_id(value["attempt_id"].as_str().unwrap()));
+        assert!(is_procedure_id(value["procedure_id"].as_str().unwrap()));
+        assert!(is_idempotency_key(
+            value["idempotency_key"].as_str().unwrap()
+        ));
+        assert!(value["procedure_revision"].as_u64().unwrap() >= 1);
+        assert!(value["revision"].as_u64().unwrap() >= 1);
+        assert!(value["supersedes"].is_null() || value["supersedes"].is_string());
+        if let Some(urn) = value["supersedes"].as_str() {
+            assert!(is_evidence_urn(urn));
+        }
+        for key in ["occurred_at", "observed_at", "expires_at"] {
+            assert!(value[key].is_string(), "{key}");
+            assert!(parse_rfc3339_ms(value[key].as_str().unwrap()).is_some());
+        }
+        let digest = value["catalog_digest"].as_str().unwrap();
+        assert!(is_sha256_digest(digest));
+        assert!(is_attack_release(value["attack_release"].as_str().unwrap()));
+        assert!(matches!(
+            value["fidelity"].as_str().unwrap(),
+            "marker" | "telemetry_replay" | "behavioral"
+        ));
+        assert_eq!(
+            object_keys(&value["producer"]),
+            vec![
+                "artifact_digest",
+                "commit_sha",
+                "config_digest",
+                "policy_digest",
+                "system",
+                "version",
+            ]
+        );
+        assert_eq!(value["producer"]["system"], "asmodeus");
+        assert!(is_commit_sha(
+            value["producer"]["commit_sha"].as_str().unwrap()
+        ));
+        for key in ["artifact_digest", "config_digest", "policy_digest"] {
+            assert!(is_sha256_digest(value["producer"][key].as_str().unwrap()));
+        }
+        let mut dimension_keys = object_keys(&value["dimensions"]);
+        dimension_keys.retain(|key| *key != "applicability_reason");
+        assert_eq!(
+            dimension_keys,
+            vec![
+                "applicability",
+                "containment",
+                "detection",
+                "prevention",
+                "telemetry",
+                "validation",
+            ]
+        );
+        assert!(matches!(
+            value["dimensions"]["applicability"].as_str().unwrap(),
+            "APPLICABLE" | "NOT_APPLICABLE"
+        ));
+        assert!(matches!(
+            value["dimensions"]["telemetry"].as_str().unwrap(),
+            "AVAILABLE" | "UNAVAILABLE" | "UNKNOWN"
+        ));
+        for key in ["detection", "prevention", "containment", "validation"] {
+            assert!(value["dimensions"][key].is_string(), "{key}");
+        }
+        if value["dimensions"]["applicability"] == "NOT_APPLICABLE" {
+            let reason = value["dimensions"]["applicability_reason"]
+                .as_str()
+                .expect("reason string");
+            assert!(!reason.is_empty() && reason.len() <= 512);
+        } else {
+            assert!(value["dimensions"].get("applicability_reason").is_none());
+        }
+        assert_eq!(
+            object_keys(&value["provenance"]),
+            vec!["signature_covers", "signature_hex", "trusted_key_id"]
+        );
+        assert!(is_trusted_key_id(
+            value["provenance"]["trusted_key_id"].as_str().unwrap()
+        ));
+        let signature = value["provenance"]["signature_hex"].as_str().unwrap();
+        assert!(is_signature_hex(signature));
+        let covers = value["provenance"]["signature_covers"].as_array().unwrap();
+        for required in ["fidelity", "refs", "results", "provenance"] {
+            assert!(covers.iter().any(|item| item == required));
+        }
+        let refs = value["evidence_refs"].as_array().unwrap();
+        assert!(refs.len() <= 64);
+        if with_evidence {
+            assert!(!refs.is_empty());
+        }
+        for item in refs {
+            assert_resource_ref(item, "evidence", "asmodeus");
+        }
+        let limitations = value["limitations"].as_array().unwrap();
+        assert!(limitations.len() <= 64);
+        assert!(limitations.iter().all(|item| item.is_string()));
+    }
+
+    fn assert_resource_ref(value: &serde_json::Value, kind: &str, source: &str) {
+        assert!(value.is_object());
+        assert_eq!(
+            object_keys(value),
+            vec!["kind", "local_id", "source", "urn"]
+        );
+        assert_eq!(value["kind"], kind);
+        assert_eq!(value["source"], source);
+        let local_id = value["local_id"].as_str().unwrap();
+        assert!(is_local_id(local_id));
+        assert_eq!(value["urn"], format!("urn:apex:{kind}:{source}:{local_id}"));
+    }
+
+    fn object_keys(value: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
     }
 
     fn public_from(secret: &[u8]) -> ([u8; 32], ()) {

@@ -463,10 +463,21 @@ mod tests {
         let rendered = body.to_string();
         assert!(!rendered.contains("honeytoken-secret"));
         assert!(!rendered.contains("/var/lib"));
-        let id = body["observation"]["observation_id"]
+        let id = body["observation"]["observation_id"].clone();
+        assert_eq!(id["kind"], "evidence");
+        assert_eq!(id["source"], "asmodeus");
+        let urn = id["urn"].as_str().unwrap().to_string();
+        assert!(urn.starts_with("urn:apex:evidence:asmodeus:"));
+        assert!(body["observation"]["asset_ref"].is_object());
+        assert_eq!(body["observation"]["asset_ref"]["kind"], "asset");
+        assert!(body["observation"]["environment_ref"]
             .as_str()
             .unwrap()
-            .to_string();
+            .starts_with("urn:apex:environment:"));
+        assert!(body["observation"]["supersedes"].is_null());
+        assert!(body["observation"]["dimensions"]
+            .get("applicability_reason")
+            .is_none());
 
         let (status, again) = post(&app, "run-val", "secops", payload(json!({}))).await;
         assert_eq!(status, StatusCode::OK);
@@ -527,7 +538,7 @@ mod tests {
         let first = export(&app).await;
         let second = export(&app).await;
         assert_eq!(first, second);
-        assert!(first.contains(&id));
+        assert!(first.contains(&urn));
         assert!(!first.contains("honeytoken-secret"));
     }
 }
