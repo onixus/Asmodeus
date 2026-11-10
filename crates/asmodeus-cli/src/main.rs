@@ -101,9 +101,13 @@ enum Cmd {
         /// Shorten the fixed local fixture deadline (milliseconds).
         #[arg(long, default_value_t = 10000, value_parser = clap::value_parser!(u64).range(1..=10000))]
         timeout_ms: u64,
-        /// Export unsigned JSON; an existing file is never overwritten.
+        /// Export JSON; an existing file is never overwritten.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Operator Ed25519 secret (`asmodeus keygen` hex file). The signature
+        /// binds this attempt only and does not attest protection.
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
     },
     /// Run all six local slots with both controls; gaps prevent a green fixture gate.
     ProcedureLocalSuite {
@@ -775,11 +779,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             attempt_id,
             timeout_ms,
             output,
+            sign_key,
         } => {
+            let secret = sign_key
+                .as_deref()
+                .map(asmodeus_crypto::read_hex_key::<64>)
+                .transpose()?;
             // Reserve before execution: a conflicting export must not consume an attempt ID.
             let mut export = output.as_deref().map(reserve_local_evidence).transpose()?;
             let evidence = run_local_fixture(procedure, variant, attempt_id, timeout_ms)?;
-            let bytes = serde_json::to_vec_pretty(&evidence)?;
+            let bytes = match &secret {
+                Some(secret) => serde_json::to_vec_pretty(&asmodeus_runner::sign_local_attempt(
+                    &evidence, secret,
+                )?)?,
+                None => serde_json::to_vec_pretty(&evidence)?,
+            };
             if let Some(file) = export.as_mut() {
                 export_local_evidence(file, &bytes)?;
             }
@@ -1211,12 +1225,14 @@ mod tests {
                 attempt_id,
                 timeout_ms,
                 output,
+                sign_key,
             } => {
                 assert_eq!(procedure.id(), "http-beacon");
                 assert!(matches!(variant, LocalVariant::BenignControl));
                 assert_eq!(attempt_id, "test_123-A");
                 assert_eq!(timeout_ms, 250);
                 assert_eq!(output, Some(PathBuf::from("evidence.json")));
+                assert!(sign_key.is_none());
             }
             _ => panic!("unexpected command"),
         }
@@ -1271,6 +1287,7 @@ mod tests {
                 attempt_id: "should-not-run".into(),
                 timeout_ms: 10000,
                 output: Some(output.clone()),
+                sign_key: None,
             },
         })
         .unwrap_err();

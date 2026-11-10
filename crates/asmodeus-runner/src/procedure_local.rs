@@ -1,5 +1,7 @@
-//! In-process, unsigned loopback fixtures. These are not corpus runtime or
-//! product acceptance: no sensor, policy, container or protection is verified.
+//! In-process loopback fixtures. These are not corpus runtime or product
+//! acceptance: no sensor, policy, container or protection is verified.
+//! An optional Ed25519 signature binds this attempt's identity and observables
+//! only. It never promotes `protection_result` or crash cleanup.
 use crate::sandbox::Sandbox;
 use asmodeus_dsl::{
     procedure_corpus, ProcedureVariantKind, ATTACK_VERSION, PROCEDURE_CORPUS_VERSION,
@@ -102,6 +104,234 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex(text: &str) -> io::Result<Vec<u8>> {
+    if text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("malformed hex"));
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&text[index..index + 2], 16).map_err(|_| invalid("malformed hex"))
+        })
+        .collect()
+}
+
+/// Canonical bytes covered by a local attempt signature. Paths, free-text
+/// details and the signature itself are excluded so the binding stays the
+/// attempt identity, revision, environment and observables.
+pub fn local_attempt_binding(attempt: &LocalProcedureAttempt) -> io::Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct Binding<'a> {
+        schema: &'static str,
+        attempt_id: &'a str,
+        procedure_id: &'a str,
+        procedure_revision: u32,
+        variant: &'a ProcedureVariantKind,
+        mode: &'a str,
+        signature_status: &'a str,
+        corpus_version: &'a str,
+        corpus_sha256: &'a str,
+        attack_version: &'a str,
+        environment: &'a LocalEnvironment,
+        started_unix_ms: u64,
+        stopped_unix_ms: u64,
+        status: LocalAttemptStatus,
+        protection_result: &'a str,
+        receipts: &'a [LocalReceipt],
+        cleanup: &'a LocalCleanup,
+        limitations: &'a [String],
+    }
+    serde_json::to_vec(&Binding {
+        schema: "asmodeus.local-attempt-binding.v1",
+        attempt_id: &attempt.attempt_id,
+        procedure_id: &attempt.procedure_id,
+        procedure_revision: attempt.procedure_revision,
+        variant: &attempt.variant,
+        mode: &attempt.mode,
+        signature_status: &attempt.signature_status,
+        corpus_version: &attempt.corpus_version,
+        corpus_sha256: &attempt.corpus_sha256,
+        attack_version: &attempt.attack_version,
+        environment: &attempt.environment,
+        started_unix_ms: attempt.started_unix_ms,
+        stopped_unix_ms: attempt.stopped_unix_ms,
+        status: attempt.status,
+        protection_result: &attempt.protection_result,
+        receipts: &attempt.receipts,
+        cleanup: &attempt.cleanup,
+        limitations: &attempt.limitations,
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+const LOCAL_SIGNATURE_LIMIT: &str = "Ed25519 signature binds this attempt's identity, revision, environment and observables only. It does not attest detection, prevention, containment or a product decision.";
+
+/// Operator signature over [`local_attempt_binding`]. `SIGNED_LOCAL` is not a
+/// protection result, and crash cleanup stays `NOT_VERIFIED`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignedLocalAttempt {
+    #[serde(flatten)]
+    pub attempt: LocalProcedureAttempt,
+    pub local_signature: String,
+    pub local_signature_public_key: String,
+}
+
+pub fn sign_local_attempt(
+    attempt: &LocalProcedureAttempt,
+    secret_key: &[u8],
+) -> io::Result<SignedLocalAttempt> {
+    if attempt.protection_result != "INCONCLUSIVE" {
+        return Err(invalid(
+            "local signature cannot establish a protection result",
+        ));
+    }
+    if attempt.cleanup.crash_cleanup != "NOT_VERIFIED" {
+        return Err(invalid("local signature cannot verify crash cleanup"));
+    }
+    let mut bound = attempt.clone();
+    bound.signature_status = "SIGNED_LOCAL".into();
+    if !bound
+        .limitations
+        .iter()
+        .any(|line| line == LOCAL_SIGNATURE_LIMIT)
+    {
+        bound.limitations.push(LOCAL_SIGNATURE_LIMIT.into());
+    }
+    let message = local_attempt_binding(&bound)?;
+    let signature = asmodeus_crypto::sign_message(&message, secret_key)
+        .map_err(|_| invalid("operator secret key is malformed"))?;
+    let public_key = asmodeus_crypto::public_key_from_secret_key(secret_key)
+        .map_err(|_| invalid("operator secret key is malformed"))?;
+    Ok(SignedLocalAttempt {
+        attempt: bound,
+        local_signature: hex(&signature),
+        local_signature_public_key: hex(&public_key),
+    })
+}
+
+/// Check a signed local attempt document. A valid signature still cannot
+/// change protection or claim that a crash was cleaned up.
+pub fn verify_local_attempt_signature(document: &serde_json::Value) -> io::Result<()> {
+    let signature = document
+        .get("local_signature")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| invalid("missing local signature"))?;
+    let public_key = document
+        .get("local_signature_public_key")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| invalid("missing local signature public key"))?;
+    let attempt: LocalProcedureAttempt = serde_json::from_value(document.clone())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if attempt.signature_status != "SIGNED_LOCAL" {
+        return Err(invalid("local signature status is not SIGNED_LOCAL"));
+    }
+    if attempt.protection_result != "INCONCLUSIVE" {
+        return Err(invalid(
+            "local signature cannot establish a protection result",
+        ));
+    }
+    if attempt.cleanup.crash_cleanup != "NOT_VERIFIED" {
+        return Err(invalid("local signature cannot verify crash cleanup"));
+    }
+    let message = local_attempt_binding(&attempt)?;
+    if asmodeus_crypto::is_valid(&message, &decode_hex(signature)?, &decode_hex(public_key)?) {
+        Ok(())
+    } else {
+        Err(invalid("local attempt signature does not verify"))
+    }
+}
+
+fn assert_owned_loopback(addr: std::net::SocketAddr) -> io::Result<()> {
+    if addr.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return Err(invalid(
+            "fixture receiver is not the attempt-owned loopback",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_out_of_scope_target(target: &str) -> io::Result<()> {
+    let normalized = target.trim().to_ascii_lowercase();
+    if normalized.contains("docker.sock") || normalized.contains("containerd.sock") {
+        return Err(invalid("host runtime socket is outside the local fixture"));
+    }
+    if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        let host = normalized
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or("")
+            .split(['/', ':', '?', '#'])
+            .next()
+            .unwrap_or("");
+        if host != "127.0.0.1" {
+            return Err(invalid("external destination is outside the local fixture"));
+        }
+    }
+    if let Ok(addr) = normalized.parse::<std::net::SocketAddr>() {
+        return assert_owned_loopback(addr);
+    }
+    if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
+        if ip != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            return Err(invalid("external destination is outside the local fixture"));
+        }
+        return Ok(());
+    }
+    if normalized.contains('.')
+        && !normalized.ends_with(".fixture.test")
+        && !normalized.starts_with("127.0.0.1")
+    {
+        return Err(invalid("external DNS name is outside the local fixture"));
+    }
+    Ok(())
+}
+
+fn accept_fixture_http_response(bytes: &[u8]) -> io::Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("fixture response is not utf-8"))?;
+    let status = text.lines().next().unwrap_or("");
+    let redirected = [" 301 ", " 302 ", " 303 ", " 307 ", " 308 "]
+        .iter()
+        .any(|code| status.contains(code));
+    let location = text
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("location:"));
+    if redirected || location {
+        return Err(invalid("HTTP redirect is forbidden for a local fixture"));
+    }
+    Ok(())
+}
+
+fn qname_is_fixture_test(packet: &[u8]) -> io::Result<()> {
+    if packet.len() < 12 {
+        return Err(invalid("malformed DNS query"));
+    }
+    let mut index = 12;
+    let mut labels = Vec::new();
+    while index < packet.len() {
+        let len = packet[index] as usize;
+        if len == 0 {
+            break;
+        }
+        if len > 63 || index + 1 + len > packet.len() {
+            return Err(invalid("malformed DNS label"));
+        }
+        let label = std::str::from_utf8(&packet[index + 1..index + 1 + len])
+            .map_err(|_| invalid("DNS label is not utf-8"))?;
+        if !label.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(invalid("DNS label is outside the fixture alphabet"));
+        }
+        labels.push(label);
+        index += 1 + len;
+    }
+    if labels.len() < 2 || labels[labels.len() - 2..] != ["fixture", "test"] {
+        return Err(invalid("external DNS name is outside the local fixture"));
+    }
+    Ok(())
+}
+
 struct Guard<'a> {
     started: Instant,
     deadline: Instant,
@@ -175,6 +405,9 @@ pub(crate) fn run_in_root(
         .iter()
         .find(|p| p.id == config.procedure_id)
         .ok_or_else(|| invalid("unknown fixed procedure slot"))?;
+    let corpus_sha256 = sha256(include_bytes!(
+        "../../asmodeus-dsl/fixtures/procedure-corpus-v1.json"
+    ));
     let started_unix_ms = unix_ms();
     let started = Instant::now();
     let guard = Guard {
@@ -205,7 +438,12 @@ pub(crate) fn run_in_root(
             "adapter_version": LOCAL_PROCEDURE_ADAPTER_VERSION,
             "attempt_id": config.attempt_id,
             "procedure_id": config.procedure_id,
+            "procedure_revision": procedure.revision,
             "variant": config.variant,
+            "corpus_version": PROCEDURE_CORPUS_VERSION,
+            "corpus_sha256": corpus_sha256.clone(),
+            "attack_version": ATTACK_VERSION,
+            "environment": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH},
             "started_unix_ms": started_unix_ms,
             "state": "RESERVED",
             "crash_cleanup": "NOT_VERIFIED",
@@ -220,7 +458,8 @@ pub(crate) fn run_in_root(
         schema_version: "asmodeus.local-procedure-attempt.v1".into(),
         adapter_version: LOCAL_PROCEDURE_ADAPTER_VERSION.into(),
         corpus_version: PROCEDURE_CORPUS_VERSION.into(),
-        corpus_sha256: sha256(include_bytes!("../../asmodeus-dsl/fixtures/procedure-corpus-v1.json")), attack_version: ATTACK_VERSION.into(),
+        corpus_sha256,
+        attack_version: ATTACK_VERSION.into(),
         procedure_id: config.procedure_id.clone(), procedure_revision: procedure.revision,
         attempt_id: config.attempt_id.clone(), variant: config.variant,
         mode: "LOCAL_FIXTURE".into(), signature_status: "UNSIGNED".into(),
@@ -318,6 +557,8 @@ fn tcp_fixture(
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     listener.set_nonblocking(true)?;
     let receiver = listener.local_addr()?;
+    assert_owned_loopback(receiver)?;
+    reject_out_of_scope_target(&receiver.to_string())?;
     let positive = config.variant == ProcedureVariantKind::Positive;
     let beacon = config.procedure_id == "http-beacon";
     let count = if beacon && positive { 4 } else { 1 };
@@ -368,9 +609,11 @@ fn tcp_fixture(
             payload_kind: payload_kind.into(),
         });
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+        accept_fixture_http_response(response)?;
         write_bounded(&mut accepted, response, guard)?;
         let mut received_response = vec![0; response.len()];
         read_bounded(&mut sender, &mut received_response, guard)?;
+        accept_fixture_http_response(&received_response)?;
         if received_response != response {
             return Err(invalid("HTTP fixture response mismatch"));
         }
@@ -410,10 +653,14 @@ fn dns_fixture(
     sender.set_nonblocking(true)?;
     let address = receiver.local_addr()?;
     let source = sender.local_addr()?;
+    assert_owned_loopback(address)?;
+    assert_owned_loopback(source)?;
+    reject_out_of_scope_target(&address.to_string())?;
     let positive = config.variant == ProcedureVariantKind::Positive;
     let count = if positive { 4 } else { 1 };
     for index in 0..count {
         let packet = dns_query(index, positive, &config.attempt_id);
+        qname_is_fixture_test(&packet)?;
         let sent = guard.retry(|| sender.send_to(&packet, address))?;
         if sent != packet.len() {
             return Err(invalid("partial DNS query"));
@@ -706,5 +953,123 @@ mod tests {
         )
         .is_err());
         assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn signed_binding_covers_identity_and_cannot_claim_protection() {
+        let root = Root::new();
+        let evidence =
+            run_in_root(config("http-beacon", "signed", false), flag(), &root.0).unwrap();
+        assert_eq!(evidence.signature_status, "UNSIGNED");
+        assert_eq!(evidence.procedure_revision, 1);
+        assert_eq!(evidence.environment.os, std::env::consts::OS);
+        let (public_key, secret_key) = asmodeus_crypto::generate_keypair();
+        let signed = sign_local_attempt(&evidence, &secret_key).unwrap();
+        assert_eq!(signed.attempt.signature_status, "SIGNED_LOCAL");
+        assert_eq!(signed.attempt.protection_result, "INCONCLUSIVE");
+        assert_eq!(signed.attempt.cleanup.crash_cleanup, "NOT_VERIFIED");
+        assert_eq!(signed.local_signature_public_key, hex(&public_key));
+        let document = serde_json::to_value(&signed).unwrap();
+        verify_local_attempt_signature(&document).unwrap();
+
+        let mut tampered = document.clone();
+        tampered["attempt_id"] = "other".into();
+        assert!(verify_local_attempt_signature(&tampered).is_err());
+        let mut tampered = document.clone();
+        tampered["procedure_revision"] = 2.into();
+        assert!(verify_local_attempt_signature(&tampered).is_err());
+        let mut tampered = document.clone();
+        tampered["environment"]["arch"] = "other".into();
+        assert!(verify_local_attempt_signature(&tampered).is_err());
+        let mut tampered = document.clone();
+        tampered["receipts"][0]["sha256"] = "ab".into();
+        assert!(verify_local_attempt_signature(&tampered).is_err());
+        let mut promoted = document.clone();
+        promoted["protection_result"] = "PASS".into();
+        assert!(verify_local_attempt_signature(&promoted).is_err());
+        let mut crash = document.clone();
+        crash["cleanup"]["crash_cleanup"] = "VERIFIED".into();
+        assert!(verify_local_attempt_signature(&crash).is_err());
+
+        let mut forbidden = evidence.clone();
+        forbidden.protection_result = "PASS".into();
+        assert!(sign_local_attempt(&forbidden, &secret_key).is_err());
+        forbidden.protection_result = "INCONCLUSIVE".into();
+        forbidden.cleanup.crash_cleanup = "VERIFIED".into();
+        assert!(sign_local_attempt(&forbidden, &secret_key).is_err());
+        assert!(sign_local_attempt(&evidence, &[0; 32]).is_err());
+    }
+
+    #[test]
+    fn host_sockets_external_dns_and_redirects_are_refused() {
+        for target in [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/run/containerd/containerd.sock",
+            "/var/run/containerd/containerd.sock",
+            "unix:///var/run/docker.sock",
+            "8.8.8.8",
+            "8.8.8.8:53",
+            "http://example.com/beacon",
+            "https://1.1.1.1/dns-query",
+            "example.com",
+            "c2.example.com",
+        ] {
+            assert!(
+                reject_out_of_scope_target(target).is_err(),
+                "{target} must stay outside the fixture"
+            );
+        }
+        assert!(reject_out_of_scope_target("127.0.0.1:9").is_ok());
+        assert!(reject_out_of_scope_target("beacon0.fixture.test").is_ok());
+        let packet = dns_query(0, true, "scope");
+        qname_is_fixture_test(&packet).unwrap();
+        let mut external = packet.clone();
+        external.truncate(12);
+        for label in ["example", "com"] {
+            external.push(label.len() as u8);
+            external.extend_from_slice(label.as_bytes());
+        }
+        external.push(0);
+        assert!(qname_is_fixture_test(&external).is_err());
+        assert!(accept_fixture_http_response(
+            b"HTTP/1.1 302 Found\r\nLocation: http://example.com/\r\nContent-Length: 0\r\n\r\n"
+        )
+        .is_err());
+        assert!(accept_fixture_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn crashed_reservation_is_not_adopted_or_removed() {
+        let root = Root::new();
+        let crashed = root.0.join("crashed");
+        std::fs::create_dir(&crashed).unwrap();
+        std::fs::write(crashed.join("keep"), b"residue").unwrap();
+        let ledger_path = root.0.join("crashed.ownership.json");
+        std::fs::write(
+            &ledger_path,
+            b"{\"state\":\"RESERVED\",\"crash_cleanup\":\"NOT_VERIFIED\"}\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&ledger_path).unwrap();
+
+        let later = run_in_root(config("http-beacon", "later", true), flag(), &root.0).unwrap();
+        assert_eq!(later.status, LocalAttemptStatus::Executed);
+        assert_eq!(later.cleanup.crash_cleanup, "NOT_VERIFIED");
+        assert_eq!(std::fs::read(crashed.join("keep")).unwrap(), b"residue");
+        assert_eq!(std::fs::read(&ledger_path).unwrap(), before);
+
+        assert!(run_in_root(config("http-beacon", "crashed", true), flag(), &root.0).is_err());
+        assert_eq!(std::fs::read(crashed.join("keep")).unwrap(), b"residue");
+        assert_eq!(std::fs::read(&ledger_path).unwrap(), before);
+        assert!(!later.ownership_record.is_empty());
+        let later_ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&later.ownership_record).unwrap()).unwrap();
+        assert_eq!(later_ledger["procedure_revision"], 1);
+        assert_eq!(later_ledger["crash_cleanup"], "NOT_VERIFIED");
+        assert_eq!(later_ledger["environment"]["os"], std::env::consts::OS);
     }
 }

@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### Добавлено — привязка локальных MITRE-попыток, 2026-11-10
+
+- `procedure-local --sign-key` подписывает attempt ID, revision, environment,
+  корпус, start/stop и receipts (`SIGNED_LOCAL`). Подпись не поднимает
+  `protection_result` и не подтверждает очистку после SIGKILL.
+- Резервирование до старта хранит revision, digest корпуса и environment.
+  Поздний запуск не забирает и не удаляет остатки аварийно завершённой попытки.
+- Локальный receiver остаётся ephemeral `127.0.0.1` этого attempt. Внешний DNS,
+  HTTP redirect и host sockets Docker/containerd отклоняются.
+
 ### Добавлено — допил функционала хаос-инженера, 2026-11-04
 
 - DSL (`asmodeus-dsl`): новые действия `AgentCrashProbe` и `DnsSinkholeDrop`;
