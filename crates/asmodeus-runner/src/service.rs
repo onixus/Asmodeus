@@ -218,11 +218,7 @@ fn run_worker(
                 target_cidr: plan.target_cidr.clone(),
                 latency_ms: plan.latency_ms,
                 jitter_ms: plan.jitter_ms,
-                loss_pct: if sinkhole && plan.loss_percent == 0 {
-                    100
-                } else {
-                    plan.loss_percent
-                },
+                loss_pct: plan.loss_percent,
                 duration_ms: plan.duration_ms.max(1),
                 dns_sinkhole: sinkhole,
                 dns_port: plan.dns_port,
@@ -251,13 +247,20 @@ fn run_worker(
                 },
             )?
         } else if plan.action == Action::AgentCrashProbe {
-            // inject() reaps the decoy this run spawned. duration_ms is only the
-            // safety envelope, so the worker must not sleep it a second time.
+            // Reap polls `check` and is capped by recovery_window_ms. The
+            // signed duration_ms is the hold after that; `wait` is what
+            // observes cancel, the lease, and max_duration for the rest.
             let injector = crate::injectors::create_injector_from_plan(&plan, target.as_ref())?;
-            let injected = injector.inject();
+            let injected = injector.inject_checked(&check);
+            let waited = if injected.is_ok() {
+                wait(plan.duration_ms)
+            } else {
+                Ok(())
+            };
             if let Err(error) = injector.cleanup() {
                 cleanup_error = Some(error.to_string());
             }
+            waited?;
             return injected;
         } else {
             let id = match plan.action {

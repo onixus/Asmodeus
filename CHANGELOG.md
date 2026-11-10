@@ -25,6 +25,13 @@
   (procedure_revision 2 фиксирует смену исполнителя, не покрытие T1562).
   `effective_fidelity()` не даёт `agent_crash_probe` поднять себя до behavioral.
 - Docs: строка `AGENT_CRASH_ENDPOINT` в `docs/mitre-fidelity.ru.md` — marker_only.
+- `recovery_window_ms` не может превысить `max_duration_sec`. Пресет
+  `AGENT_CRASH_ENDPOINT` оставляет `duration_ms = 0`: бюджет reap — это
+  `recovery_window_ms`, а удержание 5 с рвёт 3-секундный lease воркера.
+  Воркер опрашивает cancel и lease во время reap и после него ждёт
+  подписанный `duration_ms`. `dns_sinkhole_drop` принимает только
+  `loss_percent = 100`; значение 0 больше не переписывается в полный drop
+  после подписи плана.
 
 ### Добавлено — полный локальный набор процедур, 2026-10-21
 

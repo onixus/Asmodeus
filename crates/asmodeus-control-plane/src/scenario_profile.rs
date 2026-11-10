@@ -93,12 +93,10 @@ const TEST_NET_SCOPE: &str = "reserved test nets only (loopback + RFC 5737 TEST-
 
 /// The pinned old→new fidelity mapping for every built-in scenario.
 ///
-/// Fidelity is assigned from the injector each scenario actually dispatches
-/// (`asmodeus-runner::injectors::create_injector_from_plan`): the
-/// reversible-XOR canary encryptor, both network-chaos perturbations and the
-/// synthetic agent-crash probe (real SIGKILL of a decoy child) run
-/// representative behaviour — everything else merely writes/reads a synthetic
-/// marker.
+/// Fidelity follows the injector that is actually dispatched. XOR canary
+/// encryption and both network-chaos actions are behavioral. The agent-crash
+/// probe stays a marker: SIGKILL of this run's decoy is not an observed agent
+/// restart. Every other action only writes a synthetic marker.
 pub const PROFILES: &[ProfileDef] = &[
     ProfileDef {
         scenario_id: "RANSOMWARE_CANARY_SPIKE",

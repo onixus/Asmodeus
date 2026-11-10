@@ -18,6 +18,16 @@ use crate::netchaos::{default_backend, NetChaosSession, NetChaosSpec};
 pub trait ScenarioInjector: Send + Sync {
     /// Execute the synthetic injection pass (generating events, files, or network rules).
     fn inject(&self) -> Result<Report, InjectError>;
+    /// Same as [`inject`](Self::inject), polling `check` while the pass can block.
+    /// The default ignores `check`; the crash probe overrides it so a cancel,
+    /// lease loss, or safety cap can interrupt the reap.
+    fn inject_checked(
+        &self,
+        check: &dyn Fn() -> Result<(), InjectError>,
+    ) -> Result<Report, InjectError> {
+        let _ = check;
+        self.inject()
+    }
     /// Unconditionally revert and remove all synthetic traces.
     fn cleanup(&self) -> Result<(), InjectError>;
 }
@@ -476,6 +486,13 @@ impl AgentCrashProbeInjector {
 #[cfg(unix)]
 impl ScenarioInjector for AgentCrashProbeInjector {
     fn inject(&self) -> Result<Report, InjectError> {
+        self.inject_checked(&|| Ok(()))
+    }
+
+    fn inject_checked(
+        &self,
+        check: &dyn Fn() -> Result<(), InjectError>,
+    ) -> Result<Report, InjectError> {
         use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
@@ -498,15 +515,47 @@ impl ScenarioInjector for AgentCrashProbeInjector {
                 ))
             })?;
         let pid = child.id() as i32;
-        let reap = |child: &mut std::process::Child| {
+        // Poll try_wait. child.wait() can block past the caller's deadline,
+        // and dropping Child does not reap. A failed check is returned only
+        // after the decoy is dead, or after the short give-up.
+        let reap_bounded = |child: &mut std::process::Child,
+                            check: &dyn Fn() -> Result<(), InjectError>|
+         -> Result<(), InjectError> {
             let _ = child.kill();
-            let _ = child.wait();
+            let give_up = Instant::now() + Duration::from_millis(200);
+            let mut interrupted = None;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        return match interrupted {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
+                    }
+                    Ok(None) if Instant::now() >= give_up => {
+                        return Err(interrupted.unwrap_or_else(|| {
+                            InjectError::Io(io::Error::other(
+                                "decoy agent survived the forced termination window",
+                            ))
+                        }));
+                    }
+                    Ok(None) => {
+                        if interrupted.is_none() {
+                            if let Err(error) = check() {
+                                interrupted = Some(error);
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(InjectError::Io(e)),
+                }
+            }
         };
 
         // The interruption under test: SIGKILL (kill -9) on the decoy only.
         let killed = Instant::now();
         if let Err(error) = nix_kill_sig9(pid) {
-            reap(&mut child);
+            let _ = reap_bounded(&mut child, &|| Ok(()));
             return Err(error);
         }
 
@@ -515,17 +564,21 @@ impl ScenarioInjector for AgentCrashProbeInjector {
         // measurement of some other agent's restart.
         let deadline = killed + Duration::from_millis(u64::from(self.recovery_window_ms));
         let status = loop {
+            if let Err(error) = check() {
+                let _ = reap_bounded(&mut child, &|| Ok(()));
+                return Err(error);
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    reap(&mut child);
+                    reap_bounded(&mut child, check)?;
                     return Err(InjectError::Io(io::Error::other(
                         "decoy agent survived the forced termination window",
                     )));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                 Err(e) => {
-                    reap(&mut child);
+                    let _ = reap_bounded(&mut child, &|| Ok(()));
                     return Err(InjectError::Io(e));
                 }
             }
@@ -635,13 +688,7 @@ impl ChaosParams {
             target_cidr: self.target_cidr.clone(),
             latency_ms: self.latency_ms,
             jitter_ms: self.jitter_ms,
-            // A sinkhole is a full CIDR drop; keep that even if the manifest
-            // left loss at 0.
-            loss_pct: if sinkhole && self.loss_pct == 0 {
-                100
-            } else {
-                self.loss_pct
-            },
+            loss_pct: self.loss_pct,
             duration_ms: self.duration_ms.max(1),
             dns_sinkhole: sinkhole,
             dns_port: self.dns_port,

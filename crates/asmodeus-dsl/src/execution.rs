@@ -237,6 +237,13 @@ impl ExecutionPlan {
         } else {
             AGENT_CRASH_RECOVERY_WINDOW_MS
         };
+        if action == Action::AgentCrashProbe
+            && recovery_window_ms > m.spec.safety.max_duration_sec.saturating_mul(1000)
+        {
+            return Err(invalid(
+                "recovery_window_ms exceeds max_duration_sec".into(),
+            ));
+        }
         // Latency rules stay within the 50 % runner budget. Only a sinkhole
         // may ask for a full drop, and that drop is the whole test CIDR.
         let loss_max = if action == Action::DnsSinkholeDrop {
@@ -244,6 +251,14 @@ impl ExecutionPlan {
         } else {
             50
         };
+        // A sinkhole is a full CIDR drop. Rewriting 0 to 100 after the plan
+        // is signed would install a rule the operator did not ask for.
+        let loss_percent = number("loss_percent", d_loss, 0, loss_max)? as u8;
+        if action == Action::DnsSinkholeDrop && loss_percent != 100 {
+            return Err(invalid(
+                "dns_sinkhole_drop requires loss_percent = 100".into(),
+            ));
+        }
         Ok(Self {
             action,
             target_dir,
@@ -257,7 +272,7 @@ impl ExecutionPlan {
             iface,
             latency_ms: number("latency_ms", d_latency, 0, 5000)?,
             jitter_ms: number("jitter_ms", d_jitter, 0, 1000)?,
-            loss_percent: number("loss_percent", d_loss, 0, loss_max)? as u8,
+            loss_percent,
             dns_port: number("dns_port", 53, 1, 65535)? as u16,
             recovery_window_ms,
         })
@@ -296,7 +311,8 @@ pub fn synthetic_manifest(
             "recovery_window_ms".into(),
             crate::execution::AGENT_CRASH_RECOVERY_WINDOW_MS.into(),
         );
-        parameters.insert("duration_ms".into(), 5_000u32.into());
+        // duration_ms stays at the default 0. The reap budget is
+        // recovery_window_ms; a 5s hold here would fail the 3s control lease.
     }
     serde_json::from_value(serde_json::json!({
         "apiVersion":"asmodeus.io/v1alpha1", "kind":"AttackScenario",
@@ -427,5 +443,40 @@ mod tests {
                 "recovery_window_ms={bad} must be rejected (allowed 100..={AGENT_CRASH_RECOVERY_WINDOW_MS})"
             );
         }
+
+        // The reap budget is part of the signed safety cap, not a side channel
+        // past max_duration_sec.
+        let mut tight = manifest.clone();
+        tight.spec.safety.max_duration_sec = 1;
+        assert!(
+            ExecutionPlan::from_manifest(&tight).is_err(),
+            "default 5000 ms window must not outlive a 1 s cap"
+        );
+        tight
+            .spec
+            .action
+            .parameters
+            .insert("recovery_window_ms".into(), 500.into());
+        let plan = ExecutionPlan::from_manifest(&tight).unwrap();
+        assert_eq!(plan.recovery_window_ms, 500);
+        assert_eq!(plan.duration_ms, 0);
+    }
+
+    #[test]
+    fn dns_sinkhole_rejects_loss_other_than_full_drop() {
+        let mut manifest =
+            synthetic_manifest("DNS_RPZ_SINKHOLE_DROP", "/tmp/asmodeus-canary/net", 1, 1);
+        let plan = ExecutionPlan::from_manifest(&manifest).unwrap();
+        assert_eq!(plan.loss_percent, 100);
+
+        manifest
+            .spec
+            .action
+            .parameters
+            .insert("loss_percent".into(), 0.into());
+        assert!(
+            ExecutionPlan::from_manifest(&manifest).is_err(),
+            "an explicit 0% sinkhole must not be rewritten into a full drop"
+        );
     }
 }
