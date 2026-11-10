@@ -76,7 +76,7 @@ Fidelity назначена по инъектору, который сценар
 | `DATA_EXFILTRATION_CANARY` | T1041 | T1041 | **marker_only** | synthetic blob в canary; данные не покидают хост |
 | `DEFENSE_IMPAIRMENT_CANARY` | T1562 | T1562, T1562.001 | **marker_only** | benign pulse-маркер; реальные средства защиты не отключаются |
 | `LATENCY_SPIKE_VM` | — (chaos) | — | **behavioral** | chaos на тест-сетях; к технике ATT&CK не относится |
-| `AGENT_CRASH_ENDPOINT` | T1562 (chaos) | T1562 | **marker_only** | pulse-маркер для проверки watchdog; средства защиты не трогает |
+| `AGENT_CRASH_ENDPOINT` | T1562 (chaos) | T1562 | **marker_only** | SIGKILL только собственного decoy-процесса; pulse пишется после reap и не измеряет рестарт настоящего агента |
 | `DNS_RPZ_SINKHOLE_DROP` | — (chaos) | — | **behavioral** | chaos на loopback тест-сегменте; к технике ATT&CK не относится |
 
 Источник истины для таблицы — `crates/asmodeus-control-plane/src/scenario_profile.rs`

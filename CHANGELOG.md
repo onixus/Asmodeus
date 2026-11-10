@@ -7,6 +7,32 @@
 
 ## [Unreleased]
 
+### Добавлено — допил функционала хаос-инженера, 2026-11-04
+
+- DSL (`asmodeus-dsl`): новые действия `AgentCrashProbe` и `DnsSinkholeDrop`;
+  единый источник параметров по умолчанию `chaos_defaults()` (FTT §4.2);
+  параметры манифеста (`latency_ms`, `jitter_ms`, `loss_percent`, `iface`,
+  `dns_port`, `recovery_window_ms`) читаются динамически вместо хардкода;
+  поле `ExecutionPlan.recovery_window_ms` с границами 100..=5000 мс;
+  `execution_plan_for_preset()` для канонической маршрутизации.
+- Runner (`asmodeus-runner`): `AgentCrashProbeInjector` шлёт SIGKILL
+  собственному decoy-процессу и пишет pulse после reap. В логе `reap_ms` —
+  измеренное время смерти decoy, `planned_window_ms` — бюджет плана, не
+  замер рестарта агента. gRPC-воркер диспатчит `AgentCrashProbe` через
+  `create_injector_from_plan` и не паникует. `DnsSinkholeDrop` — полный drop
+  test-CIDR; `dns_port` сохраняется в плане и не является матчем классификатора.
+- Control plane: профиль `AGENT_CRASH_ENDPOINT` остаётся `MarkerOnly`
+  (procedure_revision 2 фиксирует смену исполнителя, не покрытие T1562).
+  `effective_fidelity()` не даёт `agent_crash_probe` поднять себя до behavioral.
+- Docs: строка `AGENT_CRASH_ENDPOINT` в `docs/mitre-fidelity.ru.md` — marker_only.
+- `recovery_window_ms` не может превысить `max_duration_sec`. Пресет
+  `AGENT_CRASH_ENDPOINT` оставляет `duration_ms = 0`: бюджет reap — это
+  `recovery_window_ms`, а удержание 5 с рвёт 3-секундный lease воркера.
+  Воркер опрашивает cancel и lease во время reap и после него ждёт
+  подписанный `duration_ms`. `dns_sinkhole_drop` принимает только
+  `loss_percent = 100`; значение 0 больше не переписывается в полный drop
+  после подписи плана.
+
 ### Добавлено — полный локальный набор процедур, 2026-10-21
 
 - `procedure-local-suite` выполняет все шесть MITRE slots с парными контролями

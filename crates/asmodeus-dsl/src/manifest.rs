@@ -191,7 +191,12 @@ impl ScenarioManifest {
         // Fidelity describes the executor, not an author-supplied assertion.
         // All other supported actions only create/read synthetic markers.
         let implemented = match self.spec.action.action_type.as_str() {
-            "synthetic_canary_encrypt" | "latency_spike" => Fidelity::Behavioral,
+            "synthetic_canary_encrypt" | "latency_spike" | "dns_sinkhole_drop" => {
+                Fidelity::Behavioral
+            }
+            // agent_crash_probe SIGKILLs a child this run spawned, then writes a
+            // pulse. It does not observe a real agent restart, so it cannot
+            // claim behavioural coverage of T1562.
             _ => Fidelity::MarkerOnly,
         };
         declared.min(implemented)
@@ -653,6 +658,7 @@ spec:
             "persistence_canary",
             "exfiltration_canary",
             "watchdog_probe",
+            "agent_crash_probe",
         ] {
             let mut m = parse_and_validate_manifest(V2_JSON).unwrap();
             m.spec.action.action_type = action.into();

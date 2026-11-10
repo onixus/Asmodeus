@@ -405,7 +405,7 @@ impl Catalog {
             "lariska_watchdog",
             Some(T1562_IMPAIR_DEFENSES),
             "critical",
-            "Unscheduled agent termination test to verify 5s recovery window",
+            "SIGKILL of a synthetic decoy in the canary scope; does not measure a real agent restart",
             40,
             120,
         );
@@ -580,6 +580,7 @@ spec:
             "PERSISTENCE_CRON_CANARY",
             "DATA_EXFILTRATION_CANARY",
             "DEFENSE_IMPAIRMENT_CANARY",
+            "AGENT_CRASH_ENDPOINT",
         ] {
             let e = cat.get(id).unwrap();
             assert_eq!(e.fidelity, Fidelity::MarkerOnly, "{id}");

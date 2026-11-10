@@ -21,7 +21,12 @@ use asmodeus_dsl::net_target_in_scope;
 /// cannot black-hole the test segment or run chaos unbounded.
 pub const MAX_LATENCY_MS: u32 = 5_000;
 pub const MAX_JITTER_MS: u32 = 1_000;
+/// Probabilistic loss budget for a latency-perturbation rule (FTT §4.2.1:
+/// 25 % drop, headroom to 50 %).
 pub const MAX_LOSS_PCT: u8 = 50;
+/// Absolute ceiling — a DNS sinkhole outage (FTT §4.2.3) may drop every IPv4
+/// packet toward the reserved test CIDR. The classifier has no L4 port match.
+pub const HARD_MAX_LOSS_PCT: u8 = 100;
 pub const MAX_DURATION_MS: u32 = 120_000;
 
 /// Distinctive test-interface markers (defence in depth on top of the CIDR
@@ -46,6 +51,28 @@ pub struct NetChaosSpec {
     pub loss_pct: u8,
     /// How long the rule stays installed before mandatory revert.
     pub duration_ms: u32,
+    /// True for a DNS sinkhole outage (FTT §4.2.3): a deterministic full drop
+    /// of the destination CIDR, not a probabilistic latency perturbation.
+    /// Such a spec may carry `loss_pct == 100`.
+    pub dns_sinkhole: bool,
+    /// Recorded from the manifest (default 53). Not applied by `SimBackend` or
+    /// the eBPF classifier; those match the destination CIDR only.
+    pub dns_port: u16,
+}
+
+impl Default for NetChaosSpec {
+    fn default() -> Self {
+        NetChaosSpec {
+            iface: "lo".into(),
+            target_cidr: "127.0.0.1/32".into(),
+            latency_ms: 0,
+            jitter_ms: 0,
+            loss_pct: 0,
+            duration_ms: 5_000,
+            dns_sinkhole: false,
+            dns_port: 53,
+        }
+    }
 }
 
 impl NetChaosSpec {
@@ -58,6 +85,18 @@ impl NetChaosSpec {
             jitter_ms: 250,
             loss_pct: 25,
             duration_ms: 5_000,
+            dns_sinkhole: false,
+            dns_port: 53,
+        }
+    }
+
+    /// A `DNS_RPZ_SINKHOLE_DROP`-shaped spec against loopback: full drop of
+    /// the reserved test CIDR (FTT §4.2.3). The rule is not port-specific.
+    pub fn dns_sinkhole_demo() -> Self {
+        NetChaosSpec {
+            dns_sinkhole: true,
+            loss_pct: 100,
+            ..Default::default()
         }
     }
 
@@ -83,9 +122,16 @@ impl NetChaosSpec {
                 self.jitter_ms
             )));
         }
-        if self.loss_pct > MAX_LOSS_PCT {
+        // Probabilistic loss keeps the conservative 50 % budget; only an
+        // explicitly-flagged sinkhole may drop 100 % of the test CIDR.
+        let loss_ceiling = if self.dns_sinkhole {
+            HARD_MAX_LOSS_PCT
+        } else {
+            MAX_LOSS_PCT
+        };
+        if self.loss_pct > loss_ceiling {
             return Err(NetChaosError::BudgetExceeded(format!(
-                "loss_pct={} (max {MAX_LOSS_PCT})",
+                "loss_pct={} (max {loss_ceiling})",
                 self.loss_pct
             )));
         }
@@ -297,6 +343,19 @@ mod tests {
     #[test]
     fn demo_spec_validates() {
         assert!(NetChaosSpec::latency_spike_demo().validate().is_ok());
+    }
+
+    #[test]
+    fn dns_sinkhole_demo_validates_with_full_drop() {
+        let spec = NetChaosSpec::dns_sinkhole_demo();
+        assert!(spec.validate().is_ok(), "sinkhole outage may drop 100%");
+        // A non-sinkhole spec must NOT be able to claim a full drop.
+        let mut sneaky = NetChaosSpec::dns_sinkhole_demo();
+        sneaky.dns_sinkhole = false;
+        assert!(matches!(
+            sneaky.validate(),
+            Err(NetChaosError::BudgetExceeded(_))
+        ));
     }
 
     #[test]
