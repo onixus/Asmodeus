@@ -136,6 +136,7 @@ pub(crate) async fn start_scenario_identified(
             execution_mode: mode.into(),
             ..RunEvidence::default()
         }),
+        validation: None,
     }
     .sign(&state.signing_key)
     .map_err(|e| ExecutionError::AuditSigning(e.to_string()))?;

@@ -715,6 +715,7 @@ mod tests {
                 feedback_received: true,
                 ..Default::default()
             }),
+            validation: None,
         };
         cat.record_feedback(&record);
         assert_eq!(cat.alerts().len(), 1);

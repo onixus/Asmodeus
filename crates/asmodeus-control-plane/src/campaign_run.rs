@@ -229,6 +229,7 @@ mod tests {
             mttr_ms: 0,
             detected: false,
             evidence: None,
+            validation_observation_id: None,
         }
     }
 

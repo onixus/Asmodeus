@@ -207,6 +207,7 @@ dependencies = [
  "asmodeus-common",
  "asmodeus-crypto",
  "asmodeus-dsl",
+ "ring",
  "serde",
  "serde_json",
 ]

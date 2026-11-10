@@ -232,6 +232,7 @@ async fn execute(
             mttr_ms: 0,
             detected: false,
             evidence: None,
+            validation_observation_id: None,
         };
         run = update(state, &run.id, move |r| {
             r.status = RUNNING.into();
@@ -285,6 +286,7 @@ async fn execute(
                 .as_ref()
                 .is_some_and(|r| r.measurements.blue_team_detected),
             evidence: audit.and_then(|r| r.evidence),
+            validation_observation_id: None,
         };
         // An audit commit failure must not authorize the next stage or resume.
         let terminal = if !outcome && matches!(result.status.as_str(), QUEUED | RUNNING) {
@@ -314,6 +316,7 @@ async fn execute(
 
 pub(crate) fn report(state: &AppState, run: &CampaignRun) -> CampaignRunResult {
     let mut aggregate = asmodeus_telemetry::Aggregate::default();
+    let mut validation_revisions = Vec::new();
     let mut step_results = run.step_results.clone();
     for step in &mut step_results {
         if let Some(record) = state.audit.get(&step.run_id) {
@@ -323,7 +326,19 @@ pub(crate) fn report(state: &AppState, run: &CampaignRun) -> CampaignRunResult {
             step.mttd_ms = record.measurements.mttd_ms;
             step.mttr_ms = record.measurements.mttr_ms;
             step.detected = record.measurements.blue_team_detected;
+            step.validation_observation_id =
+                asmodeus_telemetry::stage_revision(&record, &state.audit_public_key);
             step.evidence = record.evidence;
+            if let Some(id) = &step.validation_observation_id {
+                let aggregate_id = asmodeus_telemetry::aggregate_revision(
+                    &state.audit.records(),
+                    &step.run_id,
+                    &state.audit_public_key,
+                );
+                if aggregate_id.as_ref() == Some(id) {
+                    validation_revisions.push(id.clone());
+                }
+            }
         }
     }
     CampaignRunResult {
@@ -349,6 +364,7 @@ pub(crate) fn report(state: &AppState, run: &CampaignRun) -> CampaignRunResult {
         simulated_runs: aggregate.simulated_runs,
         pending_feedback_runs: aggregate.pending_feedback,
         timestamp_utc: run.updated_utc.clone(),
+        validation_revisions,
     }
 }
 

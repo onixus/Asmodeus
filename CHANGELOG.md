@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Добавлено — доверенная validation evidence и приёмка кампании (S03/S04), 2026-11-11
+
+- `ValidationObservation` schema 1.0: корреляция Blue Team feedback, ревизии
+  `supersedes`, экспорт с cursor/limit и редактированием секретов. Legacy
+  `RunEvidence` и `POST /runs/:id/feedback` не становятся `PASSED`.
+- Приёмка шести слотов первой волны без завышения покрытия. Это не protection
+  gate и не закрывает X01 (Ferrum/BSDM). См. `docs/mitre-validation-evidence.ru.md`.
+
 ### Добавлено — привязка локальных MITRE-попыток, 2026-11-10
 
 - `procedure-local --sign-key` подписывает attempt ID, revision, environment,

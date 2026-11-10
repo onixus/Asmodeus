@@ -384,6 +384,28 @@ pub fn generate_spec() -> Value {
                     }
                 }
             },
+            "/api/v1/asmodeus/runs/{id}/validation": {
+                "post": {
+                    "summary": "Submit correlated Blue Team validation feedback (S03). Legacy /feedback is not promoted to PASSED.",
+                    "responses": {
+                        "200": { "description": "Admitted or duplicate revision; dimensions may still be non-PASS" },
+                        "409": { "description": "idempotency key replayed with a different body" },
+                        "422": { "description": "Unlinked or invalid feedback" }
+                    }
+                }
+            },
+            "/api/v1/asmodeus/validation/observations": {
+                "get": {
+                    "summary": "Export ValidationObservation schema 1.0 (cursor, limit, redacted)",
+                    "responses": { "200": { "description": "Versioned observation page" } }
+                }
+            },
+            "/api/v1/asmodeus/reports/campaign-acceptance": {
+                "get": {
+                    "summary": "S04 campaign acceptance over the six first-wave procedure slots. Not a protection gate.",
+                    "responses": { "200": { "description": "Acceptance report and observation manifest" } }
+                }
+            },
             "/api/v1/asmodeus/runs/{id}/feedback": {
                 "post": {
                     "summary": "Submit Blue Team detection and containment feedback (Closed-Loop)",
