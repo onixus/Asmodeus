@@ -2,7 +2,7 @@
 //! The legacy `POST /runs/:id/feedback` route is unchanged.
 
 use asmodeus_common::Role;
-use asmodeus_dsl::ATTACK_VERSION;
+use asmodeus_dsl::{procedure_corpus, ProcedureDefinition, ATTACK_VERSION};
 use asmodeus_telemetry::{
     claim_signing_bytes, current_utc_iso8601, export_observations, export_page_json, AdmitResult,
     Applicability, AttemptBinding, FeedbackClaim, ObservationFidelity, Producer, TelemetryState,
@@ -86,6 +86,21 @@ fn default_true() -> bool {
     true
 }
 
+/// Procedure identity is the corpus entry named by `scenario_id`. A scenario
+/// that is not one of the six slots, or whose recorded technique disagrees,
+/// has no procedure binding. The attempt window is still taken from the first
+/// feedback: the audit record does not store it.
+fn procedure_for_run(record: &asmodeus_telemetry::AuditRecord) -> Option<ProcedureDefinition> {
+    let procedure = procedure_corpus()
+        .procedures
+        .into_iter()
+        .find(|item| item.id == record.scenario_id)?;
+    if !record.mitre_technique.is_empty() && record.mitre_technique != procedure.technique_id {
+        return None;
+    }
+    Some(procedure)
+}
+
 fn server_tenant() -> String {
     std::env::var("ASMODEUS_TENANT_ID").unwrap_or_else(|_| "apex-lab".into())
 }
@@ -133,22 +148,24 @@ pub(crate) async fn submit_validation(
             }
             let binding = if let Some(ext) = &old.validation {
                 ext.binding.clone()
-            } else {
+            } else if let Some(procedure) = procedure_for_run(&old) {
                 AttemptBinding {
                     tenant_id: tenant.clone(),
                     environment_ref: body.environment_ref.clone(),
                     asset_ref: body.asset_ref.clone(),
                     run_id: run_id.clone(),
                     attempt_id: body.attempt_id.clone(),
-                    procedure_id: body.procedure_id.clone(),
-                    procedure_revision: body.procedure_revision,
-                    technique_id: body
-                        .technique_id
-                        .clone()
-                        .unwrap_or_else(|| old.mitre_technique.clone()),
+                    procedure_id: procedure.id,
+                    procedure_revision: procedure.revision,
+                    technique_id: procedure.technique_id,
                     occurred_at: body.occurred_at.clone(),
                     expires_at: body.expires_at.clone(),
                 }
+            } else {
+                *outcome_slot.lock().unwrap() = Some(AdmitResult::Invalid(
+                    "run has no procedure binding".into(),
+                ));
+                return Ok(RevisionUpdate::Keep);
             };
             let mut claim = claim_from_body(&body, &binding, &tenant);
             if body.producer_signature_hex.is_some() {
@@ -367,7 +384,7 @@ mod tests {
     fn terminal(id: &str) -> AuditRecord {
         AuditRecord {
             run_id: id.into(),
-            scenario_id: "SCN".into(),
+            scenario_id: "http-beacon".into(),
             scenario_name: "SCN".into(),
             category: "red_team".into(),
             mitre_technique: "T1071.001".into(),
@@ -540,5 +557,77 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.contains(&urn));
         assert!(!first.contains("honeytoken-secret"));
+    }
+
+    #[tokio::test]
+    async fn validation_does_not_adopt_a_caller_procedure() {
+        let state = AppState::new(Catalog::seeded()).unwrap();
+        let mut ransomware = terminal("run-ransom");
+        ransomware.scenario_id = "RANSOMWARE_CANARY_SPIKE".into();
+        ransomware.mitre_technique = "T1486".into();
+        state
+            .audit
+            .append(ransomware.sign(&state.signing_key).unwrap())
+            .await
+            .unwrap();
+        state
+            .audit
+            .append(terminal("run-beacon").sign(&state.signing_key).unwrap())
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let (status, foreign) = post(
+            &app,
+            "run-ransom",
+            "secops",
+            payload(json!({
+                "procedure_id": "dns-pattern",
+                "technique_id": "T1071.004",
+                "idempotency_key": "idem-dns"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{foreign}");
+        assert_eq!(foreign["status"], "INVALID");
+        assert!(foreign["observation"].is_null());
+
+        let (status, mismatch) = post(
+            &app,
+            "run-beacon",
+            "secops",
+            payload(json!({
+                "procedure_id": "dns-pattern",
+                "technique_id": "T1071.004",
+                "idempotency_key": "idem-dns-beacon"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mismatch}");
+        assert_eq!(mismatch["status"], "UNLINKED");
+        assert_eq!(mismatch["passed"], false);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/asmodeus/reports/campaign-acceptance")
+                    .header("x-apex-role", "auditor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        let dns = report["report"]["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|slot| slot["procedure_id"] == "dns-pattern")
+            .unwrap();
+        assert_eq!(dns["observed"], "NOT_OBSERVED");
+        assert_ne!(dns["detected"], "PASSED");
     }
 }

@@ -22,7 +22,11 @@ schema `1.0` — проекция. На границе экспорта допо
 `synthetic-transfer`): `GET /api/v1/asmodeus/reports/campaign-acceptance`.
 
 Корреляция требует tenant, environment, asset, run, attempt, procedure и окно
-времени. Совпадение только technique id связь не создаёт. Подпись сверяется с
+времени. `procedure_id`, revision и technique берутся из корпуса по
+`scenario_id` прогона. Чужой `procedure_id` и прогон без слота первой волны
+наблюдение не сохраняют. Совпадение только technique id связь не создаёт.
+Идемпотентность и подпись producer покрывают упорядоченные evidence refs и
+digest producer: тот же ключ с другим телом — `REPLAY` (409). Подпись сверяется с
 доверенным ключом control-plane (`verify_with_key`); подмена
 `public_key_hex` доверия не даёт. Поздний feedback — новая ревизия
 (`supersedes`), предыдущая строка журнала не переписывается. После reload
@@ -37,7 +41,10 @@ timestamp валидны и |observed_at − occurred_at| ≤ 300 с; иначе
 `INCONCLUSIVE`. detect-then-kill — containment, не prevention.
 
 Знаменатель приёмки — 6 слотов корпуса, даже если часть `UNSUPPORTED` или
-`NOT_RUN`. Отчёт содержит scope, attack release, варианты, пробелы, ссылки на
+`NOT_RUN`. Revision сравнивается только внутри одной попытки. `FAILED` одного
+прогона не стирается более поздним `NOT_RUN` другого прогона того же слота.
+`marker` и `telemetry_replay` с prevention или containment `PASSED` не попадают
+ни в экспорт, ни в манифест приёмки. Отчёт содержит scope, attack release, варианты, пробелы, ссылки на
 evidence и условия применимости. `protection_gate` всегда `NOT_CLAIMED`:
 зелёная приёмка evidence не заявляется как protection gate. Пропуск обязательной
 процедуры не является успехом. Намеренно проваленная процедура даёт gate

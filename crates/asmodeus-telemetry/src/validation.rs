@@ -1271,6 +1271,13 @@ pub fn assess_mttd(occurred_at: &str, observed_at: &str) -> MttdAssessment {
     }
 }
 
+pub fn observation_exportable(
+    observation: &ValidationObservation,
+    trusted_public_key: &[u8],
+) -> bool {
+    exportable(observation, trusted_public_key)
+}
+
 fn exportable(observation: &ValidationObservation, trusted_public_key: &[u8]) -> bool {
     observation.schema_version == SCHEMA_VERSION
         && observation.revision >= 1
@@ -1320,8 +1327,13 @@ fn schema_dimensions_ok(observation: &ValidationObservation) -> bool {
     if !reason_ok {
         return false;
     }
-    if observation.fidelity == ObservationFidelity::Marker
-        && observation.dimensions.prevention == DimensionOutcome::PASSED
+    let low_fidelity = matches!(
+        observation.fidelity,
+        ObservationFidelity::Marker | ObservationFidelity::TelemetryReplay
+    );
+    if low_fidelity
+        && (observation.dimensions.prevention == DimensionOutcome::PASSED
+            || observation.dimensions.containment == DimensionOutcome::PASSED)
     {
         return false;
     }
@@ -1572,6 +1584,18 @@ fn claim_canonical(claim: &FeedbackClaim) -> Vec<u8> {
     field(&mut buf, &claim.attack_release);
     field(&mut buf, &claim.policy_digest);
     field(&mut buf, &claim.catalog_digest_mismatch.to_string());
+    field(&mut buf, &claim.evidence_refs.len().to_string());
+    for item in &claim.evidence_refs {
+        field(&mut buf, item);
+    }
+    field(&mut buf, &claim.producer.system);
+    field(&mut buf, &claim.producer.version);
+    field(&mut buf, &claim.producer.commit_sha);
+    field(&mut buf, &claim.producer.artifact_digest);
+    field(&mut buf, &claim.producer.config_digest);
+    field(&mut buf, &claim.producer.policy_digest);
+    field(&mut buf, &claim.config_digest);
+    field(&mut buf, &claim.artifact_digest);
     buf
 }
 
@@ -2501,6 +2525,74 @@ mod tests {
         let limitations = value["limitations"].as_array().unwrap();
         assert!(limitations.len() <= 64);
         assert!(limitations.iter().all(|item| item.is_string()));
+    }
+
+    #[test]
+    fn export_rejects_low_fidelity_control_passed() {
+        let (pk, sk) = generate_keypair();
+        for fidelity in [
+            ObservationFidelity::Marker,
+            ObservationFidelity::TelemetryReplay,
+        ] {
+            let mut claim = claim();
+            claim.fidelity = fidelity;
+            claim.idempotency_key = format!("idem-low-{fidelity:?}");
+            claim.prevention_claimed = true;
+            claim.contained = Some(true);
+            let mut ext = match admit(&binding(), &claim, None, &sk) {
+                AdmitResult::Admitted(ext) => ext,
+                other => panic!("{other:?}"),
+            };
+            assert_ne!(
+                ext.observation.dimensions.prevention,
+                DimensionOutcome::PASSED
+            );
+            assert_ne!(
+                ext.observation.dimensions.containment,
+                DimensionOutcome::PASSED
+            );
+            ext.observation.dimensions.prevention = DimensionOutcome::PASSED;
+            ext.observation.dimensions.containment = DimensionOutcome::PASSED;
+            sign_observation(&mut ext.observation, &sk).unwrap();
+            ext.revisions = vec![ext.observation.clone()];
+            let page =
+                export_observations(std::slice::from_ref(&sample_audit(ext)), &pk, None, None);
+            assert!(
+                page.observations.is_empty(),
+                "{fidelity:?} control PASSED must not export"
+            );
+        }
+    }
+
+    #[test]
+    fn same_idempotency_key_with_different_refs_is_replay() {
+        let (_, sk) = generate_keypair();
+        let mut claim = claim();
+        claim.evidence_refs = vec!["sensor-a".into()];
+        let ext = match admit(&binding(), &claim, None, &sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        let mut refs = claim.clone();
+        refs.evidence_refs = vec!["sensor-b".into()];
+        assert!(matches!(
+            admit(&binding(), &refs, Some(&ext), &sk),
+            AdmitResult::Replay
+        ));
+        assert_ne!(claim_signing_bytes(&claim), claim_signing_bytes(&refs));
+        let mut digest = claim.clone();
+        digest.artifact_digest = dig(9);
+        digest.producer.artifact_digest = dig(9);
+        assert!(matches!(
+            admit(&binding(), &digest, Some(&ext), &sk),
+            AdmitResult::Replay
+        ));
+        match admit(&binding(), &claim, Some(&ext), &sk) {
+            AdmitResult::Duplicate(obs) => {
+                assert_eq!(obs.observation_id, ext.observation.observation_id);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     fn assert_resource_ref(value: &serde_json::Value, kind: &str, source: &str) {

@@ -15,6 +15,15 @@
 - Приёмка шести слотов первой волны без завышения покрытия. Это не protection
   gate и не закрывает X01 (Ferrum/BSDM). См. `docs/mitre-validation-evidence.ru.md`.
 
+### Исправлено — validation evidence и приёмка кампании, 2026-11-11
+
+- `POST /runs/:id/validation` берёт procedure из `scenario_id` прогона и не
+  записывает слот, выбранный телом запроса.
+- Экспорт и манифест приёмки отклоняют prevention/containment `PASSED` при
+  fidelity `marker` и `telemetry_replay`.
+- Хеш идемпотентности и подпись producer покрывают evidence refs и digest
+  producer. Слот не сравнивает revision разных прогонов.
+
 ### Добавлено — привязка локальных MITRE-попыток, 2026-11-10
 
 - `procedure-local --sign-key` подписывает attempt ID, revision, environment,

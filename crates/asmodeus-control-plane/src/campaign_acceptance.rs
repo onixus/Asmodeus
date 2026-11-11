@@ -6,7 +6,7 @@
 
 use asmodeus_dsl::{procedure_corpus, ProcedureCorpus, ProcedureDefinition, ATTACK_VERSION};
 use asmodeus_telemetry::{
-    legacy_feedback_unconfirmed, observation_trusted, synthetic_ref, AuditRecord, DimensionOutcome,
+    legacy_feedback_unconfirmed, observation_exportable, AuditRecord, DimensionOutcome,
     ObservationFidelity, ValidationObservation, SCHEMA_VERSION,
 };
 use serde::Serialize;
@@ -188,7 +188,7 @@ pub fn acceptance_from_audit(
                     continue;
                 }
                 let replace = best
-                    .map(|current| observation.revision >= current.revision)
+                    .map(|current| prefer_candidate(observation, current))
                     .unwrap_or(true);
                 if replace {
                     best = Some(observation);
@@ -486,20 +486,37 @@ fn judge(slots: &[SlotReport]) -> (AcceptanceGate, Vec<String>) {
 }
 
 fn trusted_obs(observation: &ValidationObservation, trusted_public_key: &[u8]) -> bool {
-    observation.schema_version == SCHEMA_VERSION
-        && observation_trusted(observation, trusted_public_key)
-        && observation.evidence_refs.iter().all(|item| {
-            item.urn.starts_with("urn:apex:evidence:")
-                && synthetic_ref(&item.urn) == item.urn
-                && !item.urn.contains("/tmp/")
-                && !item.urn.contains("/var/")
-                && !item.local_id.contains("/tmp/")
-                && !item.local_id.contains("/var/")
-        })
-        && !observation.observation_id.urn.contains("/tmp/")
-        && !observation.observation_id.urn.contains("/var/")
-        && !observation.observation_id.local_id.contains("/tmp/")
-        && !observation.observation_id.local_id.contains("/var/")
+    observation_exportable(observation, trusted_public_key)
+}
+
+/// Revision numbers restart at 1 for every run. Inside one attempt the chain
+/// tip wins. Across attempts a later `NOT_RUN` must not clear `FAILED`.
+fn prefer_candidate(candidate: &ValidationObservation, current: &ValidationObservation) -> bool {
+    let same_attempt =
+        candidate.run_id == current.run_id && candidate.attempt_id == current.attempt_id;
+    if same_attempt {
+        candidate.revision >= current.revision
+    } else {
+        selection_rank(candidate) > selection_rank(current)
+    }
+}
+
+fn selection_rank(observation: &ValidationObservation) -> u8 {
+    if observation
+        .limitations
+        .iter()
+        .any(|item| item == "procedure_failed")
+    {
+        return 5;
+    }
+    match observation.dimensions.detection {
+        DimensionOutcome::FAILED => 5,
+        DimensionOutcome::INCONCLUSIVE => 4,
+        DimensionOutcome::STALE => 3,
+        DimensionOutcome::PASSED => 2,
+        DimensionOutcome::UNSUPPORTED | DimensionOutcome::NOT_APPLICABLE => 1,
+        DimensionOutcome::NOT_RUN => 0,
+    }
 }
 
 fn scope_line() -> String {
@@ -545,8 +562,9 @@ mod tests {
     use super::*;
     use asmodeus_crypto::generate_keypair;
     use asmodeus_telemetry::{
-        admit, AdmitResult, Applicability, AttemptBinding, FeedbackClaim, ObservationFidelity,
-        Producer, TelemetryState,
+        admit, sign_observation, AdmitResult, Applicability, AttemptBinding, AuditRecord,
+        DimensionOutcome, FeedbackClaim, Measurements, ObservationFidelity, Producer, RunEvidence,
+        TelemetryState, ValidationExtension,
     };
 
     fn dig(n: u8) -> String {
@@ -837,5 +855,156 @@ mod tests {
         assert_ne!(report.acceptance_gate, AcceptanceGate::ACCEPTED);
         assert_eq!(report.manifest_json(), report.manifest_json());
         assert!(report.manifest_json().starts_with('['));
+    }
+
+    fn admit_run(
+        secret: &[u8],
+        run: &str,
+        attempt: &str,
+        mutate: impl FnOnce(&mut FeedbackClaim),
+    ) -> ValidationExtension {
+        let mut claim = claim("http-beacon", attempt);
+        claim.run_id = run.into();
+        claim.idempotency_key = format!("idem-{run}");
+        mutate(&mut claim);
+        let mut bound = binding("http-beacon", attempt);
+        bound.run_id = run.into();
+        match admit(&bound, &claim, None, secret) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn wrap(ext: ValidationExtension) -> AuditRecord {
+        AuditRecord {
+            run_id: ext.observation.run_id.clone(),
+            scenario_id: ext.observation.procedure_id.clone(),
+            scenario_name: "slot".into(),
+            category: "red_team".into(),
+            mitre_technique: "T1071.001".into(),
+            mitre_tactic: "Command and Control".into(),
+            severity: "medium".into(),
+            tag: "exercise".into(),
+            initiator: "secops".into(),
+            runner_id: "local".into(),
+            status: "COMPLETED".into(),
+            measurements: Measurements::default(),
+            detection_source: "PENDING_VALIDATION".into(),
+            containment_action: "UNCONFIRMED".into(),
+            cleanup_status: "PENDING".into(),
+            timestamp_utc: "2026-11-11T00:00:00Z".into(),
+            signature_hex: String::new(),
+            public_key_hex: String::new(),
+            evidence: Some(RunEvidence {
+                execution_mode: "runner".into(),
+                ..RunEvidence::default()
+            }),
+            validation: Some(ext),
+        }
+    }
+
+    #[test]
+    fn a_later_run_not_run_does_not_clear_an_earlier_failure() {
+        let (pk, sk) = generate_keypair();
+        let failed = admit_run(&sk, "run-early", "attempt-early-positive", |claim| {
+            claim.detected = Some(false);
+        });
+        let empty = admit_run(&sk, "run-late", "attempt-late-positive", |claim| {
+            claim.procedure_unsupported = true;
+        });
+        assert_eq!(
+            failed.observation.dimensions.detection,
+            DimensionOutcome::FAILED
+        );
+        assert_eq!(
+            empty.observation.dimensions.detection,
+            DimensionOutcome::NOT_RUN
+        );
+        for records in [
+            vec![wrap(failed.clone()), wrap(empty.clone())],
+            vec![wrap(empty), wrap(failed)],
+        ] {
+            let report = acceptance_from_audit(&records, &pk);
+            let slot = report
+                .slots
+                .iter()
+                .find(|item| item.procedure_id == "http-beacon")
+                .unwrap();
+            assert_eq!(slot.detected, "FAILED");
+            assert_eq!(report.acceptance_gate, AcceptanceGate::FAILED);
+        }
+    }
+
+    #[test]
+    fn the_tip_of_one_attempt_replaces_its_own_earlier_revision() {
+        let (pk, sk) = generate_keypair();
+        let mut claim = claim("http-beacon", "attempt-http-beacon-positive");
+        claim.detected = Some(false);
+        let bound = binding("http-beacon", &claim.attempt_id);
+        let first = match admit(&bound, &claim, None, &sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        let mut late = claim.clone();
+        late.idempotency_key = "idem-tip".into();
+        late.procedure_unsupported = true;
+        let tip = match admit(&bound, &late, Some(&first), &sk) {
+            AdmitResult::Admitted(ext) => ext,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(tip.observation.revision, 2);
+        assert_eq!(
+            tip.observation.dimensions.detection,
+            DimensionOutcome::NOT_RUN
+        );
+        let report = acceptance_from_audit(std::slice::from_ref(&wrap(tip)), &pk);
+        let slot = report
+            .slots
+            .iter()
+            .find(|item| item.procedure_id == "http-beacon")
+            .unwrap();
+        assert_eq!(slot.detected, "NOT_RUN");
+        assert_ne!(report.acceptance_gate, AcceptanceGate::FAILED);
+    }
+
+    #[test]
+    fn resigned_low_fidelity_control_pass_is_absent_from_the_manifest() {
+        let (pk, sk) = generate_keypair();
+        for fidelity in [
+            ObservationFidelity::Marker,
+            ObservationFidelity::TelemetryReplay,
+        ] {
+            let mut claim = claim("http-beacon", "attempt-http-beacon-positive");
+            claim.fidelity = fidelity;
+            claim.prevention_claimed = true;
+            claim.contained = Some(true);
+            let bound = binding("http-beacon", &claim.attempt_id);
+            let mut ext = match admit(&bound, &claim, None, &sk) {
+                AdmitResult::Admitted(ext) => ext,
+                other => panic!("{other:?}"),
+            };
+            ext.observation.dimensions.prevention = DimensionOutcome::PASSED;
+            ext.observation.dimensions.containment = DimensionOutcome::PASSED;
+            sign_observation(&mut ext.observation, &sk).unwrap();
+            ext.revisions = vec![ext.observation.clone()];
+            let mut evidence = SlotEvidence::procedure("http-beacon");
+            evidence.observation = Some(ext.observation.clone());
+            let supplied = campaign_acceptance(&[evidence], &pk);
+            assert!(
+                !supplied.manifest_json().contains("\"prevention\":\"PASSED\""),
+                "{fidelity:?}"
+            );
+            assert!(!supplied
+                .manifest_json()
+                .contains("\"containment\":\"PASSED\""));
+            let from_audit = acceptance_from_audit(std::slice::from_ref(&wrap(ext)), &pk);
+            assert!(from_audit.observations.iter().all(|obs| {
+                obs.dimensions.prevention != DimensionOutcome::PASSED
+                    && obs.dimensions.containment != DimensionOutcome::PASSED
+            }));
+            assert!(!from_audit
+                .manifest_json()
+                .contains("\"prevention\":\"PASSED\""));
+        }
     }
 }
