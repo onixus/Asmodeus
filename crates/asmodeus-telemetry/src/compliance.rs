@@ -617,6 +617,7 @@ mod tests {
             timestamp_utc: "2026-09-09T22:00:00Z".into(),
             signature_hex: "0102".into(),
             public_key_hex: "0304".into(),
+            validation: None,
         }
     }
 

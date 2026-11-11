@@ -40,6 +40,11 @@ pub struct AuditRecord {
     pub public_key_hex: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<RunEvidence>,
+    /// S03 validation revision. Absent on historical records; included in the
+    /// signature only as a `validation-v1` extension so legacy preimages stay
+    /// stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<crate::validation::ValidationExtension>,
 }
 
 impl AuditRecord {
@@ -84,6 +89,13 @@ impl AuditRecord {
             field(
                 &mut buf,
                 &serde_json::to_string(evidence).expect("evidence serialization"),
+            );
+        }
+        if let Some(validation) = &self.validation {
+            field(&mut buf, "validation-v1");
+            field(
+                &mut buf,
+                &serde_json::to_string(validation).expect("validation serialization"),
             );
         }
         buf
@@ -397,7 +409,32 @@ mod tests {
             signature_hex: String::new(),
             public_key_hex: String::new(),
             evidence: None,
+            validation: None,
         }
+    }
+
+    #[test]
+    fn validation_extension_does_not_change_legacy_canonical_bytes() {
+        let legacy = sample_record();
+        let bytes = legacy.canonical_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("validation-v1"));
+        assert!(!text.contains("evidence-v1"));
+        let mut with_evidence = legacy.clone();
+        with_evidence.evidence = Some(RunEvidence {
+            execution_mode: "runner".into(),
+            feedback_received: true,
+            contained: true,
+            cleanup_confirmed: true,
+            failure_reason: None,
+        });
+        let evidence_bytes = with_evidence.canonical_bytes();
+        let text = String::from_utf8_lossy(&evidence_bytes);
+        assert!(text.contains("evidence-v1"));
+        assert!(!text.contains("validation-v1"));
+        let (pk, sk) = generate_keypair();
+        let signed = with_evidence.sign(&sk).unwrap();
+        assert!(signed.verify_with_key(&pk));
     }
 
     #[test]

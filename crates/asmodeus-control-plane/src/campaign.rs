@@ -34,6 +34,10 @@ pub struct CampaignStepResult {
     pub mttr_ms: u64,
     pub detected: bool,
     pub evidence: Option<asmodeus_telemetry::RunEvidence>,
+    /// Tip validation observation, filled when a report is projected.
+    /// Absent on execution checkpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_observation_id: Option<String>,
 }
 
 /// Complete report of an executed attack campaign.
@@ -55,6 +59,9 @@ pub struct CampaignRunResult {
     pub simulated_runs: u64,
     pub pending_feedback_runs: u64,
     pub timestamp_utc: String,
+    /// Trusted validation tips, in stage order. Same ids as each stage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_revisions: Vec<String>,
 }
 
 /// Preconfigured catalog of standard attack campaigns and kill-chains.

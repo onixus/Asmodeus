@@ -11,6 +11,7 @@
 mod api;
 mod audit_store;
 mod campaign;
+mod campaign_acceptance;
 mod campaign_execution;
 mod campaign_http;
 mod campaign_run;
@@ -38,6 +39,7 @@ mod scheduler;
 mod schedules_http;
 mod state;
 mod system_http;
+mod validation_http;
 mod watchdog;
 mod webhook;
 

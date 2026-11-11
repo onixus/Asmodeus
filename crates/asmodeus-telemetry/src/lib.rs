@@ -6,11 +6,13 @@ pub mod audit;
 pub mod clickhouse;
 pub mod compliance;
 pub mod reporting;
+pub mod validation;
 
 pub use audit::*;
 pub use clickhouse::*;
 pub use compliance::*;
 pub use reporting::*;
+pub use validation::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -339,6 +341,7 @@ mod tests {
                 cleanup_confirmed: true,
                 failure_reason: None,
             }),
+            validation: None,
         }
     }
 

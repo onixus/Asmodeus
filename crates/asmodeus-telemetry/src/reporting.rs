@@ -587,6 +587,7 @@ mod tests {
                 cleanup_confirmed: true,
                 failure_reason: None,
             }),
+            validation: None,
         };
 
         let report = EcosystemResilienceReport::build(&[record], &agg);

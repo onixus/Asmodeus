@@ -13,6 +13,12 @@ struct Snapshot {
     aggregate: Aggregate,
 }
 
+/// Result of a serialized audit revision attempt.
+pub enum RevisionUpdate {
+    Store(AuditRecord),
+    Keep,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuditStore {
     snapshot: Arc<RwLock<Snapshot>>,
@@ -133,6 +139,38 @@ impl AuditStore {
         .map_err(io::Error::other)?
     }
 
+    /// Like [`Self::update`], but `Keep` publishes nothing and does not append.
+    pub async fn revise<F>(&self, run_id: String, update: F) -> io::Result<Option<AuditRecord>>
+    where
+        F: FnOnce(AuditRecord) -> io::Result<RevisionUpdate> + Send + 'static,
+    {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _writer = store.writer.lock().unwrap();
+            let Some(old) = store.get(&run_id) else {
+                return Ok(None);
+            };
+            match update(old.clone())? {
+                RevisionUpdate::Keep => Ok(Some(old)),
+                RevisionUpdate::Store(record) => {
+                    if record.run_id != run_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "cannot change run ID",
+                        ));
+                    }
+                    store.persist(&record)?;
+                    let mut snapshot = store.snapshot.write().unwrap();
+                    snapshot.aggregate.update_run(&old, &record);
+                    snapshot.trail.update(&run_id, record.clone());
+                    Ok(Some(record))
+                }
+            }
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     fn persist(&self, record: &AuditRecord) -> io::Result<()> {
         if let Some(path) = &self.path {
             AuditTrail::append_to_file(record, path)?;
@@ -198,6 +236,7 @@ mod tests {
                 cleanup_confirmed: true,
                 failure_reason: None,
             }),
+            validation: None,
         }
     }
 

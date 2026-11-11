@@ -23,6 +23,7 @@ use crate::schedules_http::{
 };
 use crate::state::AppState;
 use crate::system_http::{healthz, metrics, openapi_spec, telemetry_mttd};
+use crate::validation_http::{campaign_acceptance_report, list_observations, submit_validation};
 use axum::{
     routing::{delete, get, post},
     Router,
@@ -61,7 +62,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/asmodeus/runs/:id/verify", get(verify_run))
         .route("/api/v1/asmodeus/runs/:id/cancel", post(cancel_run))
         .route("/api/v1/asmodeus/runs/:id/feedback", post(run_feedback))
+        .route(
+            "/api/v1/asmodeus/runs/:id/validation",
+            post(submit_validation),
+        )
+        .route(
+            "/api/v1/asmodeus/validation/observations",
+            get(list_observations),
+        )
         .route("/api/v1/asmodeus/runs/:id/report", get(get_run_report))
+        .route(
+            "/api/v1/asmodeus/reports/campaign-acceptance",
+            get(campaign_acceptance_report),
+        )
         .route(
             "/api/v1/asmodeus/reports/resilience",
             get(get_resilience_report),
